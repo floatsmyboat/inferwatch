@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inferwatch"
+dynamic = ["version"]
+description = "Real-time and historical metrics for locally served LLMs (Ollama and vLLM), with a dashboard and an MCP server"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The inferwatch authors" }]
+keywords = ["ollama", "vllm", "llm", "observability", "monitoring", "metrics", "mcp"]
+
+# Driven by the dependencies, not by this package: the code itself is 3.9-clean
+# (checked with vermin), but fastapi, uvicorn, starlette and mcp all require
+# 3.10 or newer.
+requires-python = ">=3.10"
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "mcp>=2.0",
+]
+
+[project.optional-dependencies]
+# Test-only. esprima syntax-checks the dashboard's JavaScript and quickjs
+# executes its formatters; both are optional and the suite skips without them,
+# but CI installs them so those tests actually run.
+dev = [
+    "esprima>=4.0",
+    "quickjs>=1.19",
+]
+
+[project.scripts]
+inferwatch = "inferwatch.main:main"
+inferwatch-mcp = "inferwatch.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/floatsmyboat/inferwatch"
+Repository = "https://github.com/floatsmyboat/inferwatch"
+Issues = "https://github.com/floatsmyboat/inferwatch/issues"
+
+[tool.hatch.version]
+path = "inferwatch/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["inferwatch"]
+
+[tool.hatch.build.targets.sdist]
+# Ship the tests and the packaging helpers so a downstream build can verify
+# itself, but not the local venv or any collected data.
+include = [
+    "/inferwatch",
+    "/tests",
+    "/scripts",
+    "/systemd",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/requirements.txt",
+    "/.mcp.json.example",
+]

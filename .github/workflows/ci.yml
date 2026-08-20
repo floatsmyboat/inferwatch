@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every version's result rather than stopping at the first
+      # failure -- knowing it breaks only on 3.10 is the useful signal.
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        # The dev extra brings esprima and quickjs, which the dashboard tests
+        # skip without. Installing them here means those tests actually run.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Confirm the optional test deps are present
+        # A silent skip would let the dashboard tests pass by not running.
+        run: |
+          python -c "import esprima, quickjs; print('esprima + quickjs available')"
+
+      - name: Tests
+        # No engine, no GPU and no network are required; the suite is hermetic.
+        run: python -m unittest discover -s tests -t . -v
+
+  docs:
+    name: docs match the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configuration reference is current
+        # Regenerated from inferwatch/config.py; fails if the spec changed and
+        # the README was not regenerated.
+        run: python scripts/gen-config-docs.py --check
+
+  package:
+    name: wheel installs and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: The wheel must contain the dashboard
+        # Easy to break with a packaging change, and the failure mode is a
+        # dashboard that 404s only once installed.
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          missing = [n for n in ("inferwatch/web/index.html", "inferwatch/main.py")
+                     if n not in names]
+          if missing:
+              sys.exit(f"missing from {whl}: {missing}")
+          print(f"{whl} contains the dashboard ({len(names)} entries)")
+          PY
+
+      - name: Install the wheel into a clean environment and serve from it
+        # Run from an empty directory so the source tree cannot satisfy the
+        # import and mask a packaging mistake.
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet dist/*.whl
+          mkdir -p /tmp/neutral && cd /tmp/neutral
+          /tmp/venv/bin/python - <<'PY'
+          import inferwatch, os
+          from inferwatch.api import WEB_DIR
+          assert "site-packages" in inferwatch.__file__, inferwatch.__file__
+          index = os.path.join(WEB_DIR, "index.html")
+          assert os.path.exists(index), index
+          print("installed copy serves from", WEB_DIR)
+          PY
+          /tmp/venv/bin/inferwatch --help > /dev/null
+          INFERWATCH_DB=/tmp/ci.db /tmp/venv/bin/inferwatch stats
+
+      - name: Keep the artifacts for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

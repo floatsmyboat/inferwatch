@@ -1,5 +1,9 @@
 # inferwatch
 
+[![ci](https://github.com/floatsmyboat/inferwatch/actions/workflows/ci.yml/badge.svg)](https://github.com/floatsmyboat/inferwatch/actions/workflows/ci.yml)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 Real-time and historical metrics for locally served LLMs — **Ollama** and
 **vLLM** — with a browser dashboard, a settings screen, and an MCP server so an
 agent can query the same data.
@@ -114,23 +118,35 @@ against old and new servers with no configuration.
 
 ## Install
 
+Requires Python 3.10 or newer — not because of this code (which is 3.9-clean)
+but because fastapi, uvicorn, starlette and mcp all require it.
+
 ```bash
-git clone <repo> inferwatch && cd inferwatch
-python3 -m venv --upgrade-deps .venv
-.venv/bin/pip install -r requirements.txt
+pip install git+https://github.com/floatsmyboat/inferwatch     # or:
+git clone https://github.com/floatsmyboat/inferwatch && cd inferwatch
+python3 -m venv --upgrade-deps .venv && .venv/bin/pip install -e ".[dev]"
 ```
+
+Installing gives you two commands:
+
+| Command | What it is |
+|---|---|
+| `inferwatch` | the collector, dashboard and API (`serve`, `ingest`, `stats`, `sources`) |
+| `inferwatch-mcp` | the MCP server, over stdio |
+
+Not on PyPI yet; install from git for now.
 
 Backfill from a journal you already have, then look at the database:
 
 ```bash
-.venv/bin/python -m inferwatch.main ingest --since 2d
-.venv/bin/python -m inferwatch.main stats
+inferwatch ingest --since 2d      # or: python -m inferwatch.main ingest
+inferwatch stats
 ```
 
 Run it:
 
 ```bash
-.venv/bin/python -m inferwatch.main serve      # http://127.0.0.1:7070
+inferwatch serve                  # http://127.0.0.1:7070
 ```
 
 As a service — the unit is rendered from `systemd/inferwatch.service.in` for the
@@ -455,10 +471,13 @@ what changed.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -t .
+python -m unittest discover -s tests -t .
 ```
 
-No network or engine required. Parser fixtures are verbatim real log lines and a
+CI runs this on Python 3.10 through 3.14, plus a packaging job that builds the
+wheel, asserts the dashboard HTML is inside it, and installs it into a clean
+environment from an empty directory so the source tree cannot mask a packaging
+mistake. No network, GPU or engine is required. Parser fixtures are verbatim real log lines and a
 real `/metrics` excerpt. Coverage includes the correlator's join and
 its ambiguous/orphan/failed cases, histogram percentiles and rollup idempotency,
 the schema migration, signal-safe commits, cursor validation, file rotation and
