@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "inferwatch": {
+      "command": "${PWD}/.venv/bin/python",
+      "args": [
+        "-m",
+        "inferwatch.mcp_server"
+      ],
+      "env": {
+        "INFERWATCH_DB": "${HOME}/.local/share/inferwatch/inferwatch.db"
+      }
+    }
+  }
+}

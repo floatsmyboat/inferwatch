@@ -1,0 +1,2153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inferwatch — LLM serving metrics</title>
+<style>
+/* ------------------------------------------------------------------
+   Palette: the dataviz reference instance, used verbatim (both modes
+   are selected steps, not an automatic flip).  Categorical slots are
+   assigned in fixed order and follow the entity, never its rank.
+   ------------------------------------------------------------------ */
+:root {
+  color-scheme: light;
+  --page:            #f9f9f7;
+  --surface:         #fcfcfb;
+  --ink:             #0b0b0b;
+  --ink-2:           #52514e;
+  --muted:           #898781;
+  --grid:            #e1e0d9;
+  --axis:            #c3c2b7;
+  --border:          rgba(11,11,11,0.10);
+  --series-1:        #2a78d6;
+  --series-2:        #eb6834;
+  --series-3:        #1baf7a;
+  --series-4:        #eda100;
+  --deemph:          #c3c2b7;
+  --good:            #0ca30c;
+  --warning:         #fab219;
+  --serious:         #ec835a;
+  --critical:        #d03b3b;
+  --success-text:    #006300;
+  --shadow:          0 1px 2px rgba(11,11,11,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page:      #0d0d0d;
+    --surface:   #1a1a19;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --muted:     #898781;
+    --grid:      #2c2c2a;
+    --axis:      #383835;
+    --border:    rgba(255,255,255,0.10);
+    --series-1:  #3987e5;
+    --series-2:  #d95926;
+    --series-3:  #199e70;
+    --series-4:  #c98500;
+    --deemph:    #383835;
+    --success-text: #0ca30c;
+    --shadow:    none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page:      #0d0d0d;
+  --surface:   #1a1a19;
+  --ink:       #ffffff;
+  --ink-2:     #c3c2b7;
+  --muted:     #898781;
+  --grid:      #2c2c2a;
+  --axis:      #383835;
+  --border:    rgba(255,255,255,0.10);
+  --series-1:  #3987e5;
+  --series-2:  #d95926;
+  --series-3:  #199e70;
+  --series-4:  #c98500;
+  --deemph:    #383835;
+  --success-text: #0ca30c;
+  --shadow:    none;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1560px; margin: 0 auto; padding: 20px 24px 64px; }
+
+/* ---------------------------------------------------------- header */
+header.top { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+header.top h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+header.top .sub { color: var(--muted); font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); }
+.dot.live { background: var(--good); }
+.dot.stale { background: var(--warning); }
+.dot.down { background: var(--critical); }
+
+/* ------------------------------------------------------------ tabs */
+nav.tabs { display: flex; gap: 2px; margin: 14px 0 0; border-bottom: 1px solid var(--border); }
+nav.tabs button {
+  appearance: none; background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: var(--ink-2); font: inherit; font-size: 13.5px; font-weight: 500;
+  padding: 8px 14px; cursor: pointer; margin-bottom: -1px;
+}
+nav.tabs button:hover { color: var(--ink); }
+nav.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--series-1); }
+nav.tabs button .badge {
+  display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px;
+  background: var(--grid); color: var(--ink-2); font-size: 11px; font-weight: 600;
+}
+
+/* -------------------------------------------------- settings screen */
+.setgroup { margin-top: 4px; }
+.setgroup h3 {
+  font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); font-weight: 600; margin: 16px 0 8px;
+  padding-bottom: 5px; border-bottom: 1px solid var(--grid);
+}
+.setrow { display: grid; grid-template-columns: minmax(180px, 260px) 190px 1fr; gap: 12px;
+          align-items: start; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+.setrow:last-child { border-bottom: 0; }
+.setrow .name { font-size: 13px; color: var(--ink); }
+.setrow .help { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.setrow input[type="text"], .setrow input[type="number"], .setrow select {
+  width: 100%; font: inherit; font-size: 13px; padding: 5px 8px; color: var(--ink);
+  background: var(--page); border: 1px solid var(--border); border-radius: 6px;
+}
+.setrow input:disabled, .setrow select:disabled { opacity: .6; cursor: not-allowed; }
+.setrow .side { display: flex; flex-direction: column; gap: 4px; }
+.origin {
+  display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: var(--grid); color: var(--ink-2); white-space: nowrap;
+}
+.origin.env, .origin.flag { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--ink); }
+.origin.database { background: color-mix(in srgb, var(--series-1) 18%, transparent); }
+.err { color: var(--critical); font-size: 12px; margin-top: 3px; }
+.ok-msg { color: var(--success-text); font-size: 12px; }
+.addform { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.addform .fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.addform label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.addform input, .addform select {
+  font: inherit; font-size: 13px; padding: 5px 8px; color: var(--ink); min-width: 160px;
+  background: var(--page); border: 1px solid var(--border); border-radius: 6px;
+}
+.addform .actions { display: flex; gap: 8px; align-items: center; }
+button.primary { background: var(--series-1); color: #fff; border-color: transparent; font-weight: 600; }
+button.danger { color: var(--critical); }
+.tools button.primary { padding: 3px 12px; }
+
+/* ------------------------------------------------- one filter row */
+.filters {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 16px 0 18px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+.filters .spacer { flex: 1 1 auto; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button {
+  appearance: none; border: 0; background: transparent; color: var(--ink-2);
+  font: inherit; font-size: 13px; padding: 6px 11px; cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--series-1); color: #fff; font-weight: 600; }
+.seg button:hover:not([aria-pressed="true"]) { background: var(--grid); }
+select, .btn {
+  appearance: none; font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; cursor: pointer;
+}
+label.inline { color: var(--ink-2); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+
+/* --------------------------------------------------------- banner */
+.banner {
+  display: none; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--border); border-left: 3px solid var(--warning);
+  background: var(--surface); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+  font-size: 13px; color: var(--ink-2);
+}
+.banner.show { display: flex; }
+.banner.critical { border-left-color: var(--critical); }
+.banner strong { color: var(--ink); }
+.banner .ico { flex: none; font-size: 14px; line-height: 1.4; }
+
+/* ----------------------------------------------------- hero + kpis */
+.hero {
+  display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 22px; margin-bottom: 14px; box-shadow: var(--shadow);
+}
+.hero .figure { font-size: 52px; font-weight: 600; line-height: 1; letter-spacing: -0.02em; }
+.hero .figure .unit { font-size: 18px; font-weight: 500; color: var(--ink-2); margin-left: 6px; letter-spacing: 0; }
+.hero .flabel { color: var(--ink-2); font-size: 13px; margin-bottom: 8px; }
+.hero .spark { flex: 1 1 260px; min-width: 200px; }
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.tile {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 13px 15px 11px; box-shadow: var(--shadow); min-width: 0;
+}
+.tile .label { color: var(--ink-2); font-size: 12.5px; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .value { font-size: 25px; font-weight: 600; line-height: 1.1; letter-spacing: -0.01em; }
+.tile .value .unit { font-size: 13px; font-weight: 500; color: var(--ink-2); margin-left: 3px; letter-spacing: 0; }
+.tile .sub { color: var(--muted); font-size: 12px; margin-top: 3px; display: flex; align-items: center; gap: 5px; }
+.tile .sub .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.tile.alarm .value { color: var(--critical); }
+
+/* ---------------------------------------------------------- cards */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: 14px; }
+.grid.one { grid-template-columns: 1fr; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 15px 17px 12px; box-shadow: var(--shadow); min-width: 0;
+}
+.card > header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 2px; }
+.card h2 { font-size: 13.5px; font-weight: 600; margin: 0; }
+.card .note { color: var(--muted); font-size: 12px; }
+.card .tools { margin-left: auto; display: flex; gap: 4px; }
+.card .tools button {
+  appearance: none; border: 1px solid var(--border); background: transparent;
+  color: var(--ink-2); font: inherit; font-size: 11.5px; padding: 2px 8px;
+  border-radius: 6px; cursor: pointer;
+}
+.card .tools button[aria-pressed="true"] { background: var(--grid); color: var(--ink); }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 2px; font-size: 12px; color: var(--ink-2); }
+.legend .item { display: inline-flex; align-items: center; gap: 6px; }
+.legend .key { width: 14px; height: 2px; border-radius: 1px; flex: none; }
+.legend .key.rect { height: 9px; width: 9px; border-radius: 2px; }
+
+/* charts: container grows with content so the x-axis band is never clipped */
+.plot { position: relative; width: 100%; }
+.plot svg { display: block; width: 100%; height: auto; overflow: visible; }
+.plot.loading { opacity: .45; }         /* refetch keeps the frame */
+.tip {
+  position: absolute; pointer-events: none; z-index: 20; opacity: 0;
+  transform: translate(-50%, -100%); transition: opacity .08s;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; min-width: 132px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.16);
+}
+.tip .when { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+.tip .row { display: flex; align-items: center; gap: 7px; white-space: nowrap; line-height: 1.6; }
+.tip .row .key { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+.tip .row .key.rect { width: 9px; height: 9px; border-radius: 2px; }
+.tip .row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tip .row .n { color: var(--ink-2); }
+
+/* --------------------------------------------------------- tables */
+.tbl-wrap { overflow-x: auto; max-height: 340px; overflow-y: auto; margin-top: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 5px 9px 5px 0; white-space: nowrap; }
+th {
+  position: sticky; top: 0; background: var(--surface); color: var(--muted);
+  font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em;
+  border-bottom: 1px solid var(--axis); z-index: 1;
+}
+td { border-bottom: 1px solid var(--grid); color: var(--ink-2); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.strong { color: var(--ink); font-weight: 500; }
+tbody tr:hover td { background: var(--page); }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.pill.ok   { color: var(--success-text); background: color-mix(in srgb, var(--good) 14%, transparent); }
+.pill.err  { color: var(--critical);     background: color-mix(in srgb, var(--critical) 14%, transparent); }
+.pill.warn { color: var(--ink);          background: color-mix(in srgb, var(--warning) 24%, transparent); }
+.pill.info { color: var(--ink-2);        background: var(--grid); }
+.flag { font-size: 11px; color: var(--muted); }
+.bar-cell { display: flex; align-items: center; gap: 7px; }
+.bar-cell .track { flex: 1 1 60px; height: 6px; background: var(--grid); border-radius: 3px; overflow: hidden; min-width: 40px; }
+.bar-cell .fill { height: 100%; border-radius: 3px; background: var(--series-1); }
+
+/* ----------------------------------------------------- live ticker */
+.ticker { max-height: 300px; overflow-y: auto; margin-top: 4px; }
+.ticker .ev {
+  display: flex; align-items: center; gap: 10px; padding: 5px 0;
+  border-bottom: 1px solid var(--grid); font-size: 12.5px; color: var(--ink-2);
+}
+.ticker .ev .t { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.ticker .ev .m { color: var(--ink); font-weight: 500; }
+.ticker .ev .metrics { margin-left: auto; display: flex; gap: 12px; font-variant-numeric: tabular-nums; flex: none; }
+.empty { color: var(--muted); font-size: 13px; padding: 22px 0; text-align: center; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>inferwatch</h1>
+    <span class="sub" id="hostline">LLM serving metrics</span>
+    <span class="spacer" style="flex:1"></span>
+    <span class="sub"><span class="dot" id="conn-dot"></span> <span id="conn-text">connecting…</span></span>
+  </header>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button role="tab" data-tab="ollama" aria-selected="true">Ollama</button>
+    <button role="tab" data-tab="vllm" aria-selected="false">vLLM</button>
+    <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
+  </nav>
+
+  <div class="banner" id="banner"><span class="ico" aria-hidden="true">⚠</span><span id="banner-text"></span></div>
+
+  <!-- One filter row, above everything it scopes. -->
+  <div class="filters">
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button data-w="15m">15m</button>
+      <button data-w="1h" aria-pressed="true">1h</button>
+      <button data-w="6h">6h</button>
+      <button data-w="24h">24h</button>
+      <button data-w="7d">7d</button>
+      <button data-w="30d">30d</button>
+    </div>
+    <label class="inline" id="model-wrap">Model
+      <select id="model"><option value="">All models</option></select>
+    </label>
+    <label class="inline" id="vsource-wrap" hidden>Instance
+      <select id="vsource"></select>
+    </label>
+    <div class="spacer"></div>
+    <label class="inline"><input type="checkbox" id="autorefresh" checked> Auto-refresh</label>
+    <button class="btn" id="theme" title="Toggle light/dark">◐</button>
+  </div>
+
+  <section id="tab-ollama">
+  <!-- Hero: exactly one per view. -->
+  <div class="hero">
+    <div>
+      <div class="flabel" id="hero-label">Output tokens/sec</div>
+      <div class="figure"><span id="hero-value">—</span><span class="unit" id="hero-unit">tok/s</span></div>
+    </div>
+    <div class="spark plot" id="hero-spark"></div>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid">
+    <div class="card" id="c-ttft">
+      <header><h2>Time to first token</h2><span class="note" id="n-ttft"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-ttft"></div><div class="plot" id="p-ttft"></div>
+      <div class="tbl-wrap" id="t-ttft" hidden></div>
+    </div>
+
+    <div class="card" id="c-tps">
+      <header><h2>Token throughput</h2><span class="note">tokens/sec against wall clock</span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-tps"></div><div class="plot" id="p-tps"></div>
+      <div class="tbl-wrap" id="t-tps" hidden></div>
+    </div>
+
+    <div class="card" id="c-rate">
+      <header><h2>Request rate</h2><span class="note">inference only; health checks excluded</span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-rate"></div><div class="plot" id="p-rate"></div>
+      <div class="tbl-wrap" id="t-rate" hidden></div>
+    </div>
+
+    <div class="card" id="c-queue">
+      <header><h2>Queue wait</h2><span class="note" id="n-queue">wall latency minus runner time</span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-queue"></div><div class="plot" id="p-queue"></div>
+      <div class="tbl-wrap" id="t-queue" hidden></div>
+    </div>
+
+    <div class="card" id="c-decode">
+      <header><h2>Model decode speed</h2><span class="note">tokens/sec while generating</span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-decode"></div><div class="plot" id="p-decode"></div>
+      <div class="tbl-wrap" id="t-decode" hidden></div>
+    </div>
+
+    <div class="card" id="c-gpu">
+      <header><h2>GPU utilisation</h2><span class="note" id="n-gpu"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-gpu"></div><div class="plot" id="p-gpu"></div>
+      <div class="tbl-wrap" id="t-gpu" hidden></div>
+    </div>
+
+    <div class="card" id="c-vram">
+      <header><h2>VRAM in use</h2><span class="note" id="n-vram"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-vram"></div><div class="plot" id="p-vram"></div>
+      <div class="tbl-wrap" id="t-vram" hidden></div>
+    </div>
+
+    <div class="card" id="c-gtemp">
+      <header><h2>GPU temperature</h2><span class="note" id="n-gtemp"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-gtemp"></div><div class="plot" id="p-gtemp"></div>
+      <div class="tbl-wrap" id="t-gtemp" hidden></div>
+    </div>
+
+    <div class="card" id="c-gpower">
+      <header><h2>GPU power draw</h2><span class="note" id="n-gpower"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-gpower"></div><div class="plot" id="p-gpower"></div>
+      <div class="tbl-wrap" id="t-gpower" hidden></div>
+    </div>
+
+    <div class="card" id="c-err">
+      <header><h2>Errors</h2><span class="note" id="n-err"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-err"></div><div class="plot" id="p-err"></div>
+      <div class="tbl-wrap" id="t-err" hidden></div>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:14px">
+    <div class="card"><header><h2>Live requests</h2><span class="note" id="n-live"></span></header>
+      <div class="ticker" id="ticker"><div class="empty">Waiting for traffic…</div></div></div>
+    <div class="card"><header><h2>Loaded models</h2><span class="note" id="n-loaded"></span></header>
+      <div class="tbl-wrap" id="t-loaded"></div></div>
+  </div>
+
+  <div class="grid one" style="margin-top:14px">
+    <div class="card"><header><h2>Per-model summary</h2><span class="note" id="n-models"></span></header>
+      <div class="tbl-wrap" id="t-models"></div></div>
+  </div>
+
+  <div class="grid" style="margin-top:14px">
+    <div class="card"><header><h2>Slowest by TTFT</h2><span class="note">worst prefill in window</span></header>
+      <div class="tbl-wrap" id="t-slowest"></div></div>
+    <div class="card"><header><h2>Longest queue waits</h2><span class="note">time spent waiting, not working</span></header>
+      <div class="tbl-wrap" id="t-slowq"></div></div>
+    <div class="card"><header><h2>Recent errors</h2><span class="note" id="n-errtbl"></span></header>
+      <div class="tbl-wrap" id="t-errors"></div></div>
+    <div class="card"><header><h2>Model load &amp; runner events</h2><span class="note">cold loads, evictions, warnings</span></header>
+      <div class="tbl-wrap" id="t-events"></div></div>
+  </div>
+
+  <div class="grid one" style="margin-top:14px">
+    <div class="card"><header><h2>Recent requests</h2><span class="note" id="n-reqs"></span></header>
+      <div class="tbl-wrap" id="t-requests"></div></div>
+  </div>
+  </section>
+
+  <!-- ================================================================
+       vLLM tab.  Deliberately a different set of panels: vLLM publishes
+       aggregates with no per-request identity, so there is no request
+       table, no client breakdown and no exact percentile here -- and it
+       publishes things ollama does not, like KV-cache occupancy.
+       ================================================================ -->
+  <section id="tab-vllm" hidden>
+    <div class="banner show" id="vllm-note" style="border-left-color:var(--series-1)">
+      <span class="ico" aria-hidden="true">i</span>
+      <span>vLLM exposes <strong>pre-aggregated</strong> metrics with no per-request
+      detail, so there are no per-request rows here. Percentile figures are the
+      <strong>upper bound of vLLM's own histogram bucket</strong> (its buckets step
+      10&rarr;20&rarr;40s), while the <strong>means are exact</strong> — prefer them.
+      Token counters also advance as tokens stream while the request counter only
+      advances on completion, so tokens &divide; requests is <em>not</em> tokens
+      per request.</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="flabel">Generation tokens/sec</div>
+        <div class="figure"><span id="v-hero">—</span><span class="unit">tok/s</span></div>
+      </div>
+      <div class="spark plot" id="v-hero-spark"></div>
+    </div>
+
+    <div class="kpis" id="v-kpis"></div>
+
+    <div class="grid">
+      <div class="card" id="c-vttft">
+        <header><h2>Time to first token</h2><span class="note" id="n-vttft"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vttft"></div><div class="plot" id="p-vttft"></div>
+        <div class="tbl-wrap" id="t-vttft" hidden></div>
+      </div>
+      <div class="card" id="c-vtps">
+        <header><h2>Token throughput</h2><span class="note">tokens/sec against wall clock</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vtps"></div><div class="plot" id="p-vtps"></div>
+        <div class="tbl-wrap" id="t-vtps" hidden></div>
+      </div>
+      <div class="card" id="c-vsat">
+        <header><h2>Batch occupancy</h2><span class="note">running vs waiting requests</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vsat"></div><div class="plot" id="p-vsat"></div>
+        <div class="tbl-wrap" id="t-vsat" hidden></div>
+      </div>
+      <div class="card" id="c-vkv">
+        <header><h2>KV cache usage</h2><span class="note">mean per minute; the tile shows the peak</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vkv"></div><div class="plot" id="p-vkv"></div>
+        <div class="tbl-wrap" id="t-vkv" hidden></div>
+      </div>
+      <div class="card" id="c-vqueue">
+        <header><h2>Queue wait</h2><span class="note">time in the WAITING phase</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vqueue"></div><div class="plot" id="p-vqueue"></div>
+        <div class="tbl-wrap" id="t-vqueue" hidden></div>
+      </div>
+      <div class="card" id="c-vgpu">
+        <header><h2>GPU utilisation</h2><span class="note" id="n-vgpu"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vgpu"></div><div class="plot" id="p-vgpu"></div>
+        <div class="tbl-wrap" id="t-vgpu" hidden></div>
+      </div>
+      <div class="card" id="c-vvram">
+        <header><h2>VRAM in use</h2><span class="note" id="n-vvram"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vvram"></div><div class="plot" id="p-vvram"></div>
+        <div class="tbl-wrap" id="t-vvram" hidden></div>
+      </div>
+      <div class="card" id="c-vtemp">
+        <header><h2>GPU temperature</h2><span class="note" id="n-vtemp"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vtemp"></div><div class="plot" id="p-vtemp"></div>
+        <div class="tbl-wrap" id="t-vtemp" hidden></div>
+      </div>
+      <div class="card" id="c-vpower">
+        <header><h2>GPU power draw</h2><span class="note" id="n-vpower"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vpower"></div><div class="plot" id="p-vpower"></div>
+        <div class="tbl-wrap" id="t-vpower" hidden></div>
+      </div>
+      <div class="card" id="c-vrate">
+        <header><h2>Request rate</h2><span class="note">completions per second</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vrate"></div><div class="plot" id="p-vrate"></div>
+        <div class="tbl-wrap" id="t-vrate" hidden></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Completion outcomes</h2><span class="note">vLLM's finish reasons</span></header>
+        <div class="tbl-wrap" id="t-vfinish"></div></div>
+      <div class="card"><header><h2>Instances</h2><span class="note" id="n-vinst"></span></header>
+        <div class="tbl-wrap" id="t-vinst"></div></div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       Settings.  Values pinned by the environment or a command-line flag
+       are shown read-only with their origin, because the process was told
+       to use them and a browser must not override that silently.
+       ================================================================ -->
+  <section id="tab-settings" hidden>
+    <div class="banner" id="set-note"><span class="ico" aria-hidden="true">i</span><span id="set-note-text"></span></div>
+    <div class="grid one">
+      <div class="card">
+        <header><h2>Monitored engines</h2><span class="note" id="n-sources"></span></header>
+        <div class="tbl-wrap" id="t-sources"></div>
+        <div id="source-add" class="addform"></div>
+      </div>
+    </div>
+    <div class="grid one" style="margin-top:14px">
+      <div class="card">
+        <header><h2>Settings</h2><span class="note">command line and environment outrank these</span>
+          <div class="tools"><button id="set-save">Save changes</button></div></header>
+        <div id="set-groups"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span id="f-source"></span><span id="f-rows"></span><span id="f-db"></span>
+  </footer>
+</div>
+<script>
+"use strict";
+/* =====================================================================
+   inferwatch dashboard
+   Charts are hand-drawn SVG: no libraries, no CDN, works offline on a box
+   with no node toolchain.  Rendering is measured against the container's
+   real pixel width (via ResizeObserver) rather than scaled with a viewBox,
+   so axis text stays at its intended size at every window width.
+   ===================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const SVGNS = "http://www.w3.org/2000/svg";
+
+/* ------------------------------------------------------------ format */
+function fmtCompact(v, digits) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(1) + "B";
+  if (a >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (a >= 1e4) return (v / 1e3).toFixed(1) + "K";
+  if (a >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (a >= 100) return v.toFixed(digits === undefined ? 0 : digits);
+  if (a >= 10) return v.toFixed(digits === undefined ? 1 : digits);
+  if (a >= 1) return v.toFixed(digits === undefined ? 2 : digits);
+  if (a === 0) return "0";
+  return v.toFixed(digits === undefined ? 2 : digits);
+}
+function fmtMs(ms) {
+  if (ms === null || ms === undefined || Number.isNaN(ms)) return "—";
+  if (ms < 1) return ms.toFixed(2) + "ms";
+  if (ms < 10) return ms.toFixed(1) + "ms";   /* cached prefills land here */
+  if (ms < 1000) return Math.round(ms) + "ms";
+  if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + "s";
+  const m = Math.floor(ms / 60000), s = Math.round((ms % 60000) / 1000);
+  return m + "m" + String(s).padStart(2, "0") + "s";
+}
+function fmtPct(x, digits) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "—";
+  return (x * 100).toFixed(digits === undefined ? 1 : digits) + "%";
+}
+function fmtBytes(b) {
+  if (b === null || b === undefined) return "—";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 1 : 0) + " " + u[i];
+}
+function fmtClock(ts, withDate) {
+  const d = new Date(ts * 1000);
+  const t = d.toLocaleTimeString(undefined, { hour12: false });
+  return withDate ? d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + t : t;
+}
+function tickFormatterForSpan(spanS) {
+  if (spanS <= 3 * 3600) return (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (spanS <= 3 * 86400) return (ts) => new Date(ts * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", hour12: false });
+  return (ts) => new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+/* Clean y-axis ticks: 1/2/5 x 10^n */
+function niceTicks(min, max, count) {
+  if (!(max > min)) { max = min + 1; }
+  const raw = (max - min) / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+  const lo = Math.floor(min / step) * step, hi = Math.ceil(max / step) * step;
+  const out = [];
+  for (let v = lo; v <= hi + step / 2; v += step) out.push(Math.abs(v) < step / 1e6 ? 0 : v);
+  return out;
+}
+function el(tag, attrs, parent) {
+  const n = document.createElementNS(SVGNS, tag);
+  if (attrs) for (const k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+/* Untrusted text (model names, endpoints, client IPs) always via textContent. */
+function text(node, s) { node.textContent = s === null || s === undefined ? "" : String(s); return node; }
+
+/* =====================================================================
+   Chart engine
+   ===================================================================== */
+const PLOT_H = 168;          // plot area
+const AXIS_BAND = 26;        // x-axis label band -- included in the height,
+const PAD = { t: 10, r: 14, b: 0, l: 46 };   // so labels are never clipped
+
+class Chart {
+  /* spec = {type:'line'|'bar', t:[epoch], series:[{name,values,color,kind}],
+             fmt, stacked, yMin, yMax, area, spark} */
+  constructor(container, spec) {
+    this.c = container;
+    this.spec = spec;
+    this.c.innerHTML = "";
+    this.svg = el("svg", { role: "img" }, this.c);
+    this.tip = document.createElement("div");
+    this.tip.className = "tip";
+    this.c.appendChild(this.tip);
+    this.hover = null;
+    this._bind();
+    this.render();
+    if (!Chart._ro) Chart._ro = new ResizeObserver((entries) => {
+      for (const e of entries) { const ch = e.target._chart; if (ch) ch.render(); }
+    });
+    this.c._chart = this;
+    Chart._ro.observe(this.c);
+  }
+  update(spec) { this.spec = spec; this.render(); }
+
+  _bind() {
+    if (this.spec.spark) return;
+    const move = (ev) => {
+      const r = this.svg.getBoundingClientRect();
+      const x = ev.clientX - r.left;
+      const i = this._indexAt(x);
+      if (i === null) { this._clearHover(); return; }
+      this.hover = i;
+      this._drawHover();
+    };
+    this.c.addEventListener("pointermove", move);
+    this.c.addEventListener("pointerleave", () => this._clearHover());
+    /* Keyboard parity: arrow keys walk the crosshair. */
+    this.c.tabIndex = 0;
+    this.c.addEventListener("keydown", (ev) => {
+      const n = this.spec.t.length;
+      if (ev.key === "ArrowRight" || ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        const d = ev.key === "ArrowRight" ? 1 : -1;
+        this.hover = Math.max(0, Math.min(n - 1, (this.hover === null ? 0 : this.hover) + d));
+        this._drawHover();
+      } else if (ev.key === "Escape") this._clearHover();
+    });
+  }
+  _indexAt(px) {
+    const n = this.spec.t.length;
+    if (!n || !this.geom) return null;
+    const { x0, x1 } = this.geom;
+    if (px < x0 - 12 || px > x1 + 12) return null;
+    const frac = (px - x0) / Math.max(1, x1 - x0);
+    return Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
+  }
+  _clearHover() {
+    this.hover = null;
+    this.tip.style.opacity = 0;
+    if (this.hoverLayer) this.hoverLayer.innerHTML = "";
+  }
+
+  render() {
+    const spec = this.spec;
+    const W = Math.max(220, Math.floor(this.c.clientWidth || 420));
+    const spark = !!spec.spark;
+    const plotH = spark ? 46 : PLOT_H;
+    const H = plotH + (spark ? 0 : AXIS_BAND);
+    const pad = spark ? { t: 4, r: 3, b: 0, l: 3 } : PAD;
+    this.svg.setAttribute("width", W);
+    this.svg.setAttribute("height", H);
+    this.svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    this.svg.innerHTML = "";
+
+    const t = spec.t || [];
+    const series = (spec.series || []).filter((s) => s.values);
+    const x0 = pad.l, x1 = W - pad.r, y0 = pad.t, y1 = plotH;
+    this.geom = { x0, x1, y0, y1 };
+
+    /* ---- y domain */
+    let lo = spec.yMin !== undefined ? spec.yMin : 0, hi = spec.yMax;
+    if (hi === undefined) {
+      hi = 0;
+      if (spec.stacked) {
+        for (let i = 0; i < t.length; i++) {
+          let sum = 0;
+          for (const s of series) sum += (s.values[i] || 0);
+          if (sum > hi) hi = sum;
+        }
+      } else {
+        for (const s of series) for (const v of s.values) if (v !== null && v !== undefined && v > hi) hi = v;
+      }
+      if (hi === 0) hi = 1;
+      hi *= 1.12;
+    }
+    const ticks = spark ? [] : niceTicks(lo, hi, 4);
+    if (ticks.length) { lo = Math.min(lo, ticks[0]); hi = Math.max(hi, ticks[ticks.length - 1]); }
+    const sx = (i) => t.length <= 1 ? (x0 + x1) / 2 : x0 + (i / (t.length - 1)) * (x1 - x0);
+    const sy = (v) => y1 - ((v - lo) / Math.max(1e-9, hi - lo)) * (y1 - y0);
+    this.sx = sx; this.sy = sy;
+
+    const surface = css("--surface"), grid = css("--grid"), axis = css("--axis"), muted = css("--muted");
+    const g = el("g", null, this.svg);
+
+    /* ---- gridlines: solid hairlines, one step off surface, recessive */
+    for (const v of ticks) {
+      const y = sy(v);
+      el("line", { x1: x0, x2: x1, y1: y, y2: y, stroke: grid, "stroke-width": 1,
+                   "shape-rendering": "crispEdges" }, g);
+      const lab = el("text", { x: x0 - 7, y: y + 3.5, "text-anchor": "end", fill: muted,
+                               "font-size": 10.5, "font-variant-numeric": "tabular-nums" }, g);
+      text(lab, spec.fmtAxis ? spec.fmtAxis(v) : fmtCompact(v));
+    }
+    /* baseline */
+    el("line", { x1: x0, x2: x1, y1: y1, y2: y1, stroke: axis, "stroke-width": 1,
+                 "shape-rendering": "crispEdges" }, g);
+
+    /* ---- x-axis labels inside their own band */
+    if (!spark && t.length) {
+      const fmt = spec.fmtTick || tickFormatterForSpan(t[t.length - 1] - t[0]);
+      const want = Math.max(2, Math.min(7, Math.floor((x1 - x0) / 82)));
+      const stride = Math.max(1, Math.round((t.length - 1) / (want - 1)) || 1);
+      for (let i = 0; i < t.length; i += stride) {
+        const anchor = i === 0 ? "start" : (i >= t.length - stride / 2 ? "end" : "middle");
+        const lab = el("text", { x: sx(i), y: y1 + 15, "text-anchor": anchor, fill: muted,
+                                 "font-size": 10.5 }, g);
+        text(lab, fmt(t[i]));
+      }
+    }
+
+    if (spec.type === "bar") this._renderBars(g, series, sx, sy, lo, surface);
+    else this._renderLines(g, series, sx, sy, surface, spark);
+
+    this.hoverLayer = el("g", null, this.svg);
+    if (this.hover !== null) this._drawHover();
+  }
+
+  _renderLines(g, series, sx, sy, surface, spark) {
+    const t = this.spec.t;
+    /* single series gets a 10% wash under the line; multi-series never does */
+    const wash = series.length === 1 && this.spec.area !== false;
+    series.forEach((s) => {
+      const color = s.color;
+      /* split into runs so null gaps are real gaps, not interpolated */
+      const runs = [];
+      let run = [];
+      for (let i = 0; i < t.length; i++) {
+        const v = s.values[i];
+        if (v === null || v === undefined || Number.isNaN(v)) { if (run.length) runs.push(run); run = []; }
+        else run.push(i);
+      }
+      if (run.length) runs.push(run);
+
+      for (const r of runs) {
+        if (wash && r.length > 1) {
+          let d = `M ${sx(r[0])} ${sy(s.values[r[0]])}`;
+          for (const i of r.slice(1)) d += ` L ${sx(i)} ${sy(s.values[i])}`;
+          d += ` L ${sx(r[r.length - 1])} ${this.geom.y1} L ${sx(r[0])} ${this.geom.y1} Z`;
+          el("path", { d, fill: color, "fill-opacity": 0.10, stroke: "none" }, g);
+        }
+        if (r.length === 1) {
+          const i = r[0];
+          el("circle", { cx: sx(i), cy: sy(s.values[i]), r: spark ? 2 : 4, fill: color,
+                         stroke: surface, "stroke-width": spark ? 0 : 2 }, g);
+        } else {
+          let d = `M ${sx(r[0])} ${sy(s.values[r[0]])}`;
+          for (const i of r.slice(1)) d += ` L ${sx(i)} ${sy(s.values[i])}`;
+          el("path", { d, fill: "none", stroke: color, "stroke-width": 2,
+                       "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+        }
+      }
+      /* end marker + selective direct label */
+      if (!spark && runs.length) {
+        const last = runs[runs.length - 1];
+        const i = last[last.length - 1];
+        const v = s.values[i];
+        el("circle", { cx: sx(i), cy: sy(v), r: 4, fill: color, stroke: surface,
+                       "stroke-width": 2 }, g);
+        s._endY = sy(v); s._endI = i; s._endV = v;
+      }
+    });
+
+    /* Direct-label the ends only where they separate cleanly; when they
+       converge the legend carries identity instead of stacked labels. */
+    if (!spark && series.length && series.length <= 4) {
+      const ends = series.filter((s) => s._endY !== undefined)
+                         .sort((a, b) => a._endY - b._endY);
+      let ok = true;
+      for (let i = 1; i < ends.length; i++) if (ends[i]._endY - ends[i - 1]._endY < 13) ok = false;
+      const room = this.geom.x1 - (ends.length ? this.sx(ends[0]._endI) : 0);
+      if (ok && room > -2) {
+        for (const s of ends) {
+          const lab = el("text", { x: Math.min(this.sx(s._endI) + 7, this.geom.x1 + 10),
+                                   y: s._endY + 3.5, fill: css("--ink-2"), "font-size": 10.5,
+                                   "font-variant-numeric": "tabular-nums" }, this.svg);
+          text(lab, (this.spec.fmt || fmtCompact)(s._endV));
+        }
+      }
+    }
+  }
+
+  _renderBars(g, series, sx, sy, lo, surface) {
+    const t = this.spec.t, n = t.length;
+    if (!n) return;
+    const slot = (this.geom.x1 - this.geom.x0) / Math.max(1, n);
+    const bw = Math.max(1.5, Math.min(24, slot - 2));   /* cap thickness; leave air */
+    const R = Math.min(4, bw / 2);
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      const total = stackSum(series, i);
+      for (const s of series) {
+        const v = s.values[i];
+        if (!v) continue;
+        const yTop = sy(acc + v), yBot = sy(acc);
+        acc += v;
+        const h = Math.max(1, yBot - yTop - (acc > v ? 2 : 0)); /* 2px surface gap */
+        const x = sx(i) - bw / 2;
+        /* rounded data-end on the topmost segment only, square at baseline */
+        const isTop = Math.abs(acc - total) < 1e-9;
+        const path = isTop && h > R
+          ? `M ${x} ${yTop + h} L ${x} ${yTop + R} Q ${x} ${yTop} ${x + R} ${yTop}
+             L ${x + bw - R} ${yTop} Q ${x + bw} ${yTop} ${x + bw} ${yTop + R}
+             L ${x + bw} ${yTop + h} Z`
+          : `M ${x} ${yTop} L ${x + bw} ${yTop} L ${x + bw} ${yTop + h} L ${x} ${yTop + h} Z`;
+        el("path", { d: path, fill: s.color }, g);
+      }
+    }
+    function stackSum(ss, i) { let a = 0; for (const s of ss) a += (s.values[i] || 0); return a; }
+  }
+
+  _drawHover() {
+    const i = this.hover;
+    if (i === null || !this.hoverLayer) return;
+    this.hoverLayer.innerHTML = "";
+    const spec = this.spec, t = spec.t;
+    if (!t || !t.length) return;
+    const x = this.sx(i);
+    if (spec.type !== "bar") {
+      el("line", { x1: x, x2: x, y1: this.geom.y0 - 4, y2: this.geom.y1,
+                   stroke: css("--axis"), "stroke-width": 1,
+                   "shape-rendering": "crispEdges" }, this.hoverLayer);
+    }
+    const rows = [];
+    for (const s of (spec.series || [])) {
+      const v = s.values ? s.values[i] : null;
+      if (v === null || v === undefined || Number.isNaN(v)) continue;
+      rows.push({ name: s.name, v, color: s.color, kind: s.kind || (spec.type === "bar" ? "rect" : "line") });
+      if (spec.type !== "bar") {
+        el("circle", { cx: x, cy: this.sy(v), r: 4.5, fill: s.color, stroke: css("--surface"),
+                       "stroke-width": 2 }, this.hoverLayer);
+      }
+    }
+    /* Build the tooltip with textContent only -- names are untrusted data. */
+    this.tip.innerHTML = "";
+    const when = document.createElement("div");
+    when.className = "when";
+    text(when, fmtClock(t[i], (t[t.length - 1] - t[0]) > 86400));
+    this.tip.appendChild(when);
+    if (!rows.length) {
+      const r = document.createElement("div"); r.className = "row";
+      text(r, "no data"); this.tip.appendChild(r);
+    }
+    for (const r of rows) {
+      const row = document.createElement("div"); row.className = "row";
+      const k = document.createElement("span");
+      k.className = "key" + (r.kind === "rect" ? " rect" : "");
+      k.style.background = r.color;
+      const v = document.createElement("span"); v.className = "v";
+      text(v, (spec.fmt || fmtCompact)(r.v));
+      const nm = document.createElement("span"); nm.className = "n";
+      text(nm, r.name);
+      row.append(k, v, nm);
+      this.tip.appendChild(row);
+    }
+    const cw = this.c.clientWidth;
+    const left = Math.max(72, Math.min(cw - 72, x));
+    this.tip.style.left = left + "px";
+    this.tip.style.top = Math.max(26, this.geom.y0 + 8) + "px";
+    this.tip.style.opacity = 1;
+  }
+}
+
+/* =====================================================================
+   Application
+   ===================================================================== */
+const state = { window: "1h", model: "", data: null, charts: {}, specs: {},
+                live: { tps: null, tpsAt: 0, count: 0 }, health: null };
+
+const SERIES = ["--series-1", "--series-2", "--series-3", "--series-4"];
+const sc = (i) => css(SERIES[i % SERIES.length]);
+
+/* ---------------------------------------------------------- fetching */
+async function jget(path) {
+  const r = await fetch(path, { headers: { "Accept": "application/json" } });
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+let refreshing = false;
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  document.querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.model ? `&model=${encodeURIComponent(state.model)}` : "");
+    const [data, health] = await Promise.all([jget("/api/dashboard" + q), jget("/api/health")]);
+    state.data = data; state.health = health;
+    renderAll();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    document.querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    refreshing = false;
+  }
+}
+
+function setConn(ok, msg) {
+  const d = $("conn-dot"), t = $("conn-text");
+  if (!ok) { d.className = "dot down"; text(t, msg || "disconnected"); return; }
+  const h = state.health || {};
+  const last = h.last_request_ts;
+  const age = last ? (Date.now() / 1000 - last) : null;
+  d.className = "dot live";
+  text(t, `collector up · ${fmtCompact(h.journal_lines_read || 0)} journal lines` +
+          (age !== null ? ` · last request ${age < 90 ? "just now" : fmtMs(age * 1000) + " ago"}` : ""));
+}
+
+/* ------------------------------------------------------------ banners */
+function renderBanner() {
+  const d = state.data, h = state.health || {};
+  const msgs = [];
+  if (h.debug_logging === false) {
+    msgs.push({ sev: "critical", html: "<strong>OLLAMA_DEBUG is not set.</strong> Request rates, statuses and GPU metrics still work, but TTFT and token counts come from llama.cpp's debug timing lines and will stay empty until it is enabled." });
+  }
+  const s = d && d.summary;
+  if (s && s.queue_ms_p90 !== null && s.queue_ms_p90 > 10000) {
+    const par = (d.events || []).find((e) => (e.msg || "").indexOf("does not currently support parallel") >= 0);
+    msgs.push({ sev: "warn", html: `<strong>Requests are queueing.</strong> p90 wait is ${fmtMs(s.queue_ms_p90)} against a median runner time — work is waiting, not running.` +
+      (par ? " Ollama logged <em>“model architecture does not currently support parallel requests”</em>, so OLLAMA_NUM_PARALLEL is not being applied for this model." : "") });
+  }
+  if (s && s.exact === false) {
+    msgs.push({ sev: "warn", html: "<strong>Aggregated view.</strong> This range is older than the raw-row retention window, so percentiles come from stored histograms and are reported as bucket upper bounds." });
+  }
+  const b = $("banner");
+  if (!msgs.length) { b.className = "banner"; return; }
+  const worst = msgs.find((m) => m.sev === "critical") || msgs[0];
+  b.className = "banner show" + (worst.sev === "critical" ? " critical" : "");
+  $("banner-text").innerHTML = msgs.map((m) => m.html).join("<br><br>");
+}
+
+/* --------------------------------------------------------------- KPIs */
+function tile(label, value, unit, sub, alarm, swatch) {
+  const d = document.createElement("div");
+  d.className = "tile" + (alarm ? " alarm" : "");
+  const l = document.createElement("div"); l.className = "label"; text(l, label);
+  const v = document.createElement("div"); v.className = "value"; text(v, value);
+  if (unit) { const u = document.createElement("span"); u.className = "unit"; text(u, unit); v.appendChild(u); }
+  d.append(l, v);
+  if (sub) {
+    const s = document.createElement("div"); s.className = "sub";
+    if (swatch) { const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = swatch; s.appendChild(sw); }
+    const sp = document.createElement("span"); text(sp, sub); s.appendChild(sp);
+    d.appendChild(s);
+  }
+  return d;
+}
+
+function renderKpis() {
+  const d = state.data, s = d.summary;
+  const k = $("kpis"); k.innerHTML = "";
+  const gpuNow = latestGpu();
+  k.append(
+    tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
+    tile("TTFT p50", fmtMs(s.ttft_ms.p50), "", `p99 ${fmtMs(s.ttft_ms.p99)}`),
+    tile("TTFT p90", fmtMs(s.ttft_ms.p90), "", `max ${fmtMs(s.ttft_max_ms)}`,
+         s.ttft_ms.p90 !== null && s.ttft_ms.p90 > 30000),
+    tile("Decode speed", fmtCompact(s.decode_tps_mean, 1), "tok/s", "while generating"),
+    tile("Queue wait p90", fmtMs(s.queue_ms_p90 !== null ? s.queue_ms_p90 : s.queue_ms_mean), "",
+         s.queue_ms_p90 !== null ? `mean ${fmtMs(s.queue_ms_mean)}` : "mean (p90 needs raw window)",
+         (s.queue_ms_p90 || 0) > 10000),
+    tile("Error rate", fmtPct(s.error_rate), "", `${s.errors} of ${s.requests}`,
+         s.error_rate > 0.01, s.errors ? css("--critical") : css("--good")),
+    tile("Prompt cache", fmtPct(s.cache_hit_rate), "",
+         `${fmtCompact(s.cached_tokens, 0)} tokens reused`),
+    tile("Tokens out", fmtCompact(s.output_tokens, 0), "",
+         `in ${fmtCompact(s.input_tokens, 0)} · ${fmtCompact(s.out_tok_per_s_wall, 2)}/s`),
+    gpuNow ? tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%",
+                  `VRAM ${fmtCompact(gpuNow.memUsed / 1024, 1)}/${fmtCompact(gpuNow.memTotal / 1024, 1)} GiB`)
+           : tile("GPU utilisation", "—", "", "no nvidia-smi samples")
+  );
+  const hotO = hottest(d.gpu && d.gpu.gpus);
+  if (hotO) {
+    k.append(tile("GPU temperature", fmtTemp(hotO.temp), "",
+                  `hottest: GPU ${hotO.index}`, hotO.temp >= TEMP_ALARM_C));
+  }
+  const wattsO = totalPower(d.gpu && d.gpu.gpus);
+  if (wattsO !== null) {
+    k.append(tile("GPU power", fmtCompact(wattsO, 0), "W",
+                  `across ${(d.gpu.gpus || []).length} device${(d.gpu.gpus || []).length === 1 ? "" : "s"}`));
+  }
+}
+
+/* Consumer cards throttle in the mid-80s, so this is where a temperature stops
+   being merely warm. Only used to colour a tile, never to hide a value. */
+const TEMP_ALARM_C = 80;
+
+function fmtTemp(v) {
+  return (v === null || v === undefined || Number.isNaN(v)) ? "—"
+    : fmtCompact(v, 0) + "\u00B0C";
+}
+
+/* Temperature never starts at zero: a 33-68C range plotted from 0 wastes most
+   of the plot. The floor is the nearest 10 below the coldest reading. */
+function tempFloor(gpus) {
+  let lo = Infinity;
+  for (const gpu of gpus || []) {
+    for (const v of gpu.temp_c || []) if (v !== null && v < lo) lo = v;
+  }
+  return Number.isFinite(lo) ? Math.max(0, Math.floor((lo - 5) / 10) * 10) : 0;
+}
+
+/* Hottest current reading across a set of GPUs, and which card it is. */
+function hottest(gpus) {
+  let best = null;
+  for (const gpu of gpus || []) {
+    for (let i = gpu.temp_c.length - 1; i >= 0; i--) {
+      if (gpu.temp_c[i] !== null) {
+        if (!best || gpu.temp_c[i] > best.temp) best = { temp: gpu.temp_c[i], index: gpu.index };
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+function fmtWatts(v) {
+  return (v === null || v === undefined || Number.isNaN(v)) ? "—"
+    : fmtCompact(v, 0) + " W";
+}
+
+/* Total draw across a set of GPUs, from each card's latest reading. Power sums
+   (unlike utilisation, which averages, or temperature, which peaks). */
+function totalPower(gpus) {
+  let watts = 0, seen = 0;
+  for (const gpu of gpus || []) {
+    for (let i = gpu.power_w.length - 1; i >= 0; i--) {
+      if (gpu.power_w[i] !== null) { watts += gpu.power_w[i]; seen++; break; }
+    }
+  }
+  return seen ? watts : null;
+}
+
+function powerChartSpec(gpus, t, labelFn, colorFn, fmtTick) {
+  return {
+    type: "line", t, fmt: fmtWatts, fmtAxis: fmtWatts, fmtTick,
+    series: (gpus || []).map((gpu, i) => ({ name: labelFn(gpu), values: gpu.power_w,
+                                           color: colorFn(gpu, i) })),
+  };
+}
+
+function tempChartSpec(gpus, t, labelFn, colorFn, fmtTick) {
+  return {
+    type: "line", t, fmt: fmtTemp, fmtAxis: fmtTemp, fmtTick,
+    yMin: tempFloor(gpus),
+    series: (gpus || []).map((gpu, i) => ({ name: labelFn(gpu), values: gpu.temp_c,
+                                           color: colorFn(gpu, i) })),
+  };
+}
+
+/* Most recent non-null reading across a set of GPUs, summed for memory and
+   averaged for utilisation. */
+function latestFrom(gpus) {
+  if (!gpus || !gpus.length) return null;
+  let util = 0, memUsed = 0, memTotal = 0, seen = 0;
+  for (const gpu of gpus) {
+    for (let i = gpu.util_pct.length - 1; i >= 0; i--) {
+      if (gpu.util_pct[i] !== null) { util += gpu.util_pct[i]; seen++; break; }
+    }
+    for (let i = gpu.mem_used.length - 1; i >= 0; i--) {
+      if (gpu.mem_used[i] !== null) { memUsed += gpu.mem_used[i]; break; }
+    }
+    memTotal += gpu.mem_total || 0;
+  }
+  if (!seen) return null;
+  return { util: util / seen, memUsed, memTotal };
+}
+
+function latestGpu() {
+  const g = state.data && state.data.gpu;
+  return latestFrom(g && g.gpus);
+}
+
+/* ------------------------------------------------------------- charts */
+function legend(elId, series) {
+  const l = $(elId); if (!l) return;
+  l.innerHTML = "";
+  /* A legend is always present for >= 2 series; one series needs none. */
+  if (series.length < 2) return;
+  for (const s of series) {
+    const item = document.createElement("span"); item.className = "item";
+    const key = document.createElement("span");
+    key.className = "key" + (s.kind === "rect" ? " rect" : "");
+    key.style.background = s.color;
+    const nm = document.createElement("span"); text(nm, s.name);
+    item.append(key, nm);
+    l.appendChild(item);
+  }
+}
+
+function draw(name, plotId, legendId, spec) {
+  state.specs[name] = spec;
+  legend(legendId, spec.series.filter((s) => s.values && s.values.some((v) => v !== null)));
+  const c = state.charts[name];
+  if (c) c.update(spec); else state.charts[name] = new Chart($(plotId), spec);
+  if (state.tableView && state.tableView[name]) renderChartTable(name);
+}
+
+function renderCharts() {
+  const d = state.data, ts = d.timeseries, S = ts.series;
+  const spanS = d.end - d.start;
+  const fmtTick = tickFormatterForSpan(spanS);
+
+  draw("ttft", "p-ttft", "l-ttft", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: fmtMs, fmtTick,
+    series: [
+      { name: "p50", values: S.ttft_p50, color: sc(0) },
+      { name: "p90", values: S.ttft_p90, color: sc(1) },
+      { name: "p99", values: S.ttft_p99, color: sc(2) },
+    ],
+  });
+  text($("n-ttft"), ts.exact ? "exact percentiles" : "histogram percentiles (bucket upper bound)");
+
+  draw("tps", "p-tps", "l-tps", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s", fmtTick,
+    series: [
+      { name: "output", values: S.out_tps, color: sc(0) },
+      { name: "input (prompt)", values: S.in_tps, color: sc(1) },
+    ],
+  });
+
+  draw("rate", "p-rate", "l-rate", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 3) + " req/s", fmtTick,
+    fmtAxis: (v) => fmtCompact(v, 2),
+    series: [{ name: "requests/sec", values: S.req_per_s, color: sc(0) }],
+  });
+
+  draw("queue", "p-queue", "l-queue", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: fmtMs, fmtTick,
+    series: [{ name: "mean queue wait", values: S.queue_ms, color: sc(0) }],
+  });
+
+  draw("decode", "p-decode", "l-decode", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s", fmtTick,
+    series: [{ name: "decode tok/s", values: S.decode_tps, color: sc(0) }],
+  });
+
+  /* Errors: status palette, because these colors mean state, not identity.
+     Legend keys carry the label so color never stands alone. */
+  const errSeries = buildErrorSeries(ts);
+  draw("err", "p-err", "l-err", {
+    type: "bar", stacked: true, t: ts.t, fmt: (v) => fmtCompact(v, 0), fmtTick,
+    fmtAxis: (v) => fmtCompact(v, 0), series: errSeries,
+  });
+  const st = (d.statuses || []).filter((x) => x.status && x.status >= 400);
+  text($("n-err"), st.length ? st.map((x) => `${x.status}×${x.count}`).join("  ") : "none in window");
+  text($("n-errtbl"), `${(d.errors || []).length} shown`);
+
+  /* GPU */
+  const g = d.gpu || { t: [], gpus: [] };
+  const utilSeries = g.gpus.map((gpu, i) => ({
+    name: `GPU ${gpu.index}${gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : ""}`,
+    values: gpu.util_pct, color: sc(i),
+  }));
+  draw("gpu", "p-gpu", "l-gpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick, series: utilSeries,
+  });
+  text($("n-gpu"), g.gpus.length ? `${g.gpus.length} device${g.gpus.length > 1 ? "s" : ""}` : "no samples yet");
+
+  draw("gtemp", "p-gtemp", "l-gtemp",
+       tempChartSpec(g.gpus, g.t,
+                     (gpu) => `GPU ${gpu.index}`, (gpu, i) => sc(i), fmtTick));
+  {
+    const hot = hottest(g.gpus);
+    text($("n-gtemp"), hot ? `hottest now ${fmtTemp(hot.temp)} on GPU ${hot.index}`
+                           : "no samples yet");
+  }
+
+  draw("gpower", "p-gpower", "l-gpower",
+       powerChartSpec(g.gpus, g.t, (gpu) => `GPU ${gpu.index}`,
+                      (gpu, i) => sc(i), fmtTick));
+  {
+    const w = totalPower(g.gpus);
+    text($("n-gpower"), w === null ? "no samples yet" : `${fmtWatts(w)} total now`);
+  }
+
+  const vramSeries = g.gpus.map((gpu, i) => ({
+    name: `GPU ${gpu.index}`, values: gpu.mem_used.map((v) => v === null ? null : v / 1024),
+    color: sc(i),
+  }));
+  const vtotal = g.gpus.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
+  draw("vram", "p-vram", "l-vram", {
+    type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick, series: vramSeries,
+    yMax: g.gpus.length ? Math.max(...g.gpus.map((x) => (x.mem_total || 0) / 1024)) : undefined,
+  });
+  text($("n-vram"), vtotal ? `${fmtCompact(vtotal, 0)} GiB total across devices` : "");
+
+  /* hero sparkline: the same output-tok/s series, de-emphasised */
+  const hs = state.charts.herospark;
+  const hspec = { type: "line", spark: true, t: ts.t, series: [{ name: "out tok/s", values: S.out_tps, color: sc(0) }] };
+  if (hs) hs.update(hspec); else state.charts.herospark = new Chart($("hero-spark"), hspec);
+}
+
+function buildErrorSeries(ts) {
+  /* Split the error rate series into 4xx/5xx using the window's status mix.
+     The timeseries carries err_per_s only, so counts per bucket are derived
+     from it and labelled as counts per bucket (never a rate x width lie). */
+  const step = ts.step;
+  const counts = (ts.series.err_per_s || []).map((v) => v === null ? null : Math.round(v * step));
+  return [{ name: "errors (4xx/5xx)", values: counts, color: css("--critical"), kind: "rect" }];
+}
+
+/* --------------------------------------------------- table-view twins */
+function renderChartTable(name) {
+  const spec = state.specs[name];
+  const wrap = $("t-" + name);
+  if (!spec || !wrap) return;
+  const rows = [];
+  for (let i = 0; i < spec.t.length; i++) {
+    if (!spec.series.some((s) => s.values && s.values[i] !== null && s.values[i] !== undefined)) continue;
+    rows.push(i);
+  }
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const htr = document.createElement("tr");
+  htr.appendChild(th("Time"));
+  for (const s of spec.series) htr.appendChild(th(s.name, true));
+  thead.appendChild(htr); table.appendChild(thead);
+  const tb = document.createElement("tbody");
+  for (const i of rows.slice(-500).reverse()) {
+    const tr = document.createElement("tr");
+    tr.appendChild(td(fmtClock(spec.t[i], (spec.t[spec.t.length - 1] - spec.t[0]) > 86400)));
+    for (const s of spec.series) {
+      const v = s.values ? s.values[i] : null;
+      tr.appendChild(td(v === null || v === undefined ? "—" : (spec.fmt || fmtCompact)(v), true));
+    }
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  wrap.innerHTML = ""; wrap.appendChild(table);
+  if (!rows.length) { wrap.innerHTML = ""; const e = document.createElement("div"); e.className = "empty"; text(e, "No data in this window."); wrap.appendChild(e); }
+}
+
+function th(label, num) { const n = document.createElement("th"); if (num) n.className = "num"; text(n, label); return n; }
+function td(v, num, strong) {
+  const n = document.createElement("td");
+  n.className = (num ? "num " : "") + (strong ? "strong" : "");
+  text(n, v); return n;
+}
+function tdNode(node, num) { const n = document.createElement("td"); if (num) n.className = "num"; n.appendChild(node); return n; }
+function pill(label, kind) { const s = document.createElement("span"); s.className = "pill " + kind; text(s, label); return s; }
+
+function table(wrapId, cols, rows, rowFn, emptyMsg) {
+  const wrap = $(wrapId); if (!wrap) return;
+  wrap.innerHTML = "";
+  if (!rows || !rows.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    text(e, emptyMsg || "Nothing in this window."); wrap.appendChild(e); return;
+  }
+  const t = document.createElement("table");
+  const thead = document.createElement("thead"), htr = document.createElement("tr");
+  for (const c of cols) htr.appendChild(th(c.label, c.num));
+  thead.appendChild(htr); t.appendChild(thead);
+  const tb = document.createElement("tbody");
+  for (const r of rows) { const tr = document.createElement("tr"); rowFn(tr, r); tb.appendChild(tr); }
+  t.appendChild(tb); wrap.appendChild(t);
+}
+
+function statusPill(status) {
+  if (status === null || status === undefined) return pill("no status", "info");
+  if (status >= 500) return pill(String(status), "err");
+  if (status >= 400) return pill(String(status), "warn");
+  return pill(String(status), "ok");
+}
+function attribFlag(a) {
+  if (!a || a === "exact") return null;
+  const s = document.createElement("span"); s.className = "flag";
+  text(s, a === "ambiguous" ? "uncertain pairing" : a === "orphan" ? "no access line" : a === "none" ? "no timings" : a);
+  return s;
+}
+
+function renderTables() {
+  const d = state.data;
+
+  table("t-models",
+    [{ label: "Model" }, { label: "Requests", num: true }, { label: "Errors", num: true },
+     { label: "TTFT mean", num: true }, { label: "TTFT max", num: true },
+     { label: "Queue mean", num: true }, { label: "Decode tok/s", num: true },
+     { label: "Tokens in", num: true }, { label: "Cached", num: true }, { label: "Tokens out", num: true }],
+    d.models, (tr, m) => {
+      tr.appendChild(td(m.model, false, true));
+      tr.appendChild(td(fmtCompact(m.requests, 0), true));
+      tr.appendChild(td(m.errors ? String(m.errors) : "0", true));
+      tr.appendChild(td(fmtMs(m.ttft_ms_mean), true));
+      tr.appendChild(td(fmtMs(m.ttft_ms_max), true));
+      tr.appendChild(td(fmtMs(m.queue_ms_mean), true));
+      tr.appendChild(td(fmtCompact(m.decode_tps, 1), true));
+      tr.appendChild(td(fmtCompact(m.input_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(m.cached_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(m.output_tokens, 0), true));
+    }, "No inference requests in this window.");
+  text($("n-models"), `${d.models.length} model${d.models.length === 1 ? "" : "s"}`);
+
+  const maxTtft = Math.max(1, ...(d.slowest || []).map((r) => r.ttft_ms || 0));
+  table("t-slowest",
+    [{ label: "Time" }, { label: "Model" }, { label: "TTFT", num: true }, { label: "" },
+     { label: "Prompt tok", num: true }, { label: "Out tok", num: true }],
+    d.slowest, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(td(r.model || "—", false, true));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(tdNode(barCell(r.ttft_ms / maxTtft, css("--series-1"))));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens_total || r.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+    });
+
+  const maxQ = Math.max(1, ...(d.slowest_queue || []).map((r) => r.queue_ms || 0));
+  table("t-slowq",
+    [{ label: "Time" }, { label: "Model" }, { label: "Queued", num: true }, { label: "" },
+     { label: "Runner", num: true }, { label: "Out tok", num: true }],
+    d.slowest_queue, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(td(r.model || "—", false, true));
+      tr.appendChild(td(fmtMs(r.queue_ms), true));
+      tr.appendChild(tdNode(barCell(r.queue_ms / maxQ, css("--series-2"))));
+      tr.appendChild(td(fmtMs(r.total_ms), true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+    });
+
+  table("t-errors",
+    [{ label: "Time" }, { label: "Status" }, { label: "Endpoint" }, { label: "Model" },
+     { label: "Client" }, { label: "Latency", num: true }],
+    d.errors, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(statusPill(r.status)));
+      tr.appendChild(td(r.endpoint, false, true));
+      tr.appendChild(td(r.model || "—"));
+      tr.appendChild(td(r.client_ip || "—"));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+    }, "No errors in this window.");
+
+  table("t-events",
+    [{ label: "Time" }, { label: "Event" }, { label: "Model" }, { label: "Duration", num: true },
+     { label: "Detail" }],
+    d.events, (tr, e) => {
+      tr.appendChild(td(fmtClock(e.ts)));
+      tr.appendChild(tdNode(eventPill(e)));
+      tr.appendChild(td(e.model || "—", false, true));
+      tr.appendChild(td(e.duration_ms ? fmtMs(e.duration_ms) : "—", true));
+      tr.appendChild(td(e.msg || ""));
+    });
+
+  table("t-requests",
+    [{ label: "Time" }, { label: "Status" }, { label: "Model" }, { label: "Endpoint" },
+     { label: "Client" }, { label: "TTFT", num: true }, { label: "Queue", num: true },
+     { label: "Latency", num: true }, { label: "In", num: true }, { label: "Cached", num: true },
+     { label: "Out", num: true }, { label: "tok/s", num: true }, { label: "" }],
+    d.requests, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(statusPill(r.status)));
+      tr.appendChild(td(r.model || "—", false, true));
+      tr.appendChild(td(r.endpoint));
+      tr.appendChild(td(r.client_ip || "—"));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(td(fmtMs(r.queue_ms), true));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.cached_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.decode_tps, 1), true));
+      const f = attribFlag(r.attribution);
+      tr.appendChild(f ? tdNode(f) : td(r.truncated ? "truncated" : ""));
+    });
+  text($("n-reqs"), `${(d.requests || []).length} most recent`);
+
+  const live = d.live || {};
+  table("t-loaded",
+    [{ label: "Model" }, { label: "VRAM", num: true }, { label: "Context", num: true }, { label: "Expires" }],
+    live.models, (tr, m) => {
+      tr.appendChild(td(m.name, false, true));
+      tr.appendChild(td(fmtBytes(m.size_vram), true));
+      tr.appendChild(td(fmtCompact(m.context_length, 0), true));
+      tr.appendChild(td(m.expires_at ? new Date(m.expires_at).toLocaleTimeString(undefined, { hour12: false }) : "—"));
+    }, "No models resident (or ollama is not reachable).");
+  text($("n-loaded"), live.ts ? `${live.loaded_count} resident · ${live.inflight || 0} in flight` : "no sample yet");
+}
+
+function eventPill(e) {
+  const k = e.kind;
+  if (k === "model_loaded") return pill("load", "info");
+  if (k === "unload") return pill("evict", "info");
+  if (k === "truncation") return pill("truncated", "warn");
+  if (k === "problem") return pill(e.level === "ERROR" ? "error" : "warning", e.level === "ERROR" ? "err" : "warn");
+  return pill(k, "info");
+}
+
+function barCell(frac, color) {
+  const d = document.createElement("div"); d.className = "bar-cell";
+  const track = document.createElement("div"); track.className = "track";
+  const fill = document.createElement("div"); fill.className = "fill";
+  fill.style.width = Math.max(2, Math.min(100, (frac || 0) * 100)) + "%";
+  fill.style.background = color;
+  track.appendChild(fill); d.appendChild(track);
+  return d;
+}
+
+/* ---------------------------------------------------------------- hero */
+function renderHero() {
+  const s = state.data.summary;
+  const liveFresh = state.live.tps !== null && (Date.now() - state.live.tpsAt) < 20000;
+  if (liveFresh) {
+    text($("hero-label"), "Output tokens/sec — generating now");
+    text($("hero-value"), fmtCompact(state.live.tps, 1));
+  } else {
+    text($("hero-label"), "Output tokens/sec — window average");
+    text($("hero-value"), fmtCompact(s.out_tok_per_s_wall, 2));
+  }
+}
+
+function renderAll() {
+  const d = state.data;
+  renderBanner();
+  renderKpis();
+  renderCharts();
+  renderTables();
+  renderHero();
+  const sel = $("model");
+  const names = d.model_names || [];
+  if (sel.dataset.names !== names.join("|")) {
+    sel.dataset.names = names.join("|");
+    sel.innerHTML = "";
+    const all = document.createElement("option"); all.value = ""; text(all, "All models");
+    sel.appendChild(all);
+    for (const n of names) {
+      const o = document.createElement("option"); o.value = n; text(o, n);
+      sel.appendChild(o);
+    }
+    sel.value = state.model;
+  }
+  const h = state.health || {};
+  text($("f-source"), `source: journalctl -u ollama (debug timing lines)`);
+  text($("f-rows"), `${fmtCompact(h.rows || 0, 0)} raw rows · rollups kept indefinitely`);
+  text($("f-db"), h.db_bytes ? `db ${fmtBytes(h.db_bytes)}` : "");
+  text($("hostline"), `${d.window} window · ${fmtClock(d.start, true)} → ${fmtClock(d.end)}`);
+}
+
+/* ----------------------------------------------------------------- SSE */
+let es = null;
+function connectStream() {
+  if (es) es.close();
+  es = new EventSource("/api/stream");
+  es.onmessage = (m) => {
+    let ev; try { ev = JSON.parse(m.data); } catch (err) { return; }
+    if (ev.type === "hello") { (ev.recent || []).forEach(pushLive); return; }
+    if (ev.type === "gen") {
+      state.live.tps = ev.tps_3s || ev.tps;
+      state.live.tpsAt = Date.now();
+      if (state.data) renderHero();
+      return;
+    }
+    if (ev.type === "request") { pushLive(ev); state.live.count++; text($("n-live"), `${state.live.count} since page load`); return; }
+    if (ev.type === "sample") { /* GPU tiles refresh on the next poll cycle */ }
+  };
+  es.onerror = () => { /* EventSource reconnects on its own */ };
+}
+
+function pushLive(ev) {
+  if (ev.type !== "request") return;
+  const box = $("ticker");
+  if (box.firstElementChild && box.firstElementChild.className === "empty") box.innerHTML = "";
+  const row = document.createElement("div"); row.className = "ev";
+  const t = document.createElement("span"); t.className = "t"; text(t, fmtClock(ev.ts));
+  const st = statusPill(ev.status);
+  const m = document.createElement("span"); m.className = "m"; text(m, ev.model || "—");
+  const ep = document.createElement("span"); text(ep, ev.endpoint || "");
+  const mm = document.createElement("span"); mm.className = "metrics";
+  const parts = [["ttft", fmtMs(ev.ttft_ms)], ["queue", fmtMs(ev.queue_ms)],
+                 ["out", fmtCompact(ev.output_tokens, 0)], ["tok/s", fmtCompact(ev.decode_tps, 1)]];
+  for (const [k, v] of parts) {
+    const s = document.createElement("span");
+    text(s, `${k} ${v}`);
+    mm.appendChild(s);
+  }
+  row.append(t, st, m, ep, mm);
+  box.insertBefore(row, box.firstChild);
+  while (box.children.length > 80) box.removeChild(box.lastChild);
+}
+
+/* ------------------------------------------------------------ controls */
+$("range").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-w]"); if (!b) return;
+  for (const x of $("range").querySelectorAll("button")) x.removeAttribute("aria-pressed");
+  b.setAttribute("aria-pressed", "true");
+  state.window = b.dataset.w;
+  refreshActive();
+});
+$("model").addEventListener("change", (e) => { state.model = e.target.value; refresh(); });
+$("theme").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "light" : cur === "light" ? "dark"
+    : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+  document.documentElement.setAttribute("data-theme", next);
+  localStorage.setItem("inferwatch-theme", next);
+  if (state.data) renderAll();
+});
+const savedTheme = localStorage.getItem("inferwatch-theme");
+if (savedTheme) document.documentElement.setAttribute("data-theme", savedTheme);
+
+state.tableView = {};
+document.querySelectorAll(".card .tools").forEach((tools) => {
+  const card = tools.closest(".card");
+  const name = card.id.replace(/^c-/, "");
+  tools.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-view]"); if (!b) return;
+    for (const x of tools.querySelectorAll("button")) x.removeAttribute("aria-pressed");
+    b.setAttribute("aria-pressed", "true");
+    const showTable = b.dataset.view === "table";
+    state.tableView[name] = showTable;
+    const plot = $("p-" + name), tbl = $("t-" + name), leg = $("l-" + name);
+    if (plot) plot.hidden = showTable;
+    if (leg) leg.hidden = showTable;
+    if (tbl) tbl.hidden = !showTable;
+    if (showTable) renderChartTable(name);
+    else if (state.charts[name]) state.charts[name].render();
+  });
+});
+
+
+/* =====================================================================
+   Tabs
+   ===================================================================== */
+state.tab = "ollama";
+state.vsource = "";
+state.vdata = null;
+state.settings = null;
+
+function switchTab(name) {
+  state.tab = name;
+  for (const btn of $("tabs").querySelectorAll("button"))
+    btn.setAttribute("aria-selected", String(btn.dataset.tab === name));
+  for (const t of ["ollama", "vllm", "settings"])
+    $("tab-" + t).hidden = t !== name;
+  // The filter row scopes the metric tabs only, and each shows a different
+  // dimension selector.
+  document.querySelector(".filters").hidden = name === "settings";
+  $("model-wrap").hidden = name !== "ollama";
+  $("vsource-wrap").hidden = name !== "vllm";
+  history.replaceState(null, "", "?" + new URLSearchParams({
+    tab: name, window: state.window,
+  }));
+  refreshActive();
+}
+
+function refreshActive() {
+  if (state.tab === "ollama") return refresh();
+  if (state.tab === "vllm") return refreshVllm();
+  return refreshSettings();
+}
+
+$("tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-tab]");
+  if (b) switchTab(b.dataset.tab);
+});
+
+/* =====================================================================
+   vLLM tab
+   ===================================================================== */
+let vRefreshing = false;
+async function refreshVllm() {
+  if (vRefreshing) return;
+  vRefreshing = true;
+  $("tab-vllm").querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.vsource ? `&source=${encodeURIComponent(state.vsource)}` : "");
+    state.vdata = await jget("/api/vllm/dashboard" + q);
+    renderVllm();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    $("tab-vllm").querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    vRefreshing = false;
+  }
+}
+
+function renderVllm() {
+  const d = state.vdata;
+  const sel = $("vsource");
+  const names = (d.instances || []).map((i) => i.source);
+  if (sel.dataset.names !== names.join("|")) {
+    sel.dataset.names = names.join("|");
+    sel.innerHTML = "";
+    for (const n of names) {
+      const o = document.createElement("option"); o.value = n; text(o, n);
+      sel.appendChild(o);
+    }
+  }
+  if (d.source) { state.vsource = d.source; sel.value = d.source; }
+
+  if (!d.summary) {
+    $("v-kpis").innerHTML = "";
+    const e = document.createElement("div"); e.className = "empty";
+    text(e, d.hint || "No vLLM instance configured yet — add one under Settings.");
+    $("v-kpis").appendChild(e);
+    return;
+  }
+
+  const s = d.summary, ts = d.timeseries, S = ts.series;
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
+
+  /* Means are exact; percentiles are bucket bounds. Lead with the mean. */
+  const k = $("v-kpis"); k.innerHTML = "";
+  k.append(
+    tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
+    tile("TTFT mean", fmtMs(s.ttft_ms.mean), "", `p90 at most ${fmtMs(s.ttft_ms.p90)}`),
+    tile("Inter-token latency", fmtMs(s.itl_ms.mean), "",
+         s.itl_ms.mean ? `${fmtCompact(1000 / s.itl_ms.mean, 1)} tok/s equivalent` : "no data"),
+    tile("End-to-end mean", fmtMs(s.e2e_ms.mean), "", `queue ${fmtMs(s.queue_ms.mean)}`),
+    tile("KV cache peak", fmtPct(s.kv_cache_usage.max), "",
+         `mean ${fmtPct(s.kv_cache_usage.mean)}`, (s.kv_cache_usage.max || 0) > 0.95),
+    tile("Batch peak", fmtCompact(s.running.max, 0), "running",
+         `waiting peak ${fmtCompact(s.waiting.max, 0)}`),
+    tile("Preemptions", fmtCompact(s.preemptions, 0), "",
+         s.preemptions ? "KV cache pressure" : "none",
+         (s.preemptions || 0) > 0),
+    tile("Tokens out", fmtCompact(s.output_tokens, 0), "",
+         `in ${fmtCompact(s.input_tokens, 0)} · ${fmtCompact(s.out_tok_per_s, 2)}/s`),
+    tile("Draft acceptance", s.spec_decode.acceptance_rate === null ? "—"
+         : fmtPct(s.spec_decode.acceptance_rate), "",
+         s.spec_decode.draft_tokens ? `${fmtCompact(s.spec_decode.draft_tokens, 0)} draft tokens`
+                                    : "speculative decoding off"),
+    tile("Errors", fmtPct(s.error_rate), "", `${fmtCompact(s.errors, 0)} of ${fmtCompact(s.requests, 0)}`,
+         s.error_rate > 0.01, s.errors ? css("--critical") : css("--good"))
+  );
+
+  /* GPU panels. nvidia-smi reports the whole host, but an instance only holds
+     some of the cards, so the ones attributed to it carry the colour and the
+     rest are drawn in the de-emphasis grey. */
+  const g = d.gpu || { t: [], gpus: [] };
+  const inst = (d.instances || []).find((i) => i.source === d.source) || {};
+  const mine = inst.gpu_indices;                 // null = attribution unknown
+  const isMine = (i) => !mine || mine.includes(i);
+  const attributed = g.gpus.filter((x) => isMine(x.index));
+  const gpuNow = latestFrom(attributed);
+
+  if (gpuNow) {
+    k.append(
+      tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%",
+           mine ? `GPU ${mine.join(", ")}` : "all devices (unattributed)"),
+      tile("VRAM in use", fmtCompact(gpuNow.memUsed / 1024, 1), "GiB",
+           `of ${fmtCompact(gpuNow.memTotal / 1024, 1)} GiB · ${fmtPct(gpuNow.memUsed / (gpuNow.memTotal || 1))}`,
+           gpuNow.memUsed / (gpuNow.memTotal || 1) > 0.95)
+    );
+  } else {
+    k.append(tile("GPU utilisation", "—", "", "no nvidia-smi samples"));
+  }
+  const hotV = hottest(attributed);
+  if (hotV) {
+    k.append(tile("GPU temperature", fmtTemp(hotV.temp), "",
+                  `hottest: GPU ${hotV.index}`, hotV.temp >= TEMP_ALARM_C));
+  }
+  const wattsV = totalPower(attributed);
+  if (wattsV !== null) {
+    k.append(tile("GPU power", fmtCompact(wattsV, 0), "W",
+                  mine ? `GPU ${mine.join(", ")}` : "all devices (unattributed)"));
+  }
+
+  const gpuLabel = (gpu) => `GPU ${gpu.index}` +
+    (gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : "") +
+    (mine && !isMine(gpu.index) ? " (other engine)" : "");
+  let slot = 0;
+  const gpuColour = (gpu) => isMine(gpu.index) ? sc(slot++) : css("--deemph");
+
+  slot = 0;
+  draw("vtemp", "p-vtemp", "l-vtemp",
+       tempChartSpec(g.gpus, g.t, gpuLabel, gpuColour, fmtTick));
+  text($("n-vtemp"), hotV
+    ? `hottest of this instance's cards: ${fmtTemp(hotV.temp)} on GPU ${hotV.index}`
+    : (g.gpus.length ? "no readings yet" : "no samples yet"));
+
+  slot = 0;
+  draw("vpower", "p-vpower", "l-vpower",
+       powerChartSpec(g.gpus, g.t, gpuLabel, gpuColour, fmtTick));
+  text($("n-vpower"), wattsV === null ? "no readings yet"
+    : `${fmtWatts(wattsV)} across this instance's cards`);
+
+  slot = 0;
+  draw("vgpu", "p-vgpu", "l-vgpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((gpu) => ({ name: gpuLabel(gpu), values: gpu.util_pct,
+                                   color: gpuColour(gpu) })),
+  });
+  text($("n-vgpu"), !g.gpus.length ? "no samples yet"
+    : mine ? `this instance holds GPU ${mine.join(", ")} of ${g.gpus.length}`
+           : `${g.gpus.length} device${g.gpus.length > 1 ? "s" : ""}; could not attribute`);
+
+  slot = 0;
+  draw("vvram", "p-vvram", "l-vvram", {
+    type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    yMax: g.gpus.length ? Math.max(...g.gpus.map((x) => (x.mem_total || 0) / 1024)) : undefined,
+    series: g.gpus.map((gpu) => ({
+      name: gpuLabel(gpu),
+      values: gpu.mem_used.map((v) => v === null ? null : v / 1024),
+      color: gpuColour(gpu),
+    })),
+  });
+  const totalMine = attributed.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
+  text($("n-vvram"), totalMine ? `${fmtCompact(totalMine, 0)} GiB across this instance's devices` : "");
+
+  text($("v-hero"), fmtCompact(s.out_tok_per_s, 2));
+  const hs = state.charts.vhero;
+  const hspec = { type: "line", spark: true, t: ts.t,
+                  series: [{ name: "out tok/s", values: S.out_tok_per_s, color: sc(0) }] };
+  if (hs) hs.update(hspec); else state.charts.vhero = new Chart($("v-hero-spark"), hspec);
+
+  draw("vttft", "p-vttft", "l-vttft", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: fmtMs, fmtTick,
+    series: [
+      { name: "p50", values: S.ttft_p50, color: sc(0) },
+      { name: "p90", values: S.ttft_p90, color: sc(1) },
+      { name: "p99", values: S.ttft_p99, color: sc(2) },
+    ],
+  });
+  text($("n-vttft"), "histogram bucket upper bounds");
+
+  draw("vtps", "p-vtps", "l-vtps", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s", fmtTick,
+    series: [
+      { name: "generation", values: S.out_tok_per_s, color: sc(0) },
+      { name: "prompt", values: S.in_tok_per_s, color: sc(1) },
+    ],
+  });
+
+  draw("vsat", "p-vsat", "l-vsat", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1), fmtAxis: (v) => fmtCompact(v, 0),
+    fmtTick,
+    series: [
+      { name: "running", values: S.running, color: sc(0) },
+      { name: "waiting", values: S.waiting, color: sc(1) },
+    ],
+  });
+
+  draw("vkv", "p-vkv", "l-vkv", {
+    type: "line", t: ts.t, yMax: 1, fmt: (v) => fmtPct(v), fmtAxis: (v) => fmtPct(v, 0),
+    fmtTick, series: [{ name: "mean per minute", values: S.kv_cache_usage, color: sc(0) }],
+  });
+
+  draw("vqueue", "p-vqueue", "l-vqueue", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: fmtMs, fmtTick,
+    series: [{ name: "queue p90 (bucket bound)", values: S.queue_p90, color: sc(0) }],
+  });
+
+  draw("vrate", "p-vrate", "l-vrate", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 3) + " req/s",
+    fmtAxis: (v) => fmtCompact(v, 2), fmtTick,
+    series: [{ name: "completions/sec", values: S.req_per_s, color: sc(0) }],
+  });
+
+  table("t-vfinish", [{ label: "Finish reason" }, { label: "Count", num: true }],
+    (s.finish_reasons || []).filter((r) => r.count > 0),
+    (tr, r) => {
+      tr.appendChild(tdNode(pill(r.finished_reason,
+        r.finished_reason === "error" || r.finished_reason === "abort" ? "err"
+          : r.finished_reason === "length" ? "warn" : "ok")));
+      tr.appendChild(td(fmtCompact(r.count, 0), true));
+    }, "No completions in this window.");
+
+  table("t-vinst",
+    [{ label: "Instance" }, { label: "Model" }, { label: "State" }, { label: "Last seen" }],
+    d.instances,
+    (tr, i) => {
+      tr.appendChild(td(i.source, false, true));
+      tr.appendChild(td(i.model || "—"));
+      tr.appendChild(tdNode(i.reachable ? pill("reachable", "ok") : pill("unreachable", "err")));
+      tr.appendChild(td(i.last_seen ? fmtClock(i.last_seen) : "—"));
+      if (!i.reachable && i.error) tr.title = i.error;
+    }, "No instances yet.");
+  text($("n-vinst"), `${(d.instances || []).length} configured`);
+}
+
+$("vsource").addEventListener("change", (e) => { state.vsource = e.target.value; refreshVllm(); });
+
+/* =====================================================================
+   Settings tab
+   ===================================================================== */
+async function refreshSettings() {
+  try {
+    state.settings = await jget("/api/config");
+    renderSettings();
+    setConn(true);
+  } catch (e) {
+    setConn(false, String(e.message || e));
+  }
+}
+
+function inputFor(st) {
+  let el;
+  if (st.type === "bool") {
+    el = document.createElement("input");
+    el.type = "checkbox";
+    el.checked = !!st.value;
+  } else if (st.type === "enum") {
+    el = document.createElement("select");
+    for (const c of st.choices || []) {
+      const o = document.createElement("option"); o.value = c; text(o, c);
+      el.appendChild(o);
+    }
+    el.value = String(st.value);
+  } else {
+    el = document.createElement("input");
+    el.type = (st.type === "int" || st.type === "float") ? "number" : "text";
+    if (st.type === "float") el.step = "any";
+    if (st.min !== null && st.min !== undefined) el.min = st.min;
+    if (st.max !== null && st.max !== undefined) el.max = st.max;
+    el.value = String(st.value);
+  }
+  el.dataset.key = st.key;
+  el.dataset.type = st.type;
+  el.disabled = !!st.locked;
+  return el;
+}
+
+function renderSettings() {
+  const d = state.settings;
+  const host = $("set-groups"); host.innerHTML = "";
+  const pinned = d.settings.filter((s) => s.locked);
+  const note = $("set-note");
+  if (pinned.length) {
+    note.className = "banner show";
+    $("set-note-text").innerHTML =
+      `<strong>${pinned.length} setting${pinned.length === 1 ? "" : "s"} pinned outside the UI.</strong> ` +
+      `Values supplied on the command line or in the environment win over anything saved here, ` +
+      `so they are shown read-only: ` +
+      pinned.map((s) => `<code>${s.key}</code> (${s.origin})`).join(", ") + ".";
+  } else {
+    note.className = "banner";
+  }
+
+  for (const g of d.groups) {
+    const items = d.settings.filter((s) => s.group === g);
+    if (!items.length) continue;
+    const box = document.createElement("div"); box.className = "setgroup";
+    const h = document.createElement("h3"); text(h, g); box.appendChild(h);
+    for (const st of items) {
+      const row = document.createElement("div"); row.className = "setrow";
+      const left = document.createElement("div");
+      const nm = document.createElement("div"); nm.className = "name"; text(nm, st.label);
+      left.appendChild(nm);
+      if (st.help) { const hp = document.createElement("div"); hp.className = "help"; text(hp, st.help); left.appendChild(hp); }
+      const mid = document.createElement("div");
+      mid.appendChild(inputFor(st));
+      const right = document.createElement("div"); right.className = "side";
+      const badge = document.createElement("span");
+      badge.className = "origin " + st.origin;
+      text(badge, st.origin === "default" ? "default"
+        : st.origin === "database" ? "saved here"
+        : st.origin === "env" ? `from ${st.env}` : "from command line");
+      right.appendChild(badge);
+      if (st.restart) {
+        const r = document.createElement("span"); r.className = "origin";
+        text(r, "needs restart"); right.appendChild(r);
+      }
+      if (st.origin === "database") {
+        const b = document.createElement("button");
+        b.className = "btn"; b.style.fontSize = "11px"; b.style.padding = "1px 8px";
+        text(b, "reset to default");
+        b.onclick = async () => {
+          await fetch("/api/config/reset", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: st.key }) });
+          refreshSettings();
+        };
+        right.appendChild(b);
+      }
+      const errBox = document.createElement("div");
+      errBox.className = "err"; errBox.id = "err-" + st.key; errBox.hidden = true;
+      right.appendChild(errBox);
+      row.append(left, mid, right);
+      box.appendChild(row);
+    }
+    host.appendChild(box);
+  }
+  renderSources();
+}
+
+$("set-save").addEventListener("click", async () => {
+  const values = {};
+  for (const el of $("set-groups").querySelectorAll("[data-key]")) {
+    if (el.disabled) continue;
+    values[el.dataset.key] = el.dataset.type === "bool" ? el.checked : el.value;
+  }
+  for (const e of $("set-groups").querySelectorAll(".err")) { e.hidden = true; text(e, ""); }
+  const r = await fetch("/api/config", { method: "PUT",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const errs = (body.detail && body.detail.errors) || {};
+    for (const [k, msg] of Object.entries(errs)) {
+      const box = $("err-" + k);
+      if (box) { text(box, msg); box.hidden = false; }
+    }
+    return;
+  }
+  const restart = body.restart_required || [];
+  const btn = $("set-save");
+  text(btn, restart.length ? `Saved — restart needed for ${restart.join(", ")}` : "Saved");
+  setTimeout(() => text(btn, "Save changes"), 4000);
+  // Pick up a changed auto-refresh cadence immediately.
+  try { const p = await jget("/api/prefs"); scheduleRefresh(p.refresh_s); } catch (e) {}
+  refreshSettings();
+});
+
+/* ------------------------------------------------------------ sources */
+function renderSources() {
+  const d = state.settings;
+  table("t-sources",
+    [{ label: "" }, { label: "Name" }, { label: "Kind" }, { label: "Configuration" }, { label: "" }],
+    d.sources,
+    (tr, s) => {
+      tr.appendChild(tdNode(pill(s.enabled ? "on" : "off", s.enabled ? "ok" : "info")));
+      tr.appendChild(td(s.name, false, true));
+      tr.appendChild(td((d.source_kinds[s.kind] || {}).label || s.kind));
+      tr.appendChild(td(Object.entries(s.config || {})
+        .filter(([, v]) => v !== "" && v !== null && v !== undefined)
+        .map(([k, v]) => `${k}=${v}`).join("  ")));
+      const acts = document.createElement("div");
+      acts.style.display = "flex"; acts.style.gap = "6px";
+      const toggle = document.createElement("button");
+      toggle.className = "btn"; toggle.style.fontSize = "11px"; toggle.style.padding = "1px 8px";
+      text(toggle, s.enabled ? "disable" : "enable");
+      toggle.onclick = async () => {
+        await fetch("/api/sources/" + s.id, { method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: !s.enabled }) });
+        refreshSettings();
+      };
+      const del = document.createElement("button");
+      del.className = "btn danger"; del.style.fontSize = "11px"; del.style.padding = "1px 8px";
+      text(del, "remove");
+      del.onclick = async () => {
+        if (!confirm(`Remove source "${s.name}"? Metrics already collected are kept.`)) return;
+        await fetch("/api/sources/" + s.id, { method: "DELETE" });
+        refreshSettings();
+      };
+      acts.append(toggle, del);
+      tr.appendChild(tdNode(acts));
+    }, "No engines configured — add one below.");
+  const ollama = d.sources.filter((s) => s.kind === "ollama" && s.enabled).length;
+  text($("n-sources"), `${d.sources.length} configured` +
+    (ollama > 1 ? " · only one Ollama source runs at a time" : ""));
+  renderAddForm();
+}
+
+function renderAddForm() {
+  const d = state.settings;
+  const host = $("source-add"); host.innerHTML = "";
+  const kind = host.dataset.kind || "vllm";
+  const spec = d.source_kinds[kind];
+
+  const fields = document.createElement("div"); fields.className = "fields";
+  const kindSel = document.createElement("select");
+  for (const k of Object.keys(d.source_kinds)) {
+    const o = document.createElement("option"); o.value = k;
+    text(o, d.source_kinds[k].label); kindSel.appendChild(o);
+  }
+  kindSel.value = kind;
+  kindSel.onchange = () => { host.dataset.kind = kindSel.value; renderAddForm(); };
+  fields.appendChild(labelled("Type", kindSel));
+
+  const nameEl = document.createElement("input");
+  nameEl.type = "text"; nameEl.placeholder = kind === "vllm" ? "e.g. qwen-8000" : "e.g. local";
+  nameEl.id = "src-name";
+  fields.appendChild(labelled("Name", nameEl));
+
+  const readerEl = spec.fields.find((f) => f.key === "reader");
+  const current = {};
+  for (const f of spec.fields) {
+    // Fields gated on another field's value (log path only matters for the
+    // file reader) are only shown when that condition holds.
+    if (f.when) {
+      const dep = Object.keys(f.when)[0];
+      const want = f.when[dep];
+      const depEl = host.querySelector(`[data-fkey="${dep}"]`);
+      const val = (depEl && depEl.value) || (readerEl && readerEl.default);
+      if (val !== want) continue;
+    }
+    let el;
+    if (f.type === "enum") {
+      el = document.createElement("select");
+      for (const c of f.choices) { const o = document.createElement("option"); o.value = c; text(o, c); el.appendChild(o); }
+      el.value = current[f.key] || f.default;
+      el.onchange = () => { host.dataset[f.key] = el.value; renderAddForm(); };
+      if (host.dataset[f.key]) el.value = host.dataset[f.key];
+    } else {
+      el = document.createElement("input"); el.type = "text";
+      el.value = f.default || "";
+      el.placeholder = f.help ? "" : f.label;
+    }
+    el.dataset.fkey = f.key;
+    fields.appendChild(labelled(f.label, el, f.help));
+  }
+  host.appendChild(fields);
+
+  const actions = document.createElement("div");
+  actions.className = "actions"; actions.style.marginTop = "10px";
+  const probe = document.createElement("button"); probe.className = "btn"; text(probe, "Test");
+  const add = document.createElement("button"); add.className = "btn primary"; text(add, "Add engine");
+  const msg = document.createElement("span"); msg.style.fontSize = "12px";
+  actions.append(probe, add, msg);
+  host.appendChild(actions);
+
+  const collect = () => {
+    const cfg = {};
+    for (const el of host.querySelectorAll("[data-fkey]")) cfg[el.dataset.fkey] = el.value;
+    return { kind: kindSel.value, name: nameEl.value.trim(), config: cfg };
+  };
+  probe.onclick = async () => {
+    text(msg, "testing…"); msg.className = "";
+    const r = await fetch("/api/sources/probe", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
+    const body = await r.json().catch(() => ({ ok: false, detail: "bad response" }));
+    msg.className = body.ok ? "ok-msg" : "err";
+    text(msg, body.detail || (body.ok ? "reachable" : "failed"));
+  };
+  add.onclick = async () => {
+    const payload = collect();
+    if (!payload.name) { msg.className = "err"; text(msg, "a name is required"); return; }
+    const r = await fetch("/api/sources", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      msg.className = "err";
+      text(msg, typeof body.detail === "string" ? body.detail : "could not add that engine");
+      return;
+    }
+    msg.className = "ok-msg"; text(msg, "added");
+    refreshSettings();
+  };
+}
+
+function labelled(labelText, el, help) {
+  const l = document.createElement("label");
+  const sp = document.createElement("span"); text(sp, labelText);
+  l.append(sp, el);
+  if (help) l.title = help;
+  return l;
+}
+
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (state.data) renderAll(); });
+
+/* ?nostream=1 disables the live SSE feed.  Useful for kiosk displays, for
+   embedding in another page, and for headless screenshot tools, which wait
+   for a load event that an open EventSource never lets settle. */
+const PARAMS = new URLSearchParams(location.search);
+if (PARAMS.has("window")) {
+  const w = PARAMS.get("window");
+  const btn = $("range").querySelector(`button[data-w="${CSS.escape(w)}"]`);
+  if (btn) {
+    for (const x of $("range").querySelectorAll("button")) x.removeAttribute("aria-pressed");
+    btn.setAttribute("aria-pressed", "true");
+    state.window = w;
+  }
+}
+if (PARAMS.get("model")) state.model = PARAMS.get("model");
+if (PARAMS.get("source")) state.vsource = PARAMS.get("source");
+const startTab = ["ollama", "vllm", "settings"].includes(PARAMS.get("tab"))
+  ? PARAMS.get("tab") : "ollama";
+
+/* Apply the defaults chosen in the settings screen before the first fetch, so
+   a saved default range is what actually loads.  An explicit ?window= in the
+   URL still wins -- a shared link should show what it says. */
+let refreshTimer = null;
+function scheduleRefresh(seconds) {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    if ($("autorefresh").checked) refreshActive();
+  }, Math.max(2000, (seconds || 10) * 1000));
+}
+
+(async function boot() {
+  let prefs = { default_window: "1h", refresh_s: 10 };
+  try { prefs = await jget("/api/prefs"); } catch (e) { /* defaults are fine */ }
+  if (!PARAMS.has("window") && prefs.default_window) {
+    const btn = $("range").querySelector(`button[data-w="${CSS.escape(prefs.default_window)}"]`);
+    if (btn) {
+      for (const x of $("range").querySelectorAll("button")) x.removeAttribute("aria-pressed");
+      btn.setAttribute("aria-pressed", "true");
+      state.window = prefs.default_window;
+    }
+  }
+  scheduleRefresh(prefs.refresh_s);
+  switchTab(startTab);
+  if (!PARAMS.has("nostream")) connectStream();
+})();
+</script>
+</body>
+</html>

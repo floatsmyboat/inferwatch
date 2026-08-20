@@ -1,0 +1,10 @@
+# Dashboard + API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+# MCP server
+mcp>=2.0
+# Tests only: pure-Python JS parser used to syntax-check the dashboard script
+esprima>=4.0
+# Optional: real JS engine, lets the dashboard formatter tests execute
+# (needs a C compiler; tests skip cleanly without it)
+quickjs>=1.19

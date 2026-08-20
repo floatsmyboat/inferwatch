@@ -1,0 +1,61 @@
+# inferwatch -- LLM serving metrics collector + dashboard
+#
+# This is a TEMPLATE.  Do not install it directly -- its placeholders are
+# filled in by:
+#
+#   ./scripts/install-systemd.sh            # system service, needs sudo
+#   ./scripts/install-systemd.sh --user     # per-user service, no sudo
+#
+# Reads ollama's journal, so it needs journal read access.  Running as a user
+# in the `adm` or `systemd-journal` group is enough; SupplementaryGroups below
+# covers the case where the user is in neither.
+
+[Unit]
+Description=inferwatch (LLM serving metrics collector and dashboard)
+Documentation=file://@@DIR@@/README.md
+After=network-online.target
+Wants=network-online.target
+# Not a hard dependency: inferwatch should stay up while ollama restarts, so it
+# can record the restart and the cold load that follows.
+After=ollama.service
+
+[Service]
+Type=exec
+User=@@USER@@
+Group=@@GROUP@@
+SupplementaryGroups=systemd-journal
+WorkingDirectory=@@DIR@@
+
+Environment=INFERWATCH_DB=@@DATADIR@@/inferwatch.db
+Environment=INFERWATCH_RETENTION_DAYS=7
+Environment=PYTHONUNBUFFERED=1
+
+# Bound to 0.0.0.0 so the dashboard is reachable from the LAN.  There is NO
+# authentication on it, so access is restricted at the firewall instead:
+#   sudo ufw allow from <your-lan>/24 to any port @@PORT@@ proto tcp
+# which mirrors how ollama's own 11434 is scoped on this host.  Revert to
+# 127.0.0.1 to make it local-only again.
+ExecStart=@@PYTHON@@ \
+    -m inferwatch.main serve --host @@HOST@@ --port @@PORT@@ --since 7d
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening.  The collector only needs to read the journal and the ollama
+# models tree, and write its own database.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@@DATADIR@@
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
