@@ -7,8 +7,9 @@ import tempfile
 import time
 import unittest
 
-from inferwatch.readers import (DockerReader, FileReader, build_reader,
-                                derive_timestamp, parse_iso)
+from inferwatch.readers import (DockerReader, FileReader, TimestampTracker,
+                                build_reader, derive_timestamp, log_timezone,
+                                parse_iso)
 from inferwatch.store import Store
 
 GO_LINE = ('time=2026-08-19T11:17:18.443-05:00 level=DEBUG source=sched.go:489'
@@ -45,9 +46,46 @@ class TestTimestamps(unittest.TestCase):
     def test_second_resolution_line_does_not_move_time_backwards(self):
         """A gin line parses to whole seconds, so following a Go line stamped
         .443 it would otherwise appear 443ms earlier."""
-        go_ts = derive_timestamp(GO_LINE, None)
-        gin_ts = derive_timestamp(GIN_LINE, go_ts)
+        clock = TimestampTracker()
+        go_ts = clock.feed(GO_LINE)
+        gin_ts = clock.feed(GIN_LINE)
         self.assertGreaterEqual(gin_ts, go_ts)
+
+    def test_naive_clock_uses_the_log_timezone_not_the_reader_timezone(self):
+        """The gin line carries no offset. Interpreting it in whatever zone the
+        reader happens to be in is wrong by the offset difference -- an engine
+        logging in UTC read from a host in another zone is ordinary. The offset
+        is learned from the Go lines instead, so the result must not depend on
+        this process's TZ."""
+        seen = []
+        original = os.environ.get("TZ")
+        try:
+            for zone in ("UTC", "America/Chicago", "Asia/Tokyo", "Europe/Berlin"):
+                os.environ["TZ"] = zone
+                time.tzset()
+                clock = TimestampTracker()
+                clock.feed(GO_LINE)
+                seen.append(clock.feed(GIN_LINE))
+        finally:
+            if original is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original
+            time.tzset()
+        self.assertEqual(len(set(seen)), 1,
+                         f"gin timestamp varied with the reader's TZ: {seen}")
+
+    def test_offset_is_learned_from_the_go_line(self):
+        self.assertIsNotNone(log_timezone(GO_LINE))
+        self.assertIsNone(log_timezone(GIN_LINE))
+        self.assertIsNone(log_timezone(SLOT_LINE))
+
+    def test_utc_suffixed_line_is_treated_as_utc(self):
+        """`Z` means UTC; dropping it would make the value local."""
+        aware = parse_iso("2026-08-19T16:17:18Z")
+        naive_utc = derive_timestamp(
+            'time=2026-08-19T16:17:18+00:00 level=INFO source=x.go:1 msg="y"', None)
+        self.assertAlmostEqual(aware, naive_utc, places=3)
 
     def test_a_genuine_jump_backwards_is_still_trusted(self):
         """Rotating in an older file is a real regression, not an artefact."""

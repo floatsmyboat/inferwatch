@@ -32,7 +32,7 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("inferwatch.readers")
 
@@ -41,12 +41,17 @@ _GIN_TS = re.compile(r"^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})"
 _DOCKER_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\s+(.*)$")
 
 
-def parse_iso(text: str) -> float | None:
+def parse_iso_dt(text: str):
+    """Parse an ISO-8601 timestamp to a datetime, or None.
+
+    Docker emits nanoseconds and datetime accepts at most microseconds, so the
+    fraction is truncated rather than the whole value rejected.
+    """
     try:
         t = text.rstrip("Z")
+        was_utc = text.endswith("Z")
         if "." in t:
             head, frac = t.split(".", 1)
-            # datetime accepts at most 6 fractional digits
             tz = ""
             for i, ch in enumerate(frac):
                 if ch in "+-":
@@ -56,11 +61,16 @@ def parse_iso(text: str) -> float | None:
             frac = (frac + "000000")[:6]
             t = f"{head}.{frac}{tz}"
         dt = datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            return dt.timestamp()
-        return dt.timestamp()
+        if dt.tzinfo is None and was_utc:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except (ValueError, TypeError):
         return None
+
+
+def parse_iso(text: str) -> float | None:
+    dt = parse_iso_dt(text)
+    return dt.timestamp() if dt is not None else None
 
 
 # A line whose own clock is this far behind the previous line is treated as a
@@ -69,18 +79,39 @@ def parse_iso(text: str) -> float | None:
 _BACKWARDS_TOLERANCE_S = 2.0
 
 
-def derive_timestamp(message: str, previous: float | None) -> float:
+def log_timezone(message: str):
+    """The UTC offset a log line declares, if it declares one.
+
+    Only ollama's Go lines carry an offset (`-05:00`, or `Z`).  Learning it
+    matters because gin lines do not: a naive clock belongs to the timezone of
+    the process that WROTE it, which need not be the zone of the process
+    reading it -- an engine in a UTC container read from a host in another zone
+    is the ordinary case, not an exotic one.
+    """
+    m = _GO_TS.match(message)
+    if not m:
+        return None
+    dt = parse_iso_dt(m.group(1))
+    return dt.tzinfo if dt is not None else None
+
+
+def derive_timestamp(message: str, previous: float | None, tz=None) -> float:
     """Best available timestamp for a log line lacking its own.
 
-    Ollama's Go lines carry a microsecond clock and gin lines carry a
-    second-resolution one; llama.cpp's slot lines carry none at all and inherit
-    the last timestamp seen.
+    Ollama's Go lines carry a microsecond clock WITH an offset; gin lines carry
+    a second-resolution clock with NO offset; llama.cpp's slot lines carry none
+    at all and inherit the last timestamp seen.
 
-    Mixing those resolutions makes time appear to go backwards: a gin line
-    logged at 11:17:18.9 parses as 11:17:18.0, which is *earlier* than the Go
-    line before it.  Stored that way, a request row could be stamped before the
-    task that produced it.  A small regression is therefore clamped to the
-    previous timestamp, keeping the sequence monotonic.
+    A naive gin clock is interpreted in `tz` when one has been learned from a Go
+    line, falling back to this process's local zone only when nothing better is
+    known.  Always interpreting it locally is wrong by the whole offset
+    difference whenever writer and reader disagree -- and silently correct on a
+    host that shares the log's zone, which is how the bug hid.
+
+    Mixing resolutions also makes time appear to go backwards: a gin line logged
+    at 11:17:18.9 parses as 11:17:18.0, earlier than the Go line before it.
+    Stored that way a request row could predate the task that produced it, so a
+    small regression is clamped to the previous timestamp.
     """
     ts = None
     m = _GO_TS.match(message)
@@ -89,12 +120,35 @@ def derive_timestamp(message: str, previous: float | None) -> float:
     if ts is None:
         m = _GIN_TS.match(message)
         if m:
-            ts = parse_iso(f"{m.group(1).replace('/', '-')}T{m.group(2)}")
+            dt = parse_iso_dt(f"{m.group(1).replace('/', '-')}T{m.group(2)}")
+            if dt is not None:
+                if dt.tzinfo is None and tz is not None:
+                    dt = dt.replace(tzinfo=tz)
+                ts = dt.timestamp()
     if ts is None:
         return previous if previous is not None else time.time()
     if previous is not None and 0 < (previous - ts) <= _BACKWARDS_TOLERANCE_S:
         return previous
     return ts
+
+
+class TimestampTracker:
+    """Stateful timestamp derivation for one log stream.
+
+    Remembers the last timestamp seen (for lines with no clock) and the
+    timezone the log declares (for lines with a clock but no offset).
+    """
+
+    def __init__(self):
+        self.last: float | None = None
+        self.tz = None
+
+    def feed(self, message: str) -> float:
+        tz = log_timezone(message)
+        if tz is not None:
+            self.tz = tz
+        self.last = derive_timestamp(message, self.last, self.tz)
+        return self.last
 
 
 _COMPACT_WINDOW = re.compile(r"^(\d+(?:\.\d+)?)([smhdw])$", re.IGNORECASE)
@@ -312,7 +366,7 @@ class FileReader(Reader):
         super().__init__(store, source, cfg)
         self.path = os.path.expanduser(cfg.get("path") or "")
         self.poll = poll
-        self.last_ts: float | None = None
+        self.clock = TimestampTracker()
 
     def describe(self) -> str:
         return f"file {self.path}"
@@ -362,8 +416,7 @@ class FileReader(Reader):
                         line = line.rstrip("\n")
                         if not line:
                             continue
-                        ts = derive_timestamp(line, self.last_ts)
-                        self.last_ts = ts
+                        ts = self.clock.feed(line)
                         self.lines += 1
                         on_line(ts, line)
                     offset = fh.tell()
@@ -403,7 +456,7 @@ class DockerReader(Reader):
         self.container = cfg.get("container") or ""
         self.binary = cfg.get("docker_binary") or ""
         self.backfill = backfill
-        self.last_ts: float | None = None
+        self.clock = TimestampTracker()
 
     def describe(self) -> str:
         return f"docker container={self.container}"
@@ -447,13 +500,17 @@ class DockerReader(Reader):
                     line = raw.decode("utf-8", "replace").rstrip("\n")
                     m = _DOCKER_TS.match(line)
                     if m:
-                        ts = parse_iso(m.group(1)) or derive_timestamp(m.group(2),
-                                                                      self.last_ts)
                         body = m.group(2)
+                        # `docker logs -t` stamps every line absolutely, which
+                        # beats anything inferable from the body.
+                        ts = parse_iso(m.group(1)) or self.clock.feed(body)
+                        self.clock.last = ts
+                        tz = log_timezone(body)
+                        if tz is not None:
+                            self.clock.tz = tz
                     else:
-                        ts = derive_timestamp(line, self.last_ts)
                         body = line
-                    self.last_ts = ts
+                        ts = self.clock.feed(body)
                     self.lines += 1
                     on_line(ts, body)
                     now = time.time()

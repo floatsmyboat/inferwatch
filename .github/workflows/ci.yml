@@ -48,6 +48,14 @@ jobs:
         # No engine, no GPU and no network are required; the suite is hermetic.
         run: python -m unittest discover -s tests -t . -v
 
+      - name: Tests again in a non-UTC timezone
+        # Runners are UTC, and a timezone bug in timestamp derivation passed
+        # locally (a -05:00 host) while failing here. Exercising both sides of
+        # that axis is what catches it.
+        env:
+          TZ: Asia/Tokyo
+        run: python -m unittest discover -s tests -t .
+
   docs:
     name: docs match the code
     runs-on: ubuntu-latest

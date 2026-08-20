@@ -253,15 +253,14 @@ def ingest(args) -> None:
     t0 = time.time()
 
     if args.log_file:
-        from .readers import derive_timestamp
-        last = None
+        from .readers import TimestampTracker
+        clock = TimestampTracker()
         with open(args.log_file, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                last = derive_timestamp(line, last)
-                corr.feed(last, line)
+                corr.feed(clock.feed(line), line)
                 lines += 1
     else:
         argv = ["journalctl", "-u", args.unit, "-o", "json", "--no-pager",
