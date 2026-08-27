@@ -25,6 +25,23 @@ attribution='ambiguous' rather than pretending.  Per-request numbers stay
 correct in aggregate either way; only the model/client pairing is uncertain.
 Set attribution='none' when an inference request had no timings at all (it
 failed before reaching the runner, e.g. the 500s in this host's history).
+
+THE PROMPT CACHE, WHICH IS NOT A REQUEST
+----------------------------------------
+Ollama also logs the state of its prompt cache -- the pool of saved prompt
+states that lets a returning conversation skip prefill:
+
+    srv  update:  - cache state: 30 prompts, 8010.969 MiB (limits: 8192.000 MiB, ...)
+    srv  get_availabl: prompt cache update took 364.22 ms
+
+That is a GAUGE, and it belongs to the runner rather than to any one request,
+so it is emitted through `on_cache` into its own table instead of being forced
+into a `requests` row.  It is also sampled on ollama's schedule, not ours: a
+line appears when ollama happens to run a cache update, which is bursty.  Rates
+derived from it are therefore honest only about the moments it was sampled,
+which is why the eviction counters are stored as DELTAS between samples rather
+than as monotonic totals -- a runner restart resets llama.cpp's own counters,
+and a delta cannot go negative across one.
 """
 
 from __future__ import annotations
@@ -52,6 +69,9 @@ MODEL_TIMEOUT_S = 2.0
 # How long a task that printed "total time" may wait for its "release" line
 # (which carries the truncation flag) before being retired without it.
 TOTAL_GRACE_S = 5.0
+# How long a prompt-cache state line waits for the "update took Nms" line that
+# follows it, before being stored without the cost figure.
+CACHE_GRACE_S = 10.0
 
 
 class Correlator:
@@ -62,10 +82,11 @@ class Correlator:
     """
 
     def __init__(self, on_request=None, on_event=None, on_live=None,
-                 model_index: ModelIndex | None = None):
+                 on_cache=None, model_index: ModelIndex | None = None):
         self.on_request = on_request or (lambda r: None)
         self.on_event = on_event or (lambda e: None)
         self.on_live = on_live or (lambda x: None)
+        self.on_cache = on_cache or (lambda c: None)
         # Resolves the blob digests on load lines to real model names.
         self.model_index = model_index
 
@@ -81,6 +102,20 @@ class Correlator:
         self.last_ts: float = 0.0
         self.stats = collections.Counter()
 
+        # -- prompt cache -------------------------------------------------
+        # A state line held until its update-cost line arrives.
+        self.pending_cache: dict | None = None
+        # Counted between samples, then reset; see the module docstring.
+        self.cache_delta = collections.Counter()
+        # Highest checkpoint index seen since the last sample, and the cap the
+        # runner reports ("2 of 32").  The cap is a constant, so it survives a
+        # sample; the high-water mark does not.
+        self.ckpt_used: int = 0
+        self.ckpt_total: int | None = None
+        self.last_cache: dict | None = None
+        # Load-time KV sizing, buffered until the load event it belongs to.
+        self.pending_kv: dict = {}
+
     # -- public entry point --------------------------------------------------
 
     def feed(self, ts: float, msg: str) -> None:
@@ -93,6 +128,10 @@ class Correlator:
             self._on_gin(ts, ev)
         elif kind == "go":
             self._on_go(ts, ev)
+        elif kind in ("cache_state", "cache_update", "cache_save"):
+            self._on_srv(ts, ev)
+        elif kind in ("kv_size", "kv_buffer"):
+            self._on_kv(ev)
         else:
             self._on_slot(ts, ev)
         self._expire(ts)
@@ -108,10 +147,16 @@ class Correlator:
     # -- slot lines ----------------------------------------------------------
 
     def _on_slot(self, ts: float, ev: dict) -> None:
+        kind = ev["kind"]
+        # Checkpoint bookkeeping describes the runner's cache, not one request,
+        # and llama.cpp sometimes logs it against task -1, so it is handled
+        # ahead of the per-task guard below rather than being dropped by it.
+        if kind in ("ckpt_create", "ckpt_restore", "ckpt_evict"):
+            self._on_ckpt(ev)
+            return
         tid = ev["task_id"]
         if tid < 0:  # task -1: slot bookkeeping, not a request
             return
-        kind = ev["kind"]
 
         if kind == "gen_progress":
             # Live decode rate, mid-stream.  Not stored per row; drives the
@@ -171,6 +216,102 @@ class Correlator:
         self.finished.append(t)
         self.stats["tasks_retired"] += 1
 
+    # -- prompt cache --------------------------------------------------------
+
+    def _on_ckpt(self, ev: dict) -> None:
+        kind = ev["kind"]
+        if kind == "ckpt_create":
+            # "created context checkpoint 2 of 32": the index is how many are
+            # live, the total is the cap the runner was built with.
+            self.ckpt_used = max(self.ckpt_used, ev.get("ckpt_index") or 0)
+            self.ckpt_total = ev.get("ckpt_total") or self.ckpt_total
+            self.cache_delta["ckpt_created"] += 1
+        elif kind == "ckpt_restore":
+            self.cache_delta["restores"] += 1
+        else:
+            self.cache_delta["evictions"] += 1
+            self.cache_delta["evict_" + (ev.get("reason") or "other")] += 1
+
+    def _on_srv(self, ts: float, ev: dict) -> None:
+        kind = ev["kind"]
+        if kind == "cache_state":
+            # A state line still pending means its cost line never arrived.
+            # Emit that one as it stands rather than overwriting it.
+            self._flush_cache()
+            self.pending_cache = {
+                "ts": ts, "model": self.recent_model, "prompts": ev["prompts"],
+                "used_mib": ev["used_mib"], "limit_mib": ev["limit_mib"],
+                "usage": ev["usage"], "token_limit": ev["token_limit"],
+                "est_tokens": ev["est_tokens"],
+            }
+        elif kind == "cache_update":
+            if self.pending_cache is not None:
+                self.pending_cache["update_ms"] = ev["update_ms"]
+                self._flush_cache()
+            else:
+                # An update that reported no state change still cost real time,
+                # so the cost is recorded on its own with the gauges left null.
+                self._emit_cache({"ts": ts, "model": self.recent_model,
+                                  "update_ms": ev["update_ms"]})
+        elif kind == "cache_save":
+            self.cache_delta["saves"] += 1
+
+    def _take_deltas(self) -> dict:
+        """Counters accumulated since the previous sample, then reset."""
+        keys = ("evictions", "evict_crowded", "evict_invalidated", "restores",
+                "ckpt_created", "saves")
+        out = {k: int(self.cache_delta[k]) for k in keys}
+        self.cache_delta.clear()
+        return out
+
+    def _flush_cache(self) -> None:
+        row = self.pending_cache
+        if row is None:
+            return
+        self.pending_cache = None
+        row["ckpt_used"] = self.ckpt_used or None
+        row["ckpt_total"] = self.ckpt_total
+        self.ckpt_used = 0
+        self._emit_cache(row)
+
+    def _emit_cache(self, row: dict) -> None:
+        row.update(self._take_deltas())
+        self.last_cache = row
+        self.stats["cache_samples"] += 1
+        self.on_cache(row)
+        self.on_live({"type": "cache", **row})
+
+    # -- load-time KV sizing -------------------------------------------------
+
+    def _on_kv(self, ev: dict) -> None:
+        """Buffer the `llama_kv_cache:` lines a load prints.
+
+        They arrive between "starting llama-server" and "llama-server started
+        in Ns", so they are held here and attached to the load event, which is
+        the only row that describes a load.
+        """
+        if ev["kind"] == "kv_buffer":
+            self.pending_kv.setdefault("buffers_mib", {})[ev["device"]] = ev["kv_mib"]
+        else:
+            self.pending_kv.update({k: v for k, v in ev.items() if k != "kind"})
+
+    def _kv_detail(self) -> dict:
+        """The buffered KV sizing, with the GPU/CPU split stated outright.
+
+        A KV cache that did not fit in VRAM is the loudest single explanation
+        for a model that decodes slowly, so the split is computed here rather
+        than left for a reader to add up from device names.
+        """
+        kv = dict(self.pending_kv)
+        buffers = kv.get("buffers_mib") or {}
+        if buffers:
+            total = sum(buffers.values())
+            cpu = sum(v for dev, v in buffers.items() if dev.upper() == "CPU")
+            kv["cpu_mib"] = cpu
+            kv["gpu_mib"] = total - cpu
+            kv["cpu_fraction"] = (cpu / total) if total else None
+        return kv
+
     # -- access lines --------------------------------------------------------
 
     def _on_gin(self, ts: float, ev: dict) -> None:
@@ -195,7 +336,7 @@ class Correlator:
                     "ttft_ms", "decode_ms", "total_ms", "prompt_tokens",
                     "prompt_tokens_total", "output_tokens", "prefill_tps", "decode_tps",
                     "draft_accept", "draft_mean_len", "truncated", "context_tokens",
-                    "slot_id", "task_id")})
+                    "n_ctx_slot", "slot_id", "task_id")})
                 if row.get("prompt_tokens_total") is not None and row.get("prompt_tokens") is not None:
                     row["cached_tokens"] = max(0, row["prompt_tokens_total"] - row["prompt_tokens"])
                 if row.get("latency_ms") is not None and row.get("total_ms") is not None:
@@ -249,6 +390,9 @@ class Correlator:
             self.pending_load = {"ts": ts, "blob": blob, "num_ctx": ev.get("num_ctx"),
                                  "parallel": ev.get("parallel"), "spec_type": ev.get("spec_type"),
                                  "port": ev.get("port")}
+            # The KV sizing lines for THIS load have not been printed yet;
+            # anything still buffered belongs to a previous one.
+            self.pending_kv = {}
         elif event == "model_loaded":
             detail = dict(self.pending_load or {})
             blob_ref = detail.get("blob")
@@ -267,9 +411,24 @@ class Correlator:
             if ts - prev_ts < 2.0 and (blob_ref is None or prev_blob == blob_ref):
                 return
             self._last_load = (blob_ref or prev_blob, ts)
+            kv = self._kv_detail() if self.pending_kv else None
+            if kv:
+                detail["kv_cache"] = kv
+            self.pending_kv = {}
             self.on_event({"ts": ts, "kind": "model_loaded", "level": "INFO", "model": name,
                            "source": ev.get("source"), "msg": ev["msg"],
                            "duration_ms": ev.get("load_ms"), "detail": detail or None})
+            # A KV cache partly on host RAM caps decode throughput for the
+            # whole life of the load, so it is called out rather than left
+            # buried in the load event's detail blob.
+            if kv and (kv.get("cpu_fraction") or 0) > 0:
+                self.on_event({
+                    "ts": ts, "kind": "kv_offload", "level": "WARN", "model": name,
+                    "source": ev.get("source"),
+                    "msg": f"{kv['cpu_fraction']:.0%} of the KV cache "
+                           f"({kv['cpu_mib']:.0f} of {kv['cpu_mib'] + kv['gpu_mib']:.0f} MiB) "
+                           f"is on host RAM, not VRAM",
+                    "detail": kv})
         elif event == "unload":
             if model:
                 self.loaded_models.discard(model)
@@ -313,7 +472,8 @@ class Correlator:
                    "attribution": "orphan", "model": t.get("model") or self.recent_model}
             for k in ("ttft_ms", "decode_ms", "total_ms", "prompt_tokens", "prompt_tokens_total",
                       "output_tokens", "prefill_tps", "decode_tps", "draft_accept",
-                      "draft_mean_len", "truncated", "context_tokens", "slot_id", "task_id"):
+                      "draft_mean_len", "truncated", "context_tokens", "n_ctx_slot",
+                      "slot_id", "task_id"):
                 if k in t:
                     row[k] = t[k]
             self.stats["orphans"] += 1
@@ -325,6 +485,11 @@ class Correlator:
         for tid, t in [(k, v) for k, v in self.tasks.items()
                        if v.get("done_ts") and now - v["done_ts"] > TOTAL_GRACE_S]:
             self._retire(tid, t["done_ts"])
+
+        # A cache state line whose cost line never arrived.
+        if self.pending_cache is not None and (
+                force_model or now - self.pending_cache["ts"] > CACHE_GRACE_S):
+            self._flush_cache()
 
         # Stale in-progress tasks (runner died mid-request).
         for tid in [k for k, v in self.tasks.items() if now - v["first_ts"] > 3600]:

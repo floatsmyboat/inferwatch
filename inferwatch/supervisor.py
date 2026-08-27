@@ -57,6 +57,9 @@ class SourceRuntime:
         if self.corr is not None:
             d["inflight"] = self.corr.inflight
             d["stats"] = dict(self.corr.stats)
+            # The most recent prompt-cache reading, so /api/status can say
+            # whether the gauge is arriving at all.
+            d["cache"] = self.corr.last_cache
         if self.vllm is not None:
             d["url"] = self.vllm.url
             d["scrapes"] = self.vllm.scrapes
@@ -174,6 +177,7 @@ class Supervisor:
             rt.corr = Correlator(on_request=self.store.insert_request,
                                  on_event=self.store.insert_event,
                                  on_live=self.hub.publish,
+                                 on_cache=self.store.insert_cache_sample,
                                  model_index=index)
             rt.reader = build_reader(self.store, spec["name"], cfg,
                                      backfill=self.config.get("collection.backfill"))

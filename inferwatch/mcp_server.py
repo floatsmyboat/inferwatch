@@ -283,6 +283,51 @@ def gpu_status(window: str = "1h", step_seconds: int | None = None) -> dict:
 
 
 @srv.tool(
+    title="Get KV / prompt cache status",
+    description="Ollama's prompt-cache occupancy over a window -- how full the "
+                "saved-prompt pool is, how often it evicted, and what its "
+                "maintenance pass cost -- plus how full the live KV context got. "
+                "This is the closest ollama equivalent of vLLM's kv_cache_usage; "
+                "unlike vLLM it is sampled from the log on ollama's own schedule, "
+                "so an idle window legitimately has no samples.",
+)
+def cache_status(window: str = "1h", step_seconds: int | None = None) -> dict:
+    """Report prompt-cache occupancy, eviction pressure and live KV usage.
+
+    Args:
+        window: Relative duration to search.
+        step_seconds: Bucket width in seconds for the series.
+    """
+    st = store()
+    start, end = _win(window)
+    summ = metrics.cache_summary(st, start, end)
+    out: dict[str, Any] = {
+        "window": window,
+        "prompt_cache": summ,
+        # A different cache: how close requests came to filling the slot's
+        # context, which is the distance to a context shift or truncation.
+        "live_kv": metrics.summary(st, start, end).get("ctx_usage"),
+        "series": metrics.cache_series(st, start, end, step_seconds),
+        "notes": [
+            "prompt_cache figures are exact over the samples that exist, but "
+            "ollama logs a sample only when it runs a cache update, so the "
+            "sampling is uneven -- counters are totals, never rates.",
+            "live_kv is derived from per-request rows and is therefore "
+            "available only inside the raw retention window.",
+        ],
+    }
+    if not summ["samples"]:
+        out["warning"] = summ.get("note")
+    elif summ["under_pressure"]:
+        out["warning"] = (
+            f"the prompt cache peaked at {summ['usage']['max']:.0%} of its "
+            f"{summ['limit_mib']:.0f} MiB limit with {summ['evictions']} "
+            f"eviction(s) in this window; evicted prompts have to be prefilled "
+            f"again, which shows up as higher TTFT.")
+    return out
+
+
+@srv.tool(
     title="Check collector health",
     description="Collector status: journal lines read, rows stored, database "
                 "size, whether OLLAMA_DEBUG timing lines are available, and "
@@ -293,7 +338,8 @@ def health() -> dict:
     st = store()
     row = st.query("SELECT COUNT(*) n, MIN(ts) first, MAX(ts) last FROM requests")[0]
     counts = {}
-    for table in ("requests", "events", "gpu_samples", "ps_samples", "rollup_1m", "rollup_1h"):
+    for table in ("requests", "events", "gpu_samples", "ps_samples",
+                  "ollama_cache_samples", "rollup_1m", "rollup_1h"):
         counts[table] = st.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
     out: dict[str, Any] = {
         "db_path": st.path,

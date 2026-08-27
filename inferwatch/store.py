@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
 # (0.1s-30s), coarse in the tail.  Last bucket is the overflow (inf).
@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS requests (
     draft_accept        REAL,
     draft_mean_len      REAL,
     truncated           INTEGER,
-    context_tokens      INTEGER,
+    context_tokens      INTEGER,         -- tokens resident in the slot's KV at release
+    n_ctx_slot          INTEGER,         -- that slot's KV capacity; the ratio is
+                                         -- how full the live KV cache got
     slot_id             INTEGER,
     task_id             INTEGER,
     attribution         TEXT             -- exact|ambiguous|none
@@ -89,6 +91,42 @@ CREATE TABLE IF NOT EXISTS ps_samples (
     loaded_count INTEGER,
     models_json  TEXT,     -- /api/ps payload, trimmed
     inflight     INTEGER   -- requests in flight per the correlator
+) WITHOUT ROWID;
+
+-- ----------------------------------------------------------------------
+-- Ollama's prompt cache, sampled from the log.
+--
+-- This is the pool of saved prompt states that lets a returning conversation
+-- skip prefill, and `cache state` lines report its occupancy outright -- the
+-- one gauge ollama publishes that resembles vLLM's kv_cache_usage_perc.
+--
+-- It gets its own table rather than columns on `ps_samples` because the two
+-- have different clocks: ps_samples is polled on a fixed interval, while these
+-- appear only when ollama runs a cache update.  Blending them would make one
+-- series look like it had gaps and the other like it had duplicates.
+--
+-- The counter columns are DELTAS since the previous row, not running totals:
+-- llama.cpp resets its own counters when a runner restarts, and a delta cannot
+-- go negative across that the way a monotonic counter would.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ollama_cache_samples (
+    ts               REAL PRIMARY KEY,
+    model            TEXT,      -- most recently active model; the line names none
+    prompts          INTEGER,   -- prompt states resident
+    used_mib         REAL,
+    limit_mib        REAL,
+    usage            REAL,      -- used_mib / limit_mib, NULL when unbounded
+    token_limit      INTEGER,
+    est_tokens       INTEGER,
+    ckpt_used        INTEGER,   -- checkpoint high-water since the last sample
+    ckpt_total       INTEGER,   -- checkpoint cap ("2 of 32")
+    update_ms        REAL,      -- cost of the maintenance pass, inside TTFT
+    evictions        INTEGER,
+    evict_crowded    INTEGER,   -- capacity pressure
+    evict_invalidated INTEGER,  -- cached positions no longer applied
+    restores         INTEGER,
+    ckpt_created     INTEGER,
+    saves            INTEGER
 ) WITHOUT ROWID;
 
 -- Model load/unload/warning/error timeline.
@@ -344,6 +382,13 @@ class Store:
         if cols and "gpu_indices" not in cols:
             self.db.execute("ALTER TABLE vllm_instances ADD COLUMN gpu_indices TEXT")
 
+        # schema 5: the slot KV capacity a request ran against.  Rows written
+        # before it keep NULL, so live-KV occupancy is simply unavailable for
+        # them rather than being back-computed from a capacity we never saw.
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(requests)")}
+        if cols and "n_ctx_slot" not in cols:
+            self.db.execute("ALTER TABLE requests ADD COLUMN n_ctx_slot INTEGER")
+
         for table, keyfn in (("requests", request_key), ("events", event_key)):
             cols = {c["name"] for c in self.db.execute(f"PRAGMA table_info({table})")}
             if "dedupe_key" not in cols:
@@ -496,7 +541,8 @@ class Store:
                 "client_ip", "latency_ms", "ttft_ms", "decode_ms", "total_ms", "queue_ms",
                 "prompt_tokens", "prompt_tokens_total", "cached_tokens", "output_tokens",
                 "prefill_tps", "decode_tps", "draft_accept", "draft_mean_len", "truncated",
-                "context_tokens", "slot_id", "task_id", "attribution", "dedupe_key")
+                "context_tokens", "n_ctx_slot", "slot_id", "task_id", "attribution",
+                "dedupe_key")
         r = dict(r)
         r["dedupe_key"] = request_key(r)
         placeholders = ",".join("?" * len(cols))
@@ -517,6 +563,25 @@ class Store:
                  e.get("msg"), e.get("duration_ms"),
                  json.dumps(e["detail"]) if e.get("detail") else None,
                  event_key(e)))
+
+    CACHE_COLS = ("ts", "model", "prompts", "used_mib", "limit_mib", "usage",
+                  "token_limit", "est_tokens", "ckpt_used", "ckpt_total", "update_ms",
+                  "evictions", "evict_crowded", "evict_invalidated", "restores",
+                  "ckpt_created", "saves")
+
+    def insert_cache_sample(self, row: dict) -> None:
+        """One prompt-cache gauge sample.
+
+        REPLACE rather than IGNORE on the timestamp: re-reading the same log
+        lines must be a no-op, and a second read produces an identical row.
+        """
+        cols = ",".join(self.CACHE_COLS)
+        placeholders = ",".join("?" * len(self.CACHE_COLS))
+        with self.lock:
+            self.db.execute(
+                f"INSERT OR REPLACE INTO ollama_cache_samples ({cols})"
+                f" VALUES ({placeholders})",
+                tuple(row.get(c) for c in self.CACHE_COLS))
 
     def insert_gpu_samples(self, ts: float, gpus: list[dict]) -> None:
         with self.lock:
@@ -626,12 +691,15 @@ class Store:
             n_req = self.db.execute("DELETE FROM requests WHERE ts < ?", (raw_cut,)).rowcount
             n_gpu = self.db.execute("DELETE FROM gpu_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_ps = self.db.execute("DELETE FROM ps_samples WHERE ts < ?", (samp_cut,)).rowcount
+            n_cache = self.db.execute("DELETE FROM ollama_cache_samples WHERE ts < ?",
+                                      (samp_cut,)).rowcount
             n_ev = self.db.execute("DELETE FROM events WHERE ts < ?", (samp_cut,)).rowcount
             n_vs = self.db.execute("DELETE FROM vllm_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_vh = self.db.execute("DELETE FROM vllm_hist WHERE ts < ?", (samp_cut,)).rowcount
             self.db.commit()
         return {"requests": n_req, "gpu_samples": n_gpu, "ps_samples": n_ps,
-                "events": n_ev, "vllm_samples": n_vs, "vllm_hist": n_vh}
+                "ollama_cache_samples": n_cache, "events": n_ev,
+                "vllm_samples": n_vs, "vllm_hist": n_vh}
 
     # -- reads ---------------------------------------------------------------
 

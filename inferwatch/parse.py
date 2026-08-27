@@ -9,6 +9,17 @@ Every regex here was written against real journal output from this host
      status, wall latency, client, endpoint.
   3. ollama go lines       -- 'time=... level=INFO source=sched.go:1 msg="..." k=v'
      model identity, load/unload, warnings.
+  4. llama.cpp srv lines   -- "srv  update:  - cache state: 30 prompts, 8010.969 MiB"
+     ollama's PROMPT CACHE: how full the saved-prompt pool is, and what its
+     maintenance pass costs.  This is the closest thing ollama has to vLLM's
+     kv_cache_usage_perc, and unlike everything else here it is a GAUGE
+     sampled whenever ollama happens to run a cache update, not per request.
+  5. llama_kv_cache lines  -- "llama_kv_cache: size = 4608.00 MiB ( 32768 cells, ...)"
+     the LIVE KV cache, sized once at load.  Its GPU/CPU split matters a lot:
+     a cache that spilled to host RAM decodes far slower than one that fit.
+
+Those last two are only printed at llama.cpp's higher log verbosity, which is
+what OLLAMA_DEBUG=1 selects -- the same precondition the timing lines have.
 
 Parsers are pure: they take a message string and return a dict, or None.
 No I/O, so they can be replayed over a captured journal in tests.
@@ -130,6 +141,24 @@ _R_DRAFT = re.compile(
     r"\s*mean len\s*=\s*(?P<mean>[\d.]+)"
 )
 _R_LAUNCH = re.compile(r"^processing task")
+# Context checkpoints are llama.cpp's within-slot KV snapshots.  There is a
+# bounded number of them ("2 of 32"), and the eviction lines below are the
+# pressure signal -- ollama's analogue of vLLM's preemptions.
+_R_CKPT_CREATE = re.compile(
+    r"^created context checkpoint\s+(?P<n>\d+)\s+of\s+(?P<total>\d+)\s*\("
+    r".*?n_tokens\s*=\s*(?P<ntok>\d+),.*?size\s*=\s*(?P<mib>[\d.]+)\s*MiB")
+_R_CKPT_RESTORE = re.compile(
+    r"^restored context checkpoint\s*\(.*?n_tokens\s*=\s*(?P<ntok>\d+),"
+    r".*?size\s*=\s*(?P<mib>[\d.]+)\s*MiB")
+# Two spellings, two reasons: one is capacity pressure (a new checkpoint
+# crowded out a neighbour), the other is correctness (the cached positions no
+# longer apply).  Counting them together would blur those apart.
+_R_CKPT_CROWDED = re.compile(
+    r"^erasing context checkpoint too close to an earlier one\s*\("
+    r".*?size\s*=\s*(?P<mib>[\d.]+)\s*MiB")
+_R_CKPT_INVALID = re.compile(
+    r"^erased invalidated context checkpoint\s*\("
+    r".*?size\s*=\s*(?P<mib>[\d.]+)\s*MiB")
 _R_PROMPT_PROGRESS = re.compile(
     r"^prompt processing, n_tokens\s*=\s*(?P<tok>\d+), progress\s*=\s*(?P<prog>[\d.]+),"
     r"\s*t\s*=\s*(?P<sec>[\d.]+)\s*s\s*/\s*(?P<tps>[\d.]+)\s*tokens per second"
@@ -176,8 +205,106 @@ def parse_slot(msg: str) -> dict | None:
     if m := _R_PROMPT_PROGRESS.match(rest):
         return {**base, "kind": "prefill_progress", "tokens": int(m.group("tok")),
                 "progress": float(m.group("prog")), "prefill_tps": float(m.group("tps"))}
+    if m := _R_CKPT_CREATE.match(rest):
+        return {**base, "kind": "ckpt_create", "ckpt_index": int(m.group("n")),
+                "ckpt_total": int(m.group("total")), "ckpt_tokens": int(m.group("ntok")),
+                "ckpt_mib": float(m.group("mib"))}
+    if m := _R_CKPT_RESTORE.match(rest):
+        return {**base, "kind": "ckpt_restore", "ckpt_tokens": int(m.group("ntok")),
+                "ckpt_mib": float(m.group("mib"))}
+    if m := _R_CKPT_CROWDED.match(rest):
+        return {**base, "kind": "ckpt_evict", "reason": "crowded",
+                "ckpt_mib": float(m.group("mib"))}
+    if m := _R_CKPT_INVALID.match(rest):
+        return {**base, "kind": "ckpt_evict", "reason": "invalidated",
+                "ckpt_mib": float(m.group("mib"))}
     if _R_LAUNCH.match(rest):
         return {**base, "kind": "launch"}
+    return None
+
+
+# --------------------------------------------------------------------------
+# llama.cpp srv lines: ollama's prompt cache
+# --------------------------------------------------------------------------
+
+_SRV_HEAD = re.compile(r"^srv\s+(?P<fn>\S+)\s*:\s*(?P<rest>.*)$")
+
+# The one line that states occupancy outright.  `est` is llama.cpp's own guess
+# at how many tokens the pool could still hold, which is not the same as the
+# hard `tokens` limit next to it, so both are kept.
+_R_CACHE_STATE = re.compile(
+    r"^-\s*cache state:\s*(?P<prompts>\d+)\s+prompts?,\s*(?P<used>[\d.]+)\s*MiB"
+    r"\s*\(limits:\s*(?P<limit>[\d.]+)\s*MiB,\s*(?P<tok_limit>\d+)\s*tokens,"
+    r"\s*(?P<est>\d+)\s*est\)")
+# The maintenance pass is synchronous and sits inside the request that triggered
+# it, so on a full cache this lands directly in TTFT.
+_R_CACHE_UPDATE_MS = re.compile(r"^prompt cache update took\s*(?P<ms>[\d.]+)\s*ms")
+_R_PROMPT_SAVE = re.compile(
+    r"^-\s*saving prompt with length\s*(?P<len>\d+),\s*total state size\s*=\s*"
+    r"(?P<mib>[\d.]+)\s*MiB")
+
+
+def parse_srv(msg: str) -> dict | None:
+    """Parse a llama.cpp `srv` line.  Only the prompt-cache ones are claimed."""
+    head = _SRV_HEAD.match(msg)
+    if not head:
+        return None
+    rest = head.group("rest").strip()
+
+    if m := _R_CACHE_STATE.match(rest):
+        limit = float(m.group("limit"))
+        used = float(m.group("used"))
+        return {"kind": "cache_state", "prompts": int(m.group("prompts")),
+                "used_mib": used, "limit_mib": limit,
+                # Reported alongside the raw pair rather than instead of it: a
+                # limit of zero means "unbounded", not "100% full".
+                "usage": (used / limit) if limit > 0 else None,
+                "token_limit": int(m.group("tok_limit")),
+                "est_tokens": int(m.group("est"))}
+    if m := _R_CACHE_UPDATE_MS.match(rest):
+        return {"kind": "cache_update", "update_ms": float(m.group("ms"))}
+    if m := _R_PROMPT_SAVE.match(rest):
+        return {"kind": "cache_save", "prompt_tokens": int(m.group("len")),
+                "state_mib": float(m.group("mib"))}
+    return None
+
+
+# --------------------------------------------------------------------------
+# llama_kv_cache lines: the live KV cache, sized once at load
+# --------------------------------------------------------------------------
+
+_KV_HEAD = re.compile(r"^llama_kv_cache:\s*(?P<rest>.*)$")
+_R_KV_SIZE = re.compile(
+    r"^size\s*=\s*(?P<mib>[\d.]+)\s*MiB\s*\(\s*(?P<cells>\d+)\s*cells,"
+    r"\s*(?P<layers>\d+)\s*layers,\s*(?P<seqs>\d+)\s*/\s*(?P<seqs_max>\d+)\s*seqs\)")
+_R_KV_TYPES = re.compile(
+    r"K\s*\((?P<ktype>[^)]*)\):\s*(?P<kmib>[\d.]+)\s*MiB.*?"
+    r"V\s*\((?P<vtype>[^)]*)\):\s*(?P<vmib>[\d.]+)\s*MiB")
+# "CUDA0 KV buffer size = 1024.00 MiB" / "CPU KV buffer size = 4096.00 MiB".
+# The device name is what makes this worth collecting: KV on the CPU is the
+# single loudest explanation for a model that decodes slowly.
+_R_KV_BUFFER = re.compile(
+    r"^(?P<device>\S+)\s+KV buffer size\s*=\s*(?P<mib>[\d.]+)\s*MiB")
+
+
+def parse_kv_cache(msg: str) -> dict | None:
+    """Parse a `llama_kv_cache:` line from a model load."""
+    head = _KV_HEAD.match(msg)
+    if not head:
+        return None
+    rest = head.group("rest").strip()
+
+    if m := _R_KV_SIZE.match(rest):
+        out = {"kind": "kv_size", "kv_mib": float(m.group("mib")),
+               "cells": int(m.group("cells")), "layers": int(m.group("layers")),
+               "seqs": int(m.group("seqs")), "seqs_max": int(m.group("seqs_max"))}
+        if t := _R_KV_TYPES.search(rest):
+            out.update({"k_type": t.group("ktype"), "k_mib": float(t.group("kmib")),
+                        "v_type": t.group("vtype"), "v_mib": float(t.group("vmib"))})
+        return out
+    if m := _R_KV_BUFFER.match(rest):
+        return {"kind": "kv_buffer", "device": m.group("device"),
+                "kv_mib": float(m.group("mib"))}
     return None
 
 
@@ -310,4 +437,8 @@ def parse_line(msg: str) -> dict | None:
         return parse_slot(msg)
     if msg.startswith("time="):
         return parse_go(msg)
+    if msg.startswith("srv "):
+        return parse_srv(msg)
+    if msg.startswith("llama_kv_cache:"):
+        return parse_kv_cache(msg)
     return None

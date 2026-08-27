@@ -238,7 +238,7 @@ def ingest(args) -> None:
 
     store = Store(args.db)
     index = ModelIndex(args.models_dir) if args.models_dir else ModelIndex()
-    n_req = n_ev = 0
+    n_req = n_ev = n_cache = 0
 
     def on_request(r):
         nonlocal n_req
@@ -248,7 +248,12 @@ def ingest(args) -> None:
         nonlocal n_ev
         store.insert_event(e); n_ev += 1
 
-    corr = Correlator(on_request=on_request, on_event=on_event, model_index=index)
+    def on_cache(c):
+        nonlocal n_cache
+        store.insert_cache_sample(c); n_cache += 1
+
+    corr = Correlator(on_request=on_request, on_event=on_event, on_cache=on_cache,
+                      model_index=index)
     lines = 0
     t0 = time.time()
 
@@ -288,7 +293,7 @@ def ingest(args) -> None:
     if rows["a"]:
         store.rebuild_rollups(rows["a"], rows["b"] + 3600)
     print(f"read {lines} log lines in {time.time()-t0:.1f}s -> "
-          f"{n_req} requests, {n_ev} events")
+          f"{n_req} requests, {n_ev} events, {n_cache} prompt-cache samples")
     print("correlator:", dict(corr.stats))
 
 
@@ -298,8 +303,9 @@ def stats(args) -> None:
         print(f"no database at {args.db}; run `ingest` or `serve` first")
         return
     store = Store(args.db, read_only=True)
-    for table in ("requests", "events", "gpu_samples", "ps_samples", "rollup_1m",
-                  "rollup_1h", "vllm_samples", "vllm_hist", "sources", "config"):
+    for table in ("requests", "events", "gpu_samples", "ps_samples",
+                  "ollama_cache_samples", "rollup_1m", "rollup_1h", "vllm_samples",
+                  "vllm_hist", "sources", "config"):
         try:
             n = store.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
         except Exception as e:

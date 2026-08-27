@@ -116,6 +116,142 @@ class TestRetention(StoreCase):
             self.st.query("SELECT COUNT(*) n FROM rollup_1h")[0]["n"], rollups_before)
 
 
+class CacheStoreCase(StoreCase):
+    def add_cache(self, ts, **kw):
+        row = {"ts": ts, "model": "m:latest", "prompts": 10, "used_mib": 4096.0,
+               "limit_mib": 8192.0, "usage": 0.5, "token_limit": 32768,
+               "ckpt_total": 32, "evictions": 0, "evict_crowded": 0,
+               "evict_invalidated": 0, "restores": 0, "ckpt_created": 0, "saves": 0}
+        row.update(kw)
+        self.st.insert_cache_sample(row)
+
+
+class TestPromptCacheStore(CacheStoreCase):
+    def test_round_trip(self):
+        self.add_cache(1_700_000_000, prompts=30, used_mib=8010.969, usage=0.9779,
+                       update_ms=364.22, evictions=3, evict_crowded=2,
+                       evict_invalidated=1)
+        self.st.commit()
+        r = self.st.query("SELECT * FROM ollama_cache_samples")[0]
+        self.assertEqual(r["prompts"], 30)
+        self.assertAlmostEqual(r["used_mib"], 8010.969)
+        self.assertAlmostEqual(r["update_ms"], 364.22)
+        self.assertEqual(r["evict_crowded"], 2)
+
+    def test_replaying_the_same_log_is_a_no_op(self):
+        """Re-reading a journal must not double-count; the timestamp is the
+        identity, and a second read reproduces an identical row."""
+        for _ in range(3):
+            self.add_cache(1_700_000_000, prompts=30)
+        self.st.commit()
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM ollama_cache_samples")[0]["n"], 1)
+
+    def test_prune_uses_the_sample_retention(self):
+        now = time.time()
+        self.add_cache(now - 60 * 86400)
+        self.add_cache(now - 60)
+        self.st.commit()
+        dropped = self.st.prune(raw_retention_days=7, sample_retention_days=30)
+        self.assertEqual(dropped["ollama_cache_samples"], 1)
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM ollama_cache_samples")[0]["n"], 1)
+
+
+class TestPromptCacheMetrics(CacheStoreCase):
+    def test_summary_aggregates_gauges_and_totals_counters(self):
+        base = 1_700_000_000
+        self.add_cache(base, usage=0.2, used_mib=1638.4, prompts=5, update_ms=10.0,
+                       evictions=1, ckpt_used=3)
+        self.add_cache(base + 60, usage=0.9, used_mib=7372.8, prompts=28,
+                       update_ms=500.0, evictions=4, ckpt_used=9)
+        self.st.commit()
+        s = metrics.cache_summary(self.st, base - 1, base + 120)
+
+        self.assertEqual(s["samples"], 2)
+        self.assertAlmostEqual(s["usage"]["mean"], 0.55)
+        self.assertAlmostEqual(s["usage"]["max"], 0.9)
+        self.assertAlmostEqual(s["usage"]["last"], 0.9)
+        self.assertEqual(s["prompts"]["max"], 28)
+        self.assertEqual(s["limit_mib"], 8192.0)
+        self.assertAlmostEqual(s["update_ms"]["max"], 500.0)
+        # Counters are summed, never averaged: they are already deltas.
+        self.assertEqual(s["evictions"], 5)
+        self.assertEqual(s["checkpoints"]["used"]["max"], 9)
+        self.assertEqual(s["checkpoints"]["total"], 32)
+
+    def test_pressure_is_flagged_on_the_peak_not_the_mean(self):
+        """A cache that spent one minute full evicted during that minute; a
+        comfortable average does not undo it."""
+        base = 1_700_000_000
+        self.add_cache(base, usage=0.05)
+        self.add_cache(base + 60, usage=0.98)
+        self.st.commit()
+        s = metrics.cache_summary(self.st, base - 1, base + 120)
+        self.assertLess(s["usage"]["mean"], metrics.CACHE_PRESSURE)
+        self.assertTrue(s["under_pressure"])
+
+    def test_an_empty_window_says_why(self):
+        """No samples is not the same as an empty cache, and the difference is
+        usually OLLAMA_DEBUG being off."""
+        s = metrics.cache_summary(self.st, 1_700_000_000, 1_700_003_600)
+        self.assertEqual(s["samples"], 0)
+        self.assertIsNone(s["usage"]["mean"])
+        self.assertFalse(s["under_pressure"])
+        self.assertIn("OLLAMA_DEBUG", s["note"])
+
+    def test_series_averages_gauges_and_sums_counters_per_bucket(self):
+        base = 1_700_000_000
+        for i, usage in enumerate((0.2, 0.4)):
+            self.add_cache(base + i, usage=usage, evictions=2)
+        self.st.commit()
+        ser = metrics.cache_series(self.st, base, base + 300, step=300)
+        self.assertAlmostEqual(ser["series"]["usage"][0], 0.3)
+        self.assertEqual(ser["series"]["evictions"][0], 4)
+        self.assertEqual(ser["counts"][0], 2)
+
+    def test_series_leaves_unsampled_buckets_null(self):
+        """An idle stretch must not draw a line down to zero: nothing was
+        measured there, which is different from a cache that emptied."""
+        base = 1_700_000_000
+        self.add_cache(base, usage=0.5)
+        self.st.commit()
+        ser = metrics.cache_series(self.st, base, base + 1200, step=300)
+        self.assertAlmostEqual(ser["series"]["usage"][0], 0.5)
+        self.assertIsNone(ser["series"]["usage"][1])
+        self.assertIsNone(ser["series"]["evictions"][1])
+
+
+class TestLiveKvOccupancy(StoreCase):
+    def test_occupancy_comes_from_the_token_and_capacity_pair(self):
+        base = time.time() - 60
+        self.add(base, latency_ms=100.0, context_tokens=16384, n_ctx_slot=32768)
+        self.add(base + 1, latency_ms=100.0, context_tokens=32700, n_ctx_slot=32768)
+        self.st.commit()
+        s = metrics.summary(self.st, base - 1, base + 60)
+        self.assertTrue(s["exact"])
+        self.assertEqual(s["ctx_usage"]["n"], 2)
+        self.assertAlmostEqual(s["ctx_usage"]["max"], 32700 / 32768)
+
+    def test_rows_without_a_capacity_are_skipped_not_guessed(self):
+        """Rows written before the column existed keep NULL; back-computing
+        occupancy from an assumed context size would invent the number."""
+        base = time.time() - 60
+        self.add(base, latency_ms=100.0, context_tokens=16384)
+        self.st.commit()
+        self.assertIsNone(metrics.summary(self.st, base - 1, base + 60)["ctx_usage"])
+
+    def test_long_windows_report_null_rather_than_a_rollup_guess(self):
+        """The rollups aggregate per model and class, not per slot, so the
+        capacity is not in them."""
+        now = time.time()
+        self.add(now - 86400, latency_ms=100.0, context_tokens=16384, n_ctx_slot=32768)
+        self.st.commit()
+        s = metrics.summary(self.st, now - 7 * 86400, now)
+        self.assertFalse(s["exact"])
+        self.assertIsNone(s["ctx_usage"])
+
+
 class TestMetricsSources(StoreCase):
     def test_short_window_is_exact_long_window_is_not(self):
         now = time.time()

@@ -41,7 +41,8 @@ This is the central design fact, so it is worth stating plainly.
 | Errors | HTTP status per request | `request_success_total{finished_reason}` |
 | Client address | yes | no |
 | Percentiles | exact within retention | bucket upper bounds; **means are exact** |
-| Unique extras | prompt cache reuse, draft accept, cold-load time | KV-cache occupancy, preemptions, batch occupancy, waiting-by-reason |
+| KV / prompt cache | occupancy + eviction counts, sampled from the log | occupancy gauge, scraped |
+| Unique extras | prompt cache reuse, draft accept, cold-load time, KV VRAM/RAM split | preemptions, batch occupancy, waiting-by-reason |
 
 Both tabs show GPU utilisation, VRAM, temperature and power draw, since those
 are measured by `nvidia-smi` rather than by either engine. Temperature and power
@@ -86,6 +87,61 @@ stay empty. The dashboard says so in a banner instead of showing zeros.
 [Service]
 Environment="OLLAMA_DEBUG=1"
 ```
+
+### Ollama: KV and prompt cache
+
+Ollama publishes no metrics endpoint, so there is nothing to scrape — but with
+`OLLAMA_DEBUG=1` it *logs* its cache state outright, and that line is collected
+into `ollama_cache_samples`:
+
+```
+srv  update:  - cache state: 30 prompts, 8010.969 MiB (limits: 8192.000 MiB, 32768 tokens, 68068 est)
+srv  get_availabl: prompt cache update took 364.22 ms
+```
+
+That is 97.8% of an 8 GiB pool, and the maintenance pass that produced it cost
+364 ms **inside the request that triggered it** — cache pressure shows up as
+TTFT, which is why the cost is stored next to the occupancy rather than
+separately.
+
+There are two different caches here and the tool keeps them apart:
+
+| | What it is | Where it comes from |
+|---|---|---|
+| **Prompt cache** | the bounded pool of saved prompt states that lets a returning conversation skip prefill | `cache state` lines → `ollama_cache_samples.usage` |
+| **Live KV cache** | the slot's own context memory, preallocated at load | `context_tokens / n_ctx_slot` per request → `ctx_usage` |
+
+Prompt-cache occupancy is the closer analogue of vLLM's `kv_cache_usage_perc`.
+Live KV occupancy is the distance to a **context shift or truncation** — a
+request at 99.9% is one token from losing history.
+
+Alongside the occupancy gauge, the same lines yield eviction pressure, split by
+reason because the two mean different things: `evict_crowded` says the pool is
+too small, `evict_invalidated` says the cached positions no longer applied. Each
+eviction is a prefill somebody pays for again later.
+
+Two caveats that shape every figure:
+
+- **Sampling is ollama's, not ours.** A `cache state` line appears only when
+  ollama runs a cache update, so an empty window means *no updates happened*,
+  not *the cache was empty*. `samples` is always reported alongside, and the
+  eviction counters are stored as **deltas** between samples and summed rather
+  than turned into rates — a rate over unevenly spaced deltas would be fiction.
+- **No `OLLAMA_DEBUG`, no gauge.** The lines vanish entirely, exactly as the
+  timing lines do. `/api/cache` returns `debug_logging` so a caller seeing zero
+  samples is told why.
+
+Model loads also record how the KV cache was *placed*:
+
+```
+llama_kv_cache:      CUDA0 KV buffer size =  512.00 MiB
+llama_kv_cache:        CPU KV buffer size = 4096.00 MiB
+```
+
+A cache that did not fit in VRAM caps decode throughput for the whole life of
+the load, so that raises a `kv_offload` **WARN event** ("89% of the KV cache is
+on host RAM, not VRAM") rather than being left buried in the load event's
+detail.
 
 ### vLLM: where the numbers come from
 
@@ -347,6 +403,7 @@ tools, which otherwise wait forever on an open stream).
 | `/api/summary`, `/api/timeseries`, `/api/models`, `/api/slowest?by=queue_ms` | Ollama breakdowns |
 | `/api/vllm/summary`, `/api/vllm/timeseries`, `/api/vllm/instances` | vLLM breakdowns |
 | `/api/requests`, `/api/errors`, `/api/events`, `/api/gpu`, `/api/ps` | raw rows and timelines |
+| `/api/cache?window=1h` | Ollama prompt-cache occupancy, evictions, update cost |
 | `/api/config` (GET/PUT), `/api/config/reset` | settings |
 | `/api/sources` (GET/POST/PUT/DELETE), `/api/sources/probe` | monitored engines |
 | `/api/prefs`, `/api/status`, `/api/health` | dashboard defaults, collector state |
@@ -377,6 +434,7 @@ always matches the number on screen.
 | `get_events` | cold loads, evictions, truncations, warnings |
 | `vllm_summary`, `vllm_timeseries`, `vllm_instances` | vLLM metrics, reachability, GPU attribution |
 | `gpu_status` | per-device util/VRAM/temp/power |
+| `cache_status` | Ollama prompt-cache occupancy and eviction pressure, plus live KV usage |
 | `list_sources`, `get_settings` | what is monitored, and how it is configured |
 | `health` | is collection working, is debug logging on |
 | `run_sql`, `describe_schema` | read-only SELECT escape hatch, with units |
@@ -386,7 +444,8 @@ always matches the number on screen.
 ## Retention
 
 - Raw per-request rows (Ollama): **7 days** (`retention.raw_days`).
-- GPU samples, events, vLLM rows: **30 days** (`retention.sample_days`).
+- GPU samples, events, prompt-cache samples, vLLM rows: **30 days**
+  (`retention.sample_days`).
 - `rollup_1m` and `rollup_1h`: **kept indefinitely**.
 
 Rollups store fixed-bucket **histograms** of TTFT and latency, not pre-computed
@@ -445,6 +504,19 @@ other does *not* give tokens per request. The API marks this with
 **No per-request anything for vLLM.** Covered above. If you need per-request
 detail from vLLM, its request-level logging is the only source, and it logs
 prompt text — which this tool deliberately never stores.
+
+**The Ollama prompt-cache gauge is sampled on ollama's schedule.** A `cache
+state` line is logged only when ollama runs a cache update, so the series is
+unevenly spaced and a window with no samples means "no cache updates happened",
+not "the cache was empty". Its counters are therefore stored as deltas and
+reported as totals, never as rates, and `samples` accompanies every figure. The
+gauge also disappears completely without `OLLAMA_DEBUG=1`.
+
+**Live KV occupancy exists only inside the raw window.** It is computed from
+`context_tokens / n_ctx_slot` on per-request rows. The rollups aggregate per
+model and class rather than per slot, so beyond retention `ctx_usage` is null
+rather than back-computed from an assumed context size. Rows written before the
+`n_ctx_slot` column existed are skipped for the same reason.
 
 **Logs are the feed, not the archive.** A journal may hold only a day or two
 depending on `journald.conf`; the SQLite file is the historian. If logs rotate

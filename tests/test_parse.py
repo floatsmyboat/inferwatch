@@ -4,7 +4,8 @@
 import unittest
 
 from inferwatch.parse import (classify_endpoint, parse_duration_ms, parse_gin,
-                           parse_go, parse_line, parse_slot)
+                           parse_go, parse_kv_cache, parse_line, parse_slot,
+                           parse_srv)
 
 
 class TestDuration(unittest.TestCase):
@@ -175,11 +176,142 @@ class TestGo(unittest.TestCase):
         self.assertEqual(ev["kv"]["architecture"], "qwen35")
 
 
+class TestPromptCache(unittest.TestCase):
+    """The `srv` lines that report ollama's prompt-cache occupancy."""
+
+    STATE = ("srv        update:  - cache state: 30 prompts, 8010.969 MiB "
+             "(limits: 8192.000 MiB, 32768 tokens, 68068 est)")
+
+    def test_cache_state(self):
+        ev = parse_srv(self.STATE)
+        self.assertEqual(ev["kind"], "cache_state")
+        self.assertEqual(ev["prompts"], 30)
+        self.assertAlmostEqual(ev["used_mib"], 8010.969)
+        self.assertAlmostEqual(ev["limit_mib"], 8192.0)
+        self.assertAlmostEqual(ev["usage"], 8010.969 / 8192.0)
+        self.assertEqual(ev["token_limit"], 32768)
+        self.assertEqual(ev["est_tokens"], 68068)
+
+    def test_an_unbounded_limit_is_not_a_full_cache(self):
+        """A zero limit means no cap; reporting 100% there would be a lie."""
+        line = ("srv        update:  - cache state: 0 prompts, 0.000 MiB "
+                "(limits: 0.000 MiB, 0 tokens, 0 est)")
+        self.assertIsNone(parse_srv(line)["usage"])
+
+    def test_singular_prompt(self):
+        line = ("srv        update:  - cache state: 1 prompt, 37.975 MiB "
+                "(limits: 8192.000 MiB, 32768 tokens, 58245 est)")
+        self.assertEqual(parse_srv(line)["prompts"], 1)
+
+    def test_update_cost(self):
+        ev = parse_srv("srv  get_availabl: prompt cache update took 364.22 ms")
+        self.assertEqual(ev["kind"], "cache_update")
+        self.assertAlmostEqual(ev["update_ms"], 364.22)
+
+    def test_prompt_save(self):
+        ev = parse_srv("srv   prompt_save:  - saving prompt with length 2211, "
+                       "total state size = 271.170 MiB (draft: 0.000 MiB)")
+        self.assertEqual(ev["kind"], "cache_save")
+        self.assertEqual(ev["prompt_tokens"], 2211)
+        self.assertAlmostEqual(ev["state_mib"], 271.170)
+
+    def test_srv_chatter_is_not_claimed(self):
+        """Most srv lines carry no metric; claiming them would invent data."""
+        for line in (
+            "srv  update_slots: all slots are idle",
+            "srv  get_availabl: updating prompt cache",
+            "srv        update:    - prompt 0x2c8e0ff0:    2244 tokens, "
+            "checkpoints:  3,   271.170 MiB",
+            "srv          load:    - prompt with length    2210, lcp =     562, "
+            "f_keep = 0.254, f_sim = 0.541",
+            "srv    operator(): chat format: peg-native",
+        ):
+            self.assertIsNone(parse_srv(line), line)
+
+
+class TestContextCheckpoints(unittest.TestCase):
+    """Within-slot KV snapshots, and the two ways they get thrown away."""
+
+    def test_created_reports_index_and_cap(self):
+        ev = parse_slot("slot create_check: id  0 | task 41843 | created context "
+                        "checkpoint 2 of 32 (pos_min = 1007, pos_max = 1007, "
+                        "n_tokens = 1008, size = 50.251 MiB)")
+        self.assertEqual(ev["kind"], "ckpt_create")
+        self.assertEqual(ev["ckpt_index"], 2)
+        self.assertEqual(ev["ckpt_total"], 32)
+        self.assertEqual(ev["ckpt_tokens"], 1008)
+        self.assertAlmostEqual(ev["ckpt_mib"], 50.251)
+
+    def test_restore(self):
+        ev = parse_slot("slot   operator(): id  0 | task 41843 | restored context "
+                        "checkpoint (pos_min = 1007, pos_max = 1007, n_tokens = 1008, "
+                        "n_past = 1008, size = 50.251 MiB)")
+        self.assertEqual(ev["kind"], "ckpt_restore")
+        self.assertEqual(ev["ckpt_tokens"], 1008)
+
+    def test_the_two_eviction_reasons_stay_apart(self):
+        """Capacity pressure and invalidation mean different things: one says
+        the cache is too small, the other says the positions moved."""
+        crowded = parse_slot(
+            "slot create_check: id  0 | task 41843 | erasing context checkpoint too "
+            "close to an earlier one (pos_min = 499, pos_max = 499, n_tokens = 500, "
+            "size = 50.251 MiB)")
+        invalid = parse_slot(
+            "slot   operator(): id  0 | task 41843 | erased invalidated context "
+            "checkpoint (pos_min = 1, pos_max = 1, n_tokens = 2, n_swa = 3, "
+            "pos_next = 4, size = 50.251 MiB)")
+        self.assertEqual(crowded["kind"], "ckpt_evict")
+        self.assertEqual(crowded["reason"], "crowded")
+        self.assertEqual(invalid["kind"], "ckpt_evict")
+        self.assertEqual(invalid["reason"], "invalidated")
+
+
+class TestKvCacheSizing(unittest.TestCase):
+    """The `llama_kv_cache:` lines a model load prints."""
+
+    def test_size_line(self):
+        ev = parse_kv_cache(
+            "llama_kv_cache: size = 4608.00 MiB ( 32768 cells,  36 layers,  "
+            "1/1 seqs), K (f16): 2304.00 MiB, V (f16): 2304.00 MiB")
+        self.assertEqual(ev["kind"], "kv_size")
+        self.assertAlmostEqual(ev["kv_mib"], 4608.0)
+        self.assertEqual(ev["cells"], 32768)
+        self.assertEqual(ev["layers"], 36)
+        self.assertEqual(ev["seqs_max"], 1)
+        self.assertEqual(ev["k_type"], "f16")
+        self.assertAlmostEqual(ev["k_mib"], 2304.0)
+        self.assertAlmostEqual(ev["v_mib"], 2304.0)
+
+    def test_size_line_without_the_kv_type_tail(self):
+        ev = parse_kv_cache("llama_kv_cache: size = 1024.00 MiB ( 32768 cells,  "
+                            "8 layers,  1/1 seqs)")
+        self.assertAlmostEqual(ev["kv_mib"], 1024.0)
+        self.assertNotIn("k_mib", ev)
+
+    def test_buffer_lines_name_their_device(self):
+        gpu = parse_kv_cache("llama_kv_cache:      CUDA0 KV buffer size =  1024.00 MiB")
+        cpu = parse_kv_cache("llama_kv_cache:        CPU KV buffer size =  4096.00 MiB")
+        self.assertEqual(gpu["device"], "CUDA0")
+        self.assertAlmostEqual(gpu["kv_mib"], 1024.0)
+        self.assertEqual(cpu["device"], "CPU")
+        self.assertAlmostEqual(cpu["kv_mib"], 4096.0)
+
+    def test_other_kv_lines_are_ignored(self):
+        self.assertIsNone(parse_kv_cache(
+            "llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 256"))
+
+
 class TestDispatch(unittest.TestCase):
     def test_unowned_lines_return_none(self):
         for line in ("", "srv  update_slots: all slots are idle",
                      "spec common_specu: statistics draft-mtp: ..."):
             self.assertIsNone(parse_line(line))
+
+    def test_new_prefixes_reach_their_parser(self):
+        self.assertEqual(parse_line(TestPromptCache.STATE)["kind"], "cache_state")
+        self.assertEqual(
+            parse_line("llama_kv_cache:  CPU KV buffer size = 4096.00 MiB")["kind"],
+            "kv_buffer")
 
 
 if __name__ == "__main__":

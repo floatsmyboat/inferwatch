@@ -319,6 +319,8 @@ def create_app(state: AppState) -> FastAPI:
                 "include_health": include_health,
                 "events": metrics.events(st, start, end, None, 40),
                 "gpu": metrics.gpu_series(st, start, end, step),
+                "cache": metrics.cache_summary(st, start, end),
+                "cache_series": metrics.cache_series(st, start, end, step),
                 "live": metrics.loaded_models(st),
                 "model_names": metrics.model_names(st),
             }
@@ -372,6 +374,17 @@ def create_app(state: AppState) -> FastAPI:
     async def gpu(window: str = "1h", step: int | None = None):
         start, end = _window(window)
         return metrics.gpu_series(state.store, start, end, step)
+
+    @app.get("/api/cache")
+    async def cache(window: str = "1h", step: int | None = None):
+        """Ollama's prompt-cache occupancy: the one KV gauge it publishes."""
+        start, end = _window(window)
+        return {"summary": metrics.cache_summary(state.store, start, end),
+                "series": metrics.cache_series(state.store, start, end, step),
+                # The gauge disappears entirely without OLLAMA_DEBUG, so a
+                # caller seeing zero samples is told why here rather than
+                # having to correlate with /api/health.
+                "debug_logging": state.debug_enabled}
 
     @app.get("/api/ps")
     async def ps():

@@ -79,7 +79,8 @@ def summary(store, start: float, end: float, model: str | None = None) -> dict:
         clause = _model_clause(model, params)
         rows = store.query(
             "SELECT class,status,ttft_ms,latency_ms,queue_ms,decode_ms,decode_tps,"
-            "prompt_tokens,output_tokens,cached_tokens,attribution"
+            "prompt_tokens,output_tokens,cached_tokens,context_tokens,n_ctx_slot,"
+            "attribution"
             f" FROM requests WHERE ts >= ? AND ts < ?{clause}", tuple(params))
         inf = [r for r in rows if r["class"] in INFERENCE_CLASSES]
         errors = [r for r in inf if r["status"] and r["status"] >= 400]
@@ -99,6 +100,14 @@ def summary(store, start: float, end: float, model: str | None = None) -> dict:
         queue_mean = (sum(queues) / len(queues)) if queues else None
         queue_p90 = _quantiles(queues, (0.9,))["p90"] if queues else None
         ttft_max = max(ttfts) if ttfts else None
+        # How full the LIVE KV cache got: tokens resident in the slot at
+        # release, over that slot's capacity.  This is the distance to a
+        # context shift, and it is a different cache from the prompt-cache
+        # pool that cache_summary() reports on.
+        ctx = [r["context_tokens"] / r["n_ctx_slot"] for r in inf
+               if r["context_tokens"] and r["n_ctx_slot"]]
+        ctx_usage = ({"mean": sum(ctx) / len(ctx), "max": max(ctx), "n": len(ctx)}
+                     if ctx else None)
     else:
         table = "rollup_1h" if span > 7 * 86400 else "rollup_1m"
         params = [start, end]
@@ -122,6 +131,10 @@ def summary(store, start: float, end: float, model: str | None = None) -> dict:
         queue_p90 = None  # not reconstructable from rollups; raw window only
         ttft_max = max([r["ttft_max"] for r in inf if r["ttft_max"] is not None], default=None)
         ambiguous = None
+        # The rollups aggregate per model and class, not per slot, so the
+        # capacity a request ran against is not in them.  Null rather than a
+        # figure derived from an assumed context size.
+        ctx_usage = None
 
     ttft_n = ttft.get("p50") is not None
     return {
@@ -146,6 +159,8 @@ def summary(store, start: float, end: float, model: str | None = None) -> dict:
         "latency_ms": lat,
         "queue_ms_mean": queue_mean,
         "queue_ms_p90": queue_p90,
+        # Live KV occupancy; raw window only, see above.
+        "ctx_usage": ctx_usage,
         "ambiguous_rows": ambiguous,
     }
 
@@ -413,6 +428,114 @@ def gpu_series(store, start: float, end: float, step: int | None = None) -> dict
     return {"start": base, "step": step, "n": nb,
             "t": [base + i * step for i in range(nb)],
             "gpus": [gpus[k] for k in sorted(gpus)]}
+
+
+# --------------------------------------------------------------------------
+# ollama's prompt cache
+# --------------------------------------------------------------------------
+
+# Occupancy above this is worth flagging: the pool is about to start evicting,
+# and every eviction is a prefill somebody pays for later.
+CACHE_PRESSURE = 0.9
+
+_CACHE_COUNTERS = ("evictions", "evict_crowded", "evict_invalidated", "restores",
+                   "ckpt_created", "saves")
+
+
+def _gauge(values: list) -> dict:
+    """mean / max / last over a gauge's samples, ignoring nulls."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return {"mean": None, "max": None, "last": None}
+    return {"mean": sum(vals) / len(vals), "max": max(vals), "last": vals[-1]}
+
+
+def cache_summary(store, start: float, end: float) -> dict:
+    """Prompt-cache occupancy and pressure over a window.
+
+    A caveat that shapes every number here: ollama logs a `cache state` line
+    only when it actually runs a cache update, so the sampling is ITS schedule,
+    not a fixed interval.  An empty window means "no cache updates happened",
+    which is not the same as "the cache was empty" -- so `samples` is reported
+    alongside, and the counters are summed rather than turned into rates, since
+    a rate over unevenly sampled deltas would be fiction.
+    """
+    span = max(1e-9, end - start)
+    rows = store.query(
+        "SELECT * FROM ollama_cache_samples WHERE ts >= ? AND ts < ? ORDER BY ts",
+        (start, end))
+    usage = _gauge([r["usage"] for r in rows])
+    out = {
+        "start": start, "end": end, "span_s": span, "exact": True,
+        "samples": len(rows),
+        "last_ts": rows[-1]["ts"] if rows else None,
+        "usage": usage,
+        "used_mib": _gauge([r["used_mib"] for r in rows]),
+        "limit_mib": next((r["limit_mib"] for r in reversed(rows)
+                           if r["limit_mib"] is not None), None),
+        "prompts": _gauge([r["prompts"] for r in rows]),
+        "token_limit": next((r["token_limit"] for r in reversed(rows)
+                             if r["token_limit"] is not None), None),
+        # The `est` field on the same log line is NOT summarised here: on an
+        # empty cache llama.cpp reports a byte budget (2^33) in the token slot,
+        # so a mean over it is meaningless.  The raw column keeps the value.
+        # The maintenance pass is synchronous, so this is latency a request
+        # paid, not background work.
+        "update_ms": _gauge([r["update_ms"] for r in rows]),
+        "checkpoints": {
+            "used": _gauge([r["ckpt_used"] for r in rows]),
+            "total": next((r["ckpt_total"] for r in reversed(rows)
+                           if r["ckpt_total"] is not None), None),
+        },
+        "under_pressure": (usage["max"] or 0) >= CACHE_PRESSURE,
+    }
+    for key in _CACHE_COUNTERS:
+        out[key] = sum(r[key] or 0 for r in rows)
+    if not rows:
+        out["note"] = ("no prompt-cache samples in this window. ollama prints "
+                       "them only with OLLAMA_DEBUG=1, and only when it runs a "
+                       "cache update -- an idle instance logs none.")
+    return out
+
+
+def cache_series(store, start: float, end: float, step: int | None = None) -> dict:
+    """Bucketed prompt-cache series for the charts.
+
+    Gauges are averaged within a bucket and counters summed, matching how the
+    two are stored.  Empty buckets stay null so an idle stretch reads as "not
+    sampled" rather than as a cache that emptied.
+    """
+    span = max(1.0, end - start)
+    step = step or pick_step(span)
+    nb = int(span // step) + 1
+    base = int(start // step) * step
+    gauges = ("usage", "used_mib", "prompts", "update_ms", "ckpt_used")
+    series = {k: [None] * nb for k in gauges + _CACHE_COUNTERS}
+    counts = [0] * nb
+
+    rows = store.query(
+        "SELECT * FROM ollama_cache_samples WHERE ts >= ? AND ts < ? ORDER BY ts",
+        (start, end))
+    acc: dict[int, dict] = {}
+    for r in rows:
+        i = int((r["ts"] - base) // step)
+        if not 0 <= i < nb:
+            continue
+        a = acc.setdefault(i, {k: [] for k in gauges})
+        for k in gauges:
+            if r[k] is not None:
+                a[k].append(r[k])
+        for k in _CACHE_COUNTERS:
+            series[k][i] = (series[k][i] or 0) + (r[k] or 0)
+        counts[i] += 1
+    for i, a in acc.items():
+        for k in gauges:
+            if a[k]:
+                series[k][i] = sum(a[k]) / len(a[k])
+
+    return {"start": base, "step": step, "n": nb, "exact": True,
+            "t": [base + i * step for i in range(nb)],
+            "counts": counts, "series": series}
 
 
 def loaded_models(store) -> dict:

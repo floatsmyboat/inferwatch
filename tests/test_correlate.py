@@ -36,9 +36,11 @@ class Harness:
         self.requests = []
         self.events = []
         self.live = []
+        self.cache = []
         self.corr = Correlator(on_request=self.requests.append,
                                on_event=self.events.append,
-                               on_live=self.live.append)
+                               on_live=self.live.append,
+                               on_cache=self.cache.append)
         self.t = 1000.0
 
     def feed(self, *lines):
@@ -192,6 +194,209 @@ class TestLifecycle(unittest.TestCase):
         gens = [e for e in h.live if e["type"] == "gen"]
         self.assertEqual(len(gens), 1)
         self.assertAlmostEqual(gens[0]["tps_3s"], 28.68)
+
+
+# --------------------------------------------------------------------------
+# prompt cache
+# --------------------------------------------------------------------------
+
+def cache_lines(prompts=30, used=8010.969, limit=8192.000, took=364.22):
+    """The srv-line burst ollama emits when it runs a prompt-cache update."""
+    return [
+        "srv  get_availabl: updating prompt cache",
+        f"srv        update:  - cache state: {prompts} prompts, {used:.3f} MiB "
+        f"(limits: {limit:.3f} MiB, 32768 tokens, 68068 est)",
+        f"srv  get_availabl: prompt cache update took {took} ms",
+    ]
+
+
+CKPT_CREATE = ("slot create_check: id  0 | task {task} | created context checkpoint "
+               "{n} of 32 (pos_min = 1, pos_max = 1, n_tokens = 1008, size = 50.251 MiB)")
+CKPT_CROWDED = ("slot create_check: id  0 | task {task} | erasing context checkpoint too "
+                "close to an earlier one (pos_min = 1, pos_max = 1, n_tokens = 500, "
+                "size = 50.251 MiB)")
+CKPT_INVALID = ("slot   operator(): id  0 | task {task} | erased invalidated context "
+                "checkpoint (pos_min = 1, pos_max = 1, n_tokens = 2, n_swa = 3, "
+                "pos_next = 4, size = 50.251 MiB)")
+CKPT_RESTORE = ("slot   operator(): id  0 | task {task} | restored context checkpoint "
+                "(pos_min = 1, pos_max = 1, n_tokens = 1008, n_past = 1008, "
+                "size = 50.251 MiB)")
+
+
+class TestPromptCacheSampling(unittest.TestCase):
+    def test_a_state_line_plus_its_cost_line_make_one_sample(self):
+        h = Harness()
+        h.feed(*cache_lines()).finish()
+        self.assertEqual(len(h.cache), 1)
+        c = h.cache[0]
+        self.assertEqual(c["prompts"], 30)
+        self.assertAlmostEqual(c["used_mib"], 8010.969)
+        self.assertAlmostEqual(c["usage"], 8010.969 / 8192.0)
+        # The cost line follows the state line, so it must land on the same row.
+        self.assertAlmostEqual(c["update_ms"], 364.22)
+
+    def test_a_state_line_with_no_cost_line_is_still_stored(self):
+        """The cost line can be missing; losing the occupancy gauge with it
+        would be the worse failure."""
+        h = Harness()
+        h.feed("srv        update:  - cache state: 5 prompts, 100.000 MiB "
+               "(limits: 8192.000 MiB, 32768 tokens, 0 est)").finish()
+        self.assertEqual(len(h.cache), 1)
+        self.assertEqual(h.cache[0]["prompts"], 5)
+        self.assertIsNone(h.cache[0].get("update_ms"))
+
+    def test_a_second_state_line_flushes_the_first(self):
+        h = Harness()
+        h.feed("srv        update:  - cache state: 1 prompts, 10.000 MiB "
+               "(limits: 8192.000 MiB, 32768 tokens, 0 est)",
+               "srv        update:  - cache state: 2 prompts, 20.000 MiB "
+               "(limits: 8192.000 MiB, 32768 tokens, 0 est)").finish()
+        self.assertEqual([c["prompts"] for c in h.cache], [1, 2])
+
+    def test_a_cost_line_alone_records_the_cost(self):
+        """An update that changed nothing still cost real time inside a
+        request, so it is kept with the gauges left null rather than dropped."""
+        h = Harness()
+        h.feed("srv  get_availabl: prompt cache update took 9.88 ms").finish()
+        self.assertEqual(len(h.cache), 1)
+        self.assertAlmostEqual(h.cache[0]["update_ms"], 9.88)
+        self.assertIsNone(h.cache[0].get("usage"))
+
+    def test_the_model_is_carried_from_the_scheduler_lines(self):
+        """The cache-state line names no model; the last active one is the
+        only honest label available."""
+        h = Harness()
+        h.feed(*task_lines(1),
+               GIN.format(status=200, lat="1s", path="/api/chat"),
+               SCHED.format(model="llama3.2:3b"),
+               *cache_lines()).finish()
+        self.assertEqual(h.cache[0]["model"], "llama3.2:3b")
+
+    def test_a_sample_is_pushed_to_the_live_feed(self):
+        h = Harness()
+        h.feed(*cache_lines()).finish()
+        self.assertEqual([e["type"] for e in h.live if e["type"] == "cache"], ["cache"])
+
+
+class TestCheckpointCounters(unittest.TestCase):
+    def test_counters_are_deltas_between_samples(self):
+        """Stored as deltas so a runner restart cannot make a rate negative."""
+        h = Harness()
+        h.feed(CKPT_CROWDED.format(task=1), CKPT_CROWDED.format(task=1),
+               CKPT_INVALID.format(task=1), CKPT_RESTORE.format(task=1),
+               *cache_lines(prompts=1))
+        h.feed(CKPT_CROWDED.format(task=2), *cache_lines(prompts=2)).finish()
+
+        first, second = h.cache
+        self.assertEqual(first["evictions"], 3)
+        self.assertEqual(first["evict_crowded"], 2)
+        self.assertEqual(first["evict_invalidated"], 1)
+        self.assertEqual(first["restores"], 1)
+        # The second sample counts only what happened after the first.
+        self.assertEqual(second["evictions"], 1)
+        self.assertEqual(second["evict_crowded"], 1)
+        self.assertEqual(second["restores"], 0)
+
+    def test_checkpoint_high_water_and_cap(self):
+        h = Harness()
+        h.feed(CKPT_CREATE.format(task=1, n=2), CKPT_CREATE.format(task=1, n=5),
+               CKPT_CREATE.format(task=1, n=3), *cache_lines()).finish()
+        c = h.cache[0]
+        self.assertEqual(c["ckpt_used"], 5)   # high-water, not the last seen
+        self.assertEqual(c["ckpt_total"], 32)
+        self.assertEqual(c["ckpt_created"], 3)
+
+    def test_the_cap_survives_a_sample_but_the_high_water_resets(self):
+        h = Harness()
+        h.feed(CKPT_CREATE.format(task=1, n=7), *cache_lines(prompts=1))
+        h.feed(*cache_lines(prompts=2)).finish()
+        self.assertEqual(h.cache[0]["ckpt_used"], 7)
+        self.assertIsNone(h.cache[1]["ckpt_used"])
+        # The cap is a property of the runner, not of the window.
+        self.assertEqual(h.cache[1]["ckpt_total"], 32)
+
+    def test_bookkeeping_against_task_minus_one_still_counts(self):
+        """These lines describe the runner's cache, not a request, and
+        llama.cpp sometimes logs them with no task attached."""
+        h = Harness()
+        h.feed(CKPT_CROWDED.format(task=-1), *cache_lines()).finish()
+        self.assertEqual(h.cache[0]["evictions"], 1)
+
+
+class TestLiveKvSizing(unittest.TestCase):
+    LOAD_START = ('time=2026-08-19T08:08:08.444-05:00 level=INFO'
+                  ' source=llama_server.go:433 msg="starting llama-server"'
+                  ' cmd="/usr/local/lib/ollama/llama-server --model'
+                  ' /models/blobs/sha256-abc --port 35259 -c 32768 -np 1"')
+    LOADED = ('time=2026-08-19T08:08:20.100-05:00 level=INFO source=server.go:1'
+              ' msg="llama-server started in 11.7 seconds"'
+              ' runner.name=registry.ollama.ai/library/qwen3:8b')
+
+    def kv_lines(self, cpu=0.0, gpu=4608.0):
+        out = []
+        if gpu:
+            out.append(f"llama_kv_cache:      CUDA0 KV buffer size =  {gpu:.2f} MiB")
+        if cpu:
+            out.append(f"llama_kv_cache:        CPU KV buffer size =  {cpu:.2f} MiB")
+        out.append(f"llama_kv_cache: size = {cpu + gpu:.2f} MiB ( 32768 cells,  "
+                   "36 layers,  1/1 seqs), K (f16): 2304.00 MiB, V (f16): 2304.00 MiB")
+        return out
+
+    def loads(self, **kw):
+        h = Harness()
+        h.feed(self.LOAD_START, *self.kv_lines(**kw), self.LOADED).finish()
+        return h
+
+    def test_sizing_is_attached_to_the_load_event(self):
+        h = self.loads()
+        loaded = [e for e in h.events if e["kind"] == "model_loaded"]
+        self.assertEqual(len(loaded), 1)
+        kv = loaded[0]["detail"]["kv_cache"]
+        self.assertAlmostEqual(kv["kv_mib"], 4608.0)
+        self.assertEqual(kv["cells"], 32768)
+        self.assertEqual(kv["gpu_mib"], 4608.0)
+        self.assertEqual(kv["cpu_mib"], 0)
+        self.assertEqual(kv["cpu_fraction"], 0.0)
+
+    def test_a_cache_that_fits_in_vram_raises_no_warning(self):
+        self.assertEqual([e for e in self.loads().events if e["kind"] == "kv_offload"], [])
+
+    def test_a_cache_spilled_to_host_ram_is_called_out(self):
+        """It caps decode throughput for the whole life of the load, which is
+        too important to leave buried in a detail blob."""
+        h = self.loads(cpu=4096.0, gpu=512.0)
+        ev = [e for e in h.events if e["kind"] == "kv_offload"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["level"], "WARN")
+        self.assertAlmostEqual(ev[0]["detail"]["cpu_fraction"], 4096.0 / 4608.0)
+        self.assertIn("89%", ev[0]["msg"])
+
+    def test_sizing_does_not_leak_into_the_next_load(self):
+        """A load whose KV lines were not captured must report none, not the
+        previous model's figures."""
+        h = Harness()
+        h.feed(self.LOAD_START, *self.kv_lines(cpu=4096.0, gpu=512.0), self.LOADED)
+        # Past the window that collapses the duplicate "started in Ns" line
+        # ollama prints per llama-server handle, so this is a genuine reload.
+        h.t += 60
+        h.feed(self.LOAD_START, self.LOADED).finish()
+        loaded = [e for e in h.events if e["kind"] == "model_loaded"]
+        self.assertEqual(len(loaded), 2)
+        self.assertIn("kv_cache", loaded[0]["detail"])
+        self.assertNotIn("kv_cache", loaded[1]["detail"] or {})
+
+
+class TestSlotCapacityOnRequests(unittest.TestCase):
+    def test_the_slot_capacity_reaches_the_request_row(self):
+        """context_tokens alone is a token count; only the pair is an
+        occupancy, so both must survive the join."""
+        h = Harness()
+        h.feed(*task_lines(9),
+               GIN.format(status=200, lat="1s", path="/api/chat"),
+               SCHED.format(model="m:latest")).finish()
+        r = h.requests[0]
+        self.assertEqual(r["n_ctx_slot"], 131072)
+        self.assertEqual(r["context_tokens"], 5000)
 
 
 if __name__ == "__main__":
