@@ -18,8 +18,12 @@ Every regex here was written against real journal output from this host
      the LIVE KV cache, sized once at load.  Its GPU/CPU split matters a lot:
      a cache that spilled to host RAM decodes far slower than one that fit.
 
-Those last two are only printed at llama.cpp's higher log verbosity, which is
-what OLLAMA_DEBUG=1 selects -- the same precondition the timing lines have.
+Those last two come from the llama-server runner, and appear only at its higher
+log verbosity.  Ollama 0.32.x passes `--log-verbosity 4` on every load, so they
+are present by default there; OLLAMA_DEBUG=1 is the documented way to be sure of
+it, and additionally turns on ollama's own DEBUG-level Go lines.  Either way an
+instance that serves no traffic logs none of them, so their absence is not by
+itself evidence of a misconfiguration.
 
 Parsers are pure: they take a message string and return a dict, or None.
 No I/O, so they can be replayed over a captured journal in tests.

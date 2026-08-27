@@ -37,18 +37,21 @@ srv = MCPServer(
         "OLLAMA (tools without a prefix) is reconstructed from its debug log, so "
         "PER-REQUEST detail exists: time-to-first-token, token counts, client "
         "address, HTTP status, queue wait, prompt-cache reuse, model load times. "
-        "Percentiles are exact inside the raw-retention window.\n\n"
+        "Percentiles are exact inside the raw-retention window. Its prompt-cache "
+        "occupancy and eviction pressure come from cache_status(), sampled from "
+        "the log on ollama's own schedule rather than on a fixed interval.\n\n"
         "vLLM (tools prefixed vllm_) comes from its Prometheus /metrics endpoint, "
         "which is PRE-AGGREGATED and carries no request identity. There are no "
         "per-request rows, no client addresses and no exact percentiles for vLLM; "
         "its percentile figures are the upper bound of vLLM's own histogram "
         "bucket, while the means are exact -- prefer the mean. In exchange it "
-        "reports things ollama cannot: KV-cache occupancy, preemptions, batch "
+        "reports evenly sampled gauges ollama does not: preemptions, batch "
         "occupancy and speculative-decoding acceptance.\n\n"
         "Windows are relative durations like '15m', '6h', '24h', '7d', '30d'. "
         "Every result carries `exact` and/or `notes` saying how it was derived.\n\n"
-        "Ollama timings require OLLAMA_DEBUG=1 on its service; call health() to "
-        "check. Use list_sources() to see which engines are configured."
+        "Ollama's per-request and cache lines come from its runner at high log "
+        "verbosity, which OLLAMA_DEBUG=1 guarantees; call health() to check. Use "
+        "list_sources() to see which engines are configured."
     ),
     version="1.0.0",
 )
@@ -289,7 +292,8 @@ def gpu_status(window: str = "1h", step_seconds: int | None = None) -> dict:
                 "maintenance pass cost -- plus how full the live KV context got. "
                 "This is the closest ollama equivalent of vLLM's kv_cache_usage; "
                 "unlike vLLM it is sampled from the log on ollama's own schedule, "
-                "so an idle window legitimately has no samples.",
+                "so a window in which no cache update ran legitimately has no "
+                "samples -- which is not the same as an empty cache.",
 )
 def cache_status(window: str = "1h", step_seconds: int | None = None) -> dict:
     """Report prompt-cache occupancy, eviction pressure and live KV usage.
@@ -320,7 +324,7 @@ def cache_status(window: str = "1h", step_seconds: int | None = None) -> dict:
         out["warning"] = summ.get("note")
     elif summ["under_pressure"]:
         out["warning"] = (
-            f"the prompt cache peaked at {summ['usage']['max']:.0%} of its "
+            f"the prompt cache peaked at {summ['usage']['max']:.1%} of its "
             f"{summ['limit_mib']:.0f} MiB limit with {summ['evictions']} "
             f"eviction(s) in this window; evicted prompts have to be prefilled "
             f"again, which shows up as higher TTFT.")

@@ -362,6 +362,20 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="tbl-wrap" id="t-decode" hidden></div>
     </div>
 
+    <div class="card" id="c-kv">
+      <header><h2>Prompt cache usage</h2><span class="note" id="n-kv"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-kv"></div><div class="plot" id="p-kv"></div>
+      <div class="tbl-wrap" id="t-kv" hidden></div>
+    </div>
+
+    <div class="card" id="c-kvevict">
+      <header><h2>Prompt cache pressure</h2><span class="note" id="n-kvevict"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-kvevict"></div><div class="plot" id="p-kvevict"></div>
+      <div class="tbl-wrap" id="t-kvevict" hidden></div>
+    </div>
+
     <div class="card" id="c-gpu">
       <header><h2>GPU utilisation</h2><span class="note" id="n-gpu"></span>
         <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
@@ -1023,6 +1037,8 @@ function renderKpis() {
          s.error_rate > 0.01, s.errors ? css("--critical") : css("--good")),
     tile("Prompt cache", fmtPct(s.cache_hit_rate), "",
          `${fmtCompact(s.cached_tokens, 0)} tokens reused`),
+    cacheTile(d.cache),
+    liveKvTile(s.ctx_usage),
     tile("Tokens out", fmtCompact(s.output_tokens, 0), "",
          `in ${fmtCompact(s.input_tokens, 0)} · ${fmtCompact(s.out_tok_per_s_wall, 2)}/s`),
     gpuNow ? tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%",
@@ -1039,6 +1055,39 @@ function renderKpis() {
     k.append(tile("GPU power", fmtCompact(wattsO, 0), "W",
                   `across ${(d.gpu.gpus || []).length} device${(d.gpu.gpus || []).length === 1 ? "" : "s"}`));
   }
+}
+
+/* Occupancy at or above this evicts, and every eviction is a prefill somebody
+   pays for again later. Matches CACHE_PRESSURE in metrics.py. */
+const CACHE_PRESSURE = 0.9;
+/* A request this close to its slot capacity is one turn from a context shift. */
+const CTX_ALARM = 0.95;
+
+/* Ollama's prompt cache: the pool of saved prompt states, sized in MiB.
+   Zero samples is NOT an empty cache -- ollama logs this only when it runs a
+   cache update, and not at all without OLLAMA_DEBUG -- so that case says so
+   rather than showing a confident 0%. */
+function cacheTile(c) {
+  if (!c || !c.samples) {
+    return tile("Prompt cache size", "\u2014", "", "no cache samples in window");
+  }
+  const sub = [`mean ${fmtPct(c.usage.mean)}`];
+  if (c.limit_mib) sub.push(`of ${fmtCompact(c.limit_mib / 1024, 1)} GiB`);
+  if (c.evictions) sub.push(`${fmtCompact(c.evictions, 0)} evicted`);
+  return tile("Prompt cache size", fmtPct(c.usage.max), "", sub.join(" \u00B7 "),
+              c.under_pressure);
+}
+
+/* A different cache from the one above: how full the slot's own context got,
+   which is the distance to a truncation. Null beyond the raw window, because
+   the rollups do not carry the per-slot capacity. */
+function liveKvTile(ctx) {
+  if (!ctx) {
+    return tile("Live KV peak", "\u2014", "", "needs the raw window");
+  }
+  return tile("Live KV peak", fmtPct(ctx.max), "",
+              `mean ${fmtPct(ctx.mean)} over ${fmtCompact(ctx.n, 0)} requests`,
+              (ctx.max || 0) > CTX_ALARM);
 }
 
 /* Consumer cards throttle in the mid-80s, so this is where a temperature stops
@@ -1194,6 +1243,36 @@ function renderCharts() {
     type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s", fmtTick,
     series: [{ name: "decode tok/s", values: S.decode_tps, color: sc(0) }],
   });
+
+  /* Prompt cache. Its own t array: these samples arrive on ollama's schedule,
+     not on the request timeline, so they are bucketed independently. */
+  const cs = d.cache_series || { t: [], series: {} };
+  const CS = cs.series || {};
+  draw("kv", "p-kv", "l-kv", {
+    type: "line", t: cs.t, yMax: 1, fmt: (v) => fmtPct(v), fmtAxis: (v) => fmtPct(v, 0),
+    fmtTick, series: [{ name: "occupancy", values: CS.usage, color: sc(0) }],
+  });
+  const cache = d.cache || {};
+  /* Say what the gauge is and why it may be absent, rather than letting an
+     empty chart read as a cache that stayed empty. */
+  text($("n-kv"), !cache.samples
+    ? "no samples: the runner logs this only when ollama runs a cache update"
+    : `${fmtCompact(cache.samples, 0)} samples \u00B7 mean per bucket \u00B7 the tile shows the peak`);
+
+  /* Split by reason on purpose: crowded means the pool is too small,
+     invalidated means the cached positions stopped applying. */
+  draw("kvevict", "p-kvevict", "l-kvevict", {
+    type: "bar", stacked: true, t: cs.t, fmt: (v) => fmtCompact(v, 0),
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [
+      { name: "crowded out", values: CS.evict_crowded, color: sc(0) },
+      { name: "invalidated", values: CS.evict_invalidated, color: sc(1) },
+      { name: "restored from checkpoint", values: CS.restores, color: sc(2) },
+    ],
+  });
+  text($("n-kvevict"), cache.samples
+    ? `${fmtCompact(cache.evictions || 0, 0)} evictions \u00B7 peak update cost ${fmtMs(cache.update_ms && cache.update_ms.max)}, paid inside a request`
+    : "no samples in window");
 
   /* Errors: status palette, because these colors mean state, not identity.
      Legend keys carry the label so color never stands alone. */

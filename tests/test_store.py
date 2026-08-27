@@ -192,13 +192,21 @@ class TestPromptCacheMetrics(CacheStoreCase):
         self.assertTrue(s["under_pressure"])
 
     def test_an_empty_window_says_why(self):
-        """No samples is not the same as an empty cache, and the difference is
-        usually OLLAMA_DEBUG being off."""
+        """No samples is not the same as an empty cache: a caller must not read
+        the absence of a gauge as a cache that sat at zero."""
         s = metrics.cache_summary(self.st, 1_700_000_000, 1_700_003_600)
         self.assertEqual(s["samples"], 0)
         self.assertIsNone(s["usage"]["mean"])
+        self.assertIsNone(s["usage"]["max"])
         self.assertFalse(s["under_pressure"])
-        self.assertIn("OLLAMA_DEBUG", s["note"])
+        self.assertIn("cache update", s["note"])
+
+    def test_an_empty_window_reports_no_counter_totals(self):
+        """Counters must read 0 rather than null: nothing was observed, and a
+        sum over nothing is genuinely zero."""
+        s = metrics.cache_summary(self.st, 1_700_000_000, 1_700_003_600)
+        self.assertEqual(s["evictions"], 0)
+        self.assertEqual(s["restores"], 0)
 
     def test_series_averages_gauges_and_sums_counters_per_bucket(self):
         base = 1_700_000_000

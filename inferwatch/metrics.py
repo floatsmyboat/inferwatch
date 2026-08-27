@@ -492,9 +492,10 @@ def cache_summary(store, start: float, end: float) -> dict:
     for key in _CACHE_COUNTERS:
         out[key] = sum(r[key] or 0 for r in rows)
     if not rows:
-        out["note"] = ("no prompt-cache samples in this window. ollama prints "
-                       "them only with OLLAMA_DEBUG=1, and only when it runs a "
-                       "cache update -- an idle instance logs none.")
+        out["note"] = ("no prompt-cache samples in this window. these lines come "
+                       "from the llama-server runner at high log verbosity, and "
+                       "only when ollama runs a cache update -- an instance that "
+                       "served no traffic logs none.")
     return out
 
 

@@ -90,9 +90,9 @@ Environment="OLLAMA_DEBUG=1"
 
 ### Ollama: KV and prompt cache
 
-Ollama publishes no metrics endpoint, so there is nothing to scrape — but with
-`OLLAMA_DEBUG=1` it *logs* its cache state outright, and that line is collected
-into `ollama_cache_samples`:
+Ollama publishes no metrics endpoint, so there is nothing to scrape — but its
+runner *logs* the cache state outright, and that line is collected into
+`ollama_cache_samples`:
 
 ```
 srv  update:  - cache state: 30 prompts, 8010.969 MiB (limits: 8192.000 MiB, 32768 tokens, 68068 est)
@@ -127,9 +127,13 @@ Two caveats that shape every figure:
   not *the cache was empty*. `samples` is always reported alongside, and the
   eviction counters are stored as **deltas** between samples and summed rather
   than turned into rates — a rate over unevenly spaced deltas would be fiction.
-- **No `OLLAMA_DEBUG`, no gauge.** The lines vanish entirely, exactly as the
-  timing lines do. `/api/cache` returns `debug_logging` so a caller seeing zero
-  samples is told why.
+- **The lines need the runner at high log verbosity.** They come from
+  llama-server, not from ollama's Go code. Ollama 0.32.x passes
+  `--log-verbosity 4` on every load, so they are present by default there;
+  `OLLAMA_DEBUG=1` is the documented way to be sure of it. Note that
+  `/api/health`'s `debug_logging` only reports whether `OLLAMA_DEBUG` is set on
+  the unit, so it can read `false` on a host that is logging these lines
+  perfectly well.
 
 Model loads also record how the KV cache was *placed*:
 
@@ -509,8 +513,7 @@ prompt text — which this tool deliberately never stores.
 state` line is logged only when ollama runs a cache update, so the series is
 unevenly spaced and a window with no samples means "no cache updates happened",
 not "the cache was empty". Its counters are therefore stored as deltas and
-reported as totals, never as rates, and `samples` accompanies every figure. The
-gauge also disappears completely without `OLLAMA_DEBUG=1`.
+reported as totals, never as rates, and `samples` accompanies every figure.
 
 **Live KV occupancy exists only inside the raw window.** It is computed from
 `context_tokens / n_ctx_slot` on per-request rows. The rollups aggregate per

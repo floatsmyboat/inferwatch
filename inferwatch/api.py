@@ -381,9 +381,10 @@ def create_app(state: AppState) -> FastAPI:
         start, end = _window(window)
         return {"summary": metrics.cache_summary(state.store, start, end),
                 "series": metrics.cache_series(state.store, start, end, step),
-                # The gauge disappears entirely without OLLAMA_DEBUG, so a
-                # caller seeing zero samples is told why here rather than
-                # having to correlate with /api/health.
+                # Reported for context, not as the explanation: it reflects
+                # whether OLLAMA_DEBUG is set on the unit, and ollama 0.32.x
+                # logs these lines even when it is not.  Zero samples usually
+                # means no cache updates ran, which `summary.note` says.
                 "debug_logging": state.debug_enabled}
 
     @app.get("/api/ps")
