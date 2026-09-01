@@ -286,6 +286,59 @@ def gpu_status(window: str = "1h", step_seconds: int | None = None) -> dict:
 
 
 @srv.tool(
+    title="Get per-client statistics",
+    description="Per-client breakdown of Ollama traffic: which models each "
+                "client address requested, how large its prompts are, how close "
+                "it runs to its context limit, tokens, TTFT and error counts. "
+                "Raw-window only -- the rollups carry no client column -- and "
+                "requests whose model the log never named are counted as "
+                "`unattributed` rather than dropped.",
+)
+def client_stats(window: str = "1h", limit: int = 25) -> dict:
+    """Report who is calling, for which models, at what context size.
+
+    Args:
+        window: Relative duration to search.
+        limit: Maximum clients to return, busiest first.
+    """
+    st = store()
+    start, end = _win(window)
+    rows = metrics.by_client(st, start, end, limit)
+    covers_from = metrics.raw_coverage(st)
+    complete = covers_from is not None and covers_from <= start
+    out: dict[str, Any] = {
+        "window": window,
+        "clients": _humanise([dict(c) for c in rows]),
+        "complete": complete,
+        "covers_from": _when(covers_from),
+        "notes": [
+            "Client identity exists only on raw request rows, so this reaches "
+            "back only as far as raw retention (7 days by default); the rollups "
+            "aggregate by model and class and carry no client address.",
+            "`prompt_tokens_max` is what the client sends; `n_ctx_max` is the "
+            "capacity of the slot it ran in. `ctx_usage_max` is the peak ratio "
+            "of the two computed per request, which is the client's closest "
+            "approach to a context shift.",
+        ],
+    }
+    if not complete:
+        out["warning"] = (
+            f"this window starts before the oldest surviving raw request row "
+            f"({out['covers_from']}), so the earlier part of it has no "
+            f"per-client detail at all -- raise retention.raw_days or ask for a "
+            f"shorter window rather than reading this as the full picture.")
+    stale = sum(c["unattributed"] for c in rows)
+    total = sum(c["requests"] for c in rows)
+    if stale:
+        out["attribution_note"] = (
+            f"{stale} of {total} requests have no model attributed. Ollama names "
+            f"the model on a per-request scheduler line; when that line is "
+            f"absent from the log the request is still counted, with its model "
+            f"left null rather than guessed.")
+    return out
+
+
+@srv.tool(
     title="Get KV / prompt cache status",
     description="Ollama's prompt-cache occupancy over a window -- how full the "
                 "saved-prompt pool is, how often it evicted, and what its "

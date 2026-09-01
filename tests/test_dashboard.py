@@ -44,6 +44,56 @@ def extract_function(js, name):
     raise AssertionError(f"unbalanced braces in {name}")
 
 
+def spark_specs(js):
+    """Every object literal containing `spark: true`, brace-matched.
+
+    A regex cannot do this: the spec nests `series: [{...}]`.
+    """
+    out = []
+    for m in re.finditer(r"spark:\s*true", js):
+        depth, start = 0, None
+        for i in range(m.start(), -1, -1):      # nearest unclosed '{' to the left
+            if js[i] == "}":
+                depth += 1
+            elif js[i] == "{":
+                if depth == 0:
+                    start = i
+                    break
+                depth -= 1
+        assert start is not None, "no enclosing brace for a spark spec"
+        depth = 0
+        for j in range(start, len(js)):
+            if js[j] == "{":
+                depth += 1
+            elif js[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(js[start:j + 1])
+                    break
+    return out
+
+
+def extract_function_body(js, name):
+    """Return the source of a CLASS METHOD `name(...) {...}`.
+
+    extract_function() only matches top-level `function name(`, which the Chart
+    class's methods are not.
+    """
+    m = re.search(r"^\s{2,}" + name + r"\s*\(", js, re.M)
+    if not m:
+        raise AssertionError(f"method {name} not found")
+    start = js.index("{", m.end() - 1)
+    depth = 0
+    for i in range(start, len(js)):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[m.start():i + 1]
+    raise AssertionError(f"unbalanced braces in {name}")
+
+
 class TestMarkup(unittest.TestCase):
     def setUp(self):
         self.html = read()
@@ -218,10 +268,6 @@ class TestFormatters(unittest.TestCase):
             self.assertEqual(got[0], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestTemperature(unittest.TestCase):
     """Temperature is the one series that should not be plotted from zero."""
 
@@ -282,3 +328,142 @@ class TestTemperature(unittest.TestCase):
     def test_power_of_nothing_is_null_not_zero(self):
         self.assertIsNone(self.js("totalPower([])"))
         self.assertIsNone(self.js('totalPower([{"power_w":[null]}])'))
+
+
+class TestSparkHover(unittest.TestCase):
+    """The hero sparkline is a chart like any other; it must answer the mouse."""
+
+    def setUp(self):
+        self.html = read()
+        self.js = script(self.html)
+
+    def test_bind_does_not_opt_sparks_out(self):
+        """A `return` for sparks at the top of _bind() silently removes the
+        pointer listener, which is what made the hero chart inert."""
+        bind = extract_function_body(self.js, "_bind")
+        self.assertNotIn("spec.spark) return", bind.replace(" ", ""))
+
+    def test_pointer_and_keyboard_handlers_are_bound(self):
+        bind = extract_function_body(self.js, "_bind")
+        for ev in ("pointermove", "pointerleave", "keydown"):
+            self.assertIn(ev, bind)
+
+    def test_spark_tooltip_opens_downward(self):
+        """A spark sits at the top of the page with ~46px of height, so an
+        upward tooltip would be clipped by the viewport."""
+        self.assertIn(".tip.below", self.html)
+        self.assertIn('classList.toggle("below"', self.js)
+
+    def test_every_spark_spec_carries_a_unit_formatter(self):
+        """Without fmt the tooltip shows a bare number, and 'output 12.3' does
+        not say tokens per second."""
+        specs = spark_specs(self.js)
+        self.assertTrue(specs, "no spark specs found -- did the hero change?")
+        for spec in specs:
+            self.assertIn("fmt:", spec, f"spark spec without fmt: {spec[:90]}")
+
+
+class TestHoverIndexMath(unittest.TestCase):
+    """_indexAt maps a pointer x to a bucket. Exercised directly because there
+    is no DOM here, and this is the part of hover that can be silently wrong."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import quickjs
+        except ImportError:
+            raise unittest.SkipTest("quickjs not installed")
+        body = extract_function_body(script(read()), "_indexAt")
+        # Rebind the method as a plain function over an injected `self`.
+        src = "function indexAt(self, px) { const fn = function " + body.strip() + \
+              "; return fn.call(self, px); }"
+        cls.ctx = quickjs.Context()
+        cls.ctx.eval(src)
+
+    def at(self, px, n=10, x0=3, x1=403):
+        t = ",".join(str(i) for i in range(n))
+        self_js = f'{{spec:{{t:[{t}]}}, geom:{{x0:{x0},x1:{x1}}}}}'
+        return self.ctx.eval(f"indexAt({self_js}, {px})")
+
+    def test_left_edge_is_the_first_bucket(self):
+        self.assertEqual(self.at(3), 0)
+
+    def test_right_edge_is_the_last_bucket(self):
+        self.assertEqual(self.at(403, n=10), 9)
+
+    def test_midpoint_lands_mid_series(self):
+        # 10 buckets across 400px: the centre is bucket 4 or 5, not off the end.
+        self.assertIn(self.at(203, n=10), (4, 5))
+
+    def test_just_outside_the_plot_still_snaps(self):
+        """A small overshoot is slack for the pointer, not a miss -- otherwise
+        the tooltip flickers off at the very edge of the trace."""
+        self.assertEqual(self.at(-5), 0)
+        self.assertEqual(self.at(410, n=10), 9)
+
+    def test_far_outside_clears_the_hover(self):
+        self.assertIsNone(self.at(-40))
+        self.assertIsNone(self.at(500))
+
+    def test_an_empty_series_never_returns_an_index(self):
+        self.assertIsNone(self.ctx.eval(
+            "indexAt({spec:{t:[]}, geom:{x0:3,x1:403}}, 200)"))
+
+
+class TestClientTable(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import quickjs
+        except ImportError:
+            raise unittest.SkipTest("quickjs not installed")
+        js = script(read())
+        src = "\n".join(extract_function(js, n) for n in ("fmtCompact", "modelMix"))
+        cls.ctx = quickjs.Context()
+        cls.ctx.eval(src)
+
+    def js(self, expr):
+        return self.ctx.eval(expr)
+
+    def test_lists_models_busiest_first(self):
+        c = '{"models":[{"model":"llama3.2:3b","requests":42},' \
+            '{"model":"qwen3:8b","requests":3}],"unattributed":0}'
+        self.assertEqual(self.js(f"modelMix({c})"), "llama3.2:3b \u00d742, qwen3:8b \u00d73")
+
+    def test_long_lists_are_summarised_not_truncated_silently(self):
+        c = ('{"models":[{"model":"a","requests":9},{"model":"b","requests":8},'
+             '{"model":"c","requests":7},{"model":"d","requests":6}],"unattributed":0}')
+        self.assertEqual(self.js(f"modelMix({c})"), "a \u00d79, b \u00d78, +2 more")
+
+    def test_unattributed_requests_are_stated(self):
+        """Omitting them would make a client look like it used only the models
+        that happened to be logged."""
+        c = '{"models":[{"model":"a","requests":2}],"unattributed":121}'
+        self.assertEqual(self.js(f"modelMix({c})"), "a \u00d72, 121 unattributed")
+
+    def test_a_client_with_nothing_named_reads_as_a_dash(self):
+        self.assertEqual(self.js('modelMix({"models":[],"unattributed":0})'), "\u2014")
+
+    def test_only_unattributed_still_says_so(self):
+        self.assertEqual(self.js('modelMix({"models":[],"unattributed":5})'),
+                         "5 unattributed")
+
+
+class TestClientMarkup(unittest.TestCase):
+    def test_the_client_table_exists_and_is_rendered(self):
+        """by_client() was in the API payload but rendered nowhere, so the data
+        was computed and thrown away."""
+        html = read()
+        self.assertIn('id="t-clients"', html)
+        self.assertIn('table("t-clients"', script(html))
+
+    def test_the_vllm_tab_grows_no_client_table(self):
+        """vLLM publishes no client addresses; offering the panel would imply
+        data that does not exist."""
+        html = read()
+        vllm = html[html.index('id="tab-vllm"'):]
+        self.assertNotIn('id="t-vclients"', vllm)
+
+
+if __name__ == "__main__":
+    unittest.main()

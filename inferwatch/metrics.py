@@ -335,14 +335,94 @@ def by_endpoint(store, start: float, end: float) -> list[dict]:
              "errors": r["err"] or 0, "latency_ms_mean": r["lat_mean"]} for r in rows]
 
 
-def by_client(store, start: float, end: float) -> list[dict]:
+def raw_coverage(store) -> float | None:
+    """Timestamp of the oldest surviving raw request row, or None if there are none.
+
+    The honest bound for anything that can only be answered from raw rows.  It
+    is NOT the same as RAW_WINDOW_S: that constant only decides when a query
+    switches to the rollups for speed, while raw rows survive for
+    `retention.raw_days` (7 by default).  A 7-day client breakdown is therefore
+    complete even though `summary()['exact']` is False for that span, and
+    conflating the two reports a full answer as a partial one.
+    """
+    row = store.query("SELECT MIN(ts) t FROM requests")
+    return row[0]["t"] if row and row[0]["t"] is not None else None
+
+
+def by_client(store, start: float, end: float, limit: int = 25) -> list[dict]:
+    """Per-client detail: who is calling, for which models, at what context size.
+
+    Client identity exists ONLY on raw request rows -- the rollups aggregate by
+    model and class and carry no client column at all -- so this can only see as
+    far back as raw retention.  Callers should pair it with `raw_coverage()` to
+    tell a complete answer from one whose window starts before the oldest
+    surviving row.
+
+    Two notions of "context size" are reported because they answer different
+    questions.  `prompt_tokens` is what the client actually sends (the full
+    prompt, cache hits included); `n_ctx_max` is the capacity of the slot it
+    landed in.  The ratio of the two is how close that client runs to a context
+    shift, and it is computed per row before aggregating -- taking the maximum
+    of each separately would pair a peak prompt with an unrelated capacity.
+    """
+    params = (start, end, limit)
     rows = store.query(
-        "SELECT client_ip, COUNT(*) n, SUM(output_tokens) out_tok,"
-        " SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) err"
+        "SELECT client_ip, COUNT(*) n,"
+        " SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) err,"
+        " SUM(CASE WHEN model IS NULL THEN 1 ELSE 0 END) unattributed,"
+        " COUNT(DISTINCT model) n_models,"
+        " SUM(prompt_tokens) in_tok, SUM(cached_tokens) cached,"
+        " SUM(output_tokens) out_tok, SUM(decode_ms) dec_ms,"
+        " AVG(prompt_tokens_total) prompt_mean, MAX(prompt_tokens_total) prompt_max,"
+        " MAX(context_tokens) ctx_max, MAX(n_ctx_slot) n_ctx_max,"
+        " MAX(CASE WHEN n_ctx_slot > 0 THEN CAST(context_tokens AS REAL) / n_ctx_slot END)"
+        "   ctx_usage_max,"
+        " AVG(ttft_ms) ttft_mean, MAX(ttft_ms) ttft_max, AVG(latency_ms) lat_mean,"
+        " MIN(ts) first_seen, MAX(ts) last_seen"
         " FROM requests WHERE ts >= ? AND ts < ? AND class IN ('inference','embed')"
-        " GROUP BY client_ip ORDER BY n DESC LIMIT 25", (start, end))
-    return [{"client_ip": r["client_ip"], "requests": r["n"],
-             "output_tokens": r["out_tok"] or 0, "errors": r["err"] or 0} for r in rows]
+        " GROUP BY client_ip ORDER BY n DESC LIMIT ?", params)
+    out = []
+    for r in rows:
+        dec_s = (r["dec_ms"] or 0) / 1000.0
+        out.append({
+            "client_ip": r["client_ip"],
+            "requests": r["n"], "errors": r["err"] or 0,
+            # Requests whose model the log never named.  Surfaced rather than
+            # hidden: on a stretch where ollama did not log its per-request
+            # scheduler line, this is most of the traffic, and a models list
+            # that quietly omitted them would misrepresent the client.
+            "unattributed": r["unattributed"] or 0,
+            "models": [],          # filled in below
+            "input_tokens": r["in_tok"] or 0,
+            "cached_tokens": r["cached"] or 0,
+            "output_tokens": r["out_tok"] or 0,
+            "decode_tps": (r["out_tok"] / dec_s) if dec_s > 0 and r["out_tok"] else None,
+            "prompt_tokens_mean": r["prompt_mean"],
+            "prompt_tokens_max": r["prompt_max"],
+            "context_tokens_max": r["ctx_max"],
+            "n_ctx_max": r["n_ctx_max"],
+            "ctx_usage_max": r["ctx_usage_max"],
+            "ttft_ms_mean": r["ttft_mean"], "ttft_ms_max": r["ttft_max"],
+            "latency_ms_mean": r["lat_mean"],
+            "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+        })
+    if not out:
+        return out
+
+    # Model mix, in one pass rather than a query per client.
+    by_ip = {c["client_ip"]: c for c in out}
+    mix = store.query(
+        "SELECT client_ip, model, COUNT(*) n, MAX(prompt_tokens_total) prompt_max,"
+        " MAX(n_ctx_slot) n_ctx"
+        " FROM requests WHERE ts >= ? AND ts < ? AND class IN ('inference','embed')"
+        " AND model IS NOT NULL GROUP BY client_ip, model ORDER BY n DESC", (start, end))
+    for r in mix:
+        c = by_ip.get(r["client_ip"])
+        if c is not None:
+            c["models"].append({"model": r["model"], "requests": r["n"],
+                                "prompt_tokens_max": r["prompt_max"],
+                                "n_ctx": r["n_ctx"]})
+    return out
 
 
 def status_breakdown(store, start: float, end: float) -> list[dict]:

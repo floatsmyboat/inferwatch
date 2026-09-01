@@ -260,6 +260,96 @@ class TestLiveKvOccupancy(StoreCase):
         self.assertIsNone(s["ctx_usage"])
 
 
+class TestPerClient(StoreCase):
+    """by_client: who is calling, for which models, at what context size."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = time.time() - 300
+
+    def test_aggregates_per_client(self):
+        self.add(self.base, client_ip="10.0.0.1", latency_ms=100.0, output_tokens=10)
+        self.add(self.base + 1, client_ip="10.0.0.1", latency_ms=100.0, output_tokens=5,
+                 status=500)
+        self.add(self.base + 2, client_ip="10.0.0.2", latency_ms=100.0, output_tokens=7)
+        self.st.commit()
+        rows = metrics.by_client(self.st, self.base - 1, self.base + 60)
+        by_ip = {r["client_ip"]: r for r in rows}
+        self.assertEqual(by_ip["10.0.0.1"]["requests"], 2)
+        self.assertEqual(by_ip["10.0.0.1"]["errors"], 1)
+        self.assertEqual(by_ip["10.0.0.1"]["output_tokens"], 15)
+        self.assertEqual(by_ip["10.0.0.2"]["requests"], 1)
+        # Busiest first, so the noisiest caller is the first thing read.
+        self.assertEqual(rows[0]["client_ip"], "10.0.0.1")
+
+    def test_lists_which_models_a_client_requested(self):
+        for i in range(3):
+            self.add(self.base + i, client_ip="10.0.0.1", model="llama3.2:3b",
+                     latency_ms=10.0)
+        self.add(self.base + 9, client_ip="10.0.0.1", model="qwen3:8b", latency_ms=10.0)
+        self.st.commit()
+        c = metrics.by_client(self.st, self.base - 1, self.base + 60)[0]
+        self.assertEqual([(m["model"], m["requests"]) for m in c["models"]],
+                         [("llama3.2:3b", 3), ("qwen3:8b", 1)])
+
+    def test_requests_with_no_model_are_counted_not_dropped(self):
+        """Ollama names the model on a per-request scheduler line; when that
+        line is missing the request still happened, so it must not vanish from
+        the client's totals or make its model list look complete."""
+        self.add(self.base, client_ip="10.0.0.1", model="llama3.2:3b", latency_ms=10.0)
+        self.add(self.base + 1, client_ip="10.0.0.1", model=None, latency_ms=10.0)
+        self.add(self.base + 2, client_ip="10.0.0.1", model=None, latency_ms=10.0)
+        self.st.commit()
+        c = metrics.by_client(self.st, self.base - 1, self.base + 60)[0]
+        self.assertEqual(c["requests"], 3)
+        self.assertEqual(c["unattributed"], 2)
+        self.assertEqual([m["model"] for m in c["models"]], ["llama3.2:3b"])
+
+    def test_context_usage_is_computed_per_request_before_aggregating(self):
+        """The whole point of the column. Pairing the peak prompt with the peak
+        capacity would report 20000/262144 = 7.6%; the real worst case is the
+        small-capacity request at 12000/32768 = 36.6%."""
+        self.add(self.base, client_ip="10.0.0.1", latency_ms=10.0,
+                 context_tokens=12000, n_ctx_slot=32768)
+        self.add(self.base + 1, client_ip="10.0.0.1", latency_ms=10.0,
+                 context_tokens=20000, n_ctx_slot=262144)
+        self.st.commit()
+        c = metrics.by_client(self.st, self.base - 1, self.base + 60)[0]
+        self.assertAlmostEqual(c["ctx_usage_max"], 12000 / 32768, places=6)
+        self.assertEqual(c["context_tokens_max"], 20000)
+        self.assertEqual(c["n_ctx_max"], 262144)
+
+    def test_prompt_size_reports_mean_and_peak(self):
+        self.add(self.base, client_ip="10.0.0.1", latency_ms=10.0,
+                 prompt_tokens_total=1000)
+        self.add(self.base + 1, client_ip="10.0.0.1", latency_ms=10.0,
+                 prompt_tokens_total=3000)
+        self.st.commit()
+        c = metrics.by_client(self.st, self.base - 1, self.base + 60)[0]
+        self.assertAlmostEqual(c["prompt_tokens_mean"], 2000.0)
+        self.assertEqual(c["prompt_tokens_max"], 3000)
+
+    def test_rows_without_a_capacity_leave_usage_null(self):
+        self.add(self.base, client_ip="10.0.0.1", latency_ms=10.0, context_tokens=500)
+        self.st.commit()
+        c = metrics.by_client(self.st, self.base - 1, self.base + 60)[0]
+        self.assertIsNone(c["ctx_usage_max"])
+
+    def test_health_traffic_is_excluded(self):
+        """A client that only polls /api/ps is not an inference client."""
+        self.add(self.base, client_ip="10.0.0.9", **{"class": "health"},
+                 endpoint="/api/ps", latency_ms=1.0)
+        self.st.commit()
+        self.assertEqual(metrics.by_client(self.st, self.base - 1, self.base + 60), [])
+
+    def test_limit_is_respected(self):
+        for i in range(5):
+            self.add(self.base + i, client_ip=f"10.0.0.{i}", latency_ms=10.0)
+        self.st.commit()
+        self.assertEqual(len(metrics.by_client(self.st, self.base - 1, self.base + 60,
+                                              limit=3)), 3)
+
+
 class TestMetricsSources(StoreCase):
     def test_short_window_is_exact_long_window_is_not(self):
         now = time.time()

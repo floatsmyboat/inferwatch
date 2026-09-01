@@ -408,6 +408,7 @@ tools, which otherwise wait forever on an open stream).
 | `/api/vllm/summary`, `/api/vllm/timeseries`, `/api/vllm/instances` | vLLM breakdowns |
 | `/api/requests`, `/api/errors`, `/api/events`, `/api/gpu`, `/api/ps` | raw rows and timelines |
 | `/api/cache?window=1h` | Ollama prompt-cache occupancy, evictions, update cost |
+| `/api/clients?window=1h&limit=25` | per-client detail: models requested, context sizes, tokens, TTFT |
 | `/api/config` (GET/PUT), `/api/config/reset` | settings |
 | `/api/sources` (GET/POST/PUT/DELETE), `/api/sources/probe` | monitored engines |
 | `/api/prefs`, `/api/status`, `/api/health` | dashboard defaults, collector state |
@@ -439,6 +440,7 @@ always matches the number on screen.
 | `vllm_summary`, `vllm_timeseries`, `vllm_instances` | vLLM metrics, reachability, GPU attribution |
 | `gpu_status` | per-device util/VRAM/temp/power |
 | `cache_status` | Ollama prompt-cache occupancy and eviction pressure, plus live KV usage |
+| `client_stats` | who is calling, for which models, at what context size |
 | `list_sources`, `get_settings` | what is monitored, and how it is configured |
 | `health` | is collection working, is debug logging on |
 | `run_sql`, `describe_schema` | read-only SELECT escape hatch, with units |
@@ -508,6 +510,23 @@ other does *not* give tokens per request. The API marks this with
 **No per-request anything for vLLM.** Covered above. If you need per-request
 detail from vLLM, its request-level logging is the only source, and it logs
 prompt text — which this tool deliberately never stores.
+
+**Per-client detail reaches back only as far as raw retention.** Client
+addresses exist only on raw request rows; the rollups aggregate by model and
+class and carry no client column, so there is nothing to fall back to. Every
+per-client response therefore carries `covers_from` (the oldest surviving raw
+row) and `complete`, and the dashboard names the cutoff rather than implying a
+full history. Note that this bound is `retention.raw_days` (7 by default), not
+the 6-hour `RAW_WINDOW_S` that decides when *other* queries switch to rollups —
+a 7-day client breakdown is complete even though `summary()['exact']` is false
+for that span.
+
+**A client's model mix is only as good as ollama's logging.** Ollama names the
+model on a per-request scheduler line, and when that line is absent the request
+is counted with its model left null — reported as `unattributed` per client
+rather than dropped or guessed. On this host the rate has ranged from 100% named
+to 0% named on different days, so a client showing mostly `unattributed` is a
+statement about the log, not about the client.
 
 **The Ollama prompt-cache gauge is sampled on ollama's schedule.** A `cache
 state` line is logged only when ollama runs a cache update, so the series is

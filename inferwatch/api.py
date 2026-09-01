@@ -300,6 +300,8 @@ def create_app(state: AppState) -> FastAPI:
             include_health = bool(state.config.get("dashboard.include_health")) \
                 if state.config else False
 
+        raw_from = metrics.raw_coverage(st)
+
         def build():
             return {
                 "window": window,
@@ -311,6 +313,10 @@ def create_app(state: AppState) -> FastAPI:
                 "models": metrics.by_model(st, start, end),
                 "endpoints": metrics.by_endpoint(st, start, end),
                 "clients": metrics.by_client(st, start, end),
+                # by_client can only answer back to the oldest raw row; the
+                # dashboard says so rather than implying a full history.
+                "clients_complete": raw_from is not None and raw_from <= start,
+                "clients_from": raw_from,
                 "statuses": metrics.status_breakdown(st, start, end),
                 "errors": metrics.recent_errors(st, start, end, 25),
                 "slowest": metrics.slowest(st, start, end, "ttft_ms", 10),
@@ -374,6 +380,19 @@ def create_app(state: AppState) -> FastAPI:
     async def gpu(window: str = "1h", step: int | None = None):
         start, end = _window(window)
         return metrics.gpu_series(state.store, start, end, step)
+
+    @app.get("/api/clients")
+    async def clients(window: str = "1h", limit: int = 25):
+        """Per-client detail: models requested, context sizes, tokens, TTFT."""
+        start, end = _window(window)
+        rows = metrics.by_client(state.store, start, end, limit)
+        covers_from = metrics.raw_coverage(state.store)
+        return {"window": window, "start": start, "end": end, "clients": rows,
+                # Client identity lives only on raw rows, so the answer is
+                # complete only back to the oldest surviving one.  Stated
+                # outright so a short list is not read as "few clients called".
+                "covers_from": covers_from,
+                "complete": covers_from is not None and covers_from <= start}
 
     @app.get("/api/cache")
     async def cache(window: str = "1h", step: int | None = None):

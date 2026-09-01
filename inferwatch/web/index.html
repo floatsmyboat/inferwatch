@@ -232,6 +232,9 @@ label.inline { color: var(--ink-2); font-size: 13px; display: inline-flex; align
   padding: 8px 10px; font-size: 12px; min-width: 132px;
   box-shadow: 0 4px 14px rgba(0,0,0,.16);
 }
+/* A spark is 46px tall and sits at the top of the view, so a tooltip anchored
+   upward would be clipped by the viewport. Sparks open theirs downward. */
+.tip.below { transform: translate(-50%, 0); }
 .tip .when { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
 .tip .row { display: flex; align-items: center; gap: 7px; white-space: nowrap; line-height: 1.6; }
 .tip .row .key { width: 12px; height: 2px; border-radius: 1px; flex: none; }
@@ -422,6 +425,11 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
   <div class="grid one" style="margin-top:14px">
     <div class="card"><header><h2>Per-model summary</h2><span class="note" id="n-models"></span></header>
       <div class="tbl-wrap" id="t-models"></div></div>
+  </div>
+
+  <div class="grid one" style="margin-top:14px">
+    <div class="card"><header><h2>Per-client summary</h2><span class="note" id="n-clients"></span></header>
+      <div class="tbl-wrap" id="t-clients"></div></div>
   </div>
 
   <div class="grid" style="margin-top:14px">
@@ -675,7 +683,6 @@ class Chart {
   update(spec) { this.spec = spec; this.render(); }
 
   _bind() {
-    if (this.spec.spark) return;
     const move = (ev) => {
       const r = this.svg.getBoundingClientRect();
       const x = ev.clientX - r.left;
@@ -927,7 +934,13 @@ class Chart {
     const cw = this.c.clientWidth;
     const left = Math.max(72, Math.min(cw - 72, x));
     this.tip.style.left = left + "px";
-    this.tip.style.top = Math.max(26, this.geom.y0 + 8) + "px";
+    /* A spark has no axis band and only ~46px of height, so its tooltip hangs
+       below the trace; a full chart keeps the established above-the-point
+       placement so it never covers the x-axis labels. */
+    const below = !!spec.spark;
+    this.tip.classList.toggle("below", below);
+    this.tip.style.top = below ? (this.geom.y1 + 6) + "px"
+                               : Math.max(26, this.geom.y0 + 8) + "px";
     this.tip.style.opacity = 1;
   }
 }
@@ -1328,7 +1341,9 @@ function renderCharts() {
 
   /* hero sparkline: the same output-tok/s series, de-emphasised */
   const hs = state.charts.herospark;
-  const hspec = { type: "line", spark: true, t: ts.t, series: [{ name: "out tok/s", values: S.out_tps, color: sc(0) }] };
+  const hspec = { type: "line", spark: true, t: ts.t,
+                  fmt: (v) => fmtCompact(v, 2) + " tok/s",
+                  series: [{ name: "output", values: S.out_tps, color: sc(0) }] };
   if (hs) hs.update(hspec); else state.charts.herospark = new Chart($("hero-spark"), hspec);
 }
 
@@ -1432,6 +1447,46 @@ function renderTables() {
     }, "No inference requests in this window.");
   text($("n-models"), `${d.models.length} model${d.models.length === 1 ? "" : "s"}`);
 
+  /* Per-client. "Context" pairs the largest prompt a client sent with the
+     capacity of the slot it ran in, and bars the peak ratio -- that ratio is
+     computed server-side per request, so it is never a peak prompt paired with
+     an unrelated capacity. */
+  table("t-clients",
+    [{ label: "Client" }, { label: "Requests", num: true }, { label: "Errors", num: true },
+     { label: "Models requested" }, { label: "Prompt max", num: true },
+     { label: "Context limit", num: true }, { label: "Peak ctx", num: true }, { label: "" },
+     { label: "TTFT mean", num: true }, { label: "Tokens in", num: true },
+     { label: "Cached", num: true }, { label: "Tokens out", num: true },
+     { label: "tok/s", num: true }, { label: "Last seen" }],
+    d.clients, (tr, c) => {
+      tr.appendChild(td(c.client_ip || "unknown", false, true));
+      tr.appendChild(td(fmtCompact(c.requests, 0), true));
+      tr.appendChild(td(c.errors ? String(c.errors) : "0", true));
+      tr.appendChild(td(modelMix(c)));
+      tr.appendChild(td(fmtCompact(c.prompt_tokens_max, 0), true));
+      tr.appendChild(td(fmtCompact(c.n_ctx_max, 0), true));
+      tr.appendChild(td(fmtPct(c.ctx_usage_max), true));
+      tr.appendChild(tdNode(barCell(c.ctx_usage_max,
+        (c.ctx_usage_max || 0) > CTX_ALARM ? css("--critical") : css("--series-3"))));
+      tr.appendChild(td(fmtMs(c.ttft_ms_mean), true));
+      tr.appendChild(td(fmtCompact(c.input_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.cached_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.output_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.decode_tps, 1), true));
+      tr.appendChild(td(fmtClock(c.last_seen)));
+    }, d.clients_complete === false
+         ? "Per-client detail comes from raw request rows, which are kept for "
+           + "retention.raw_days; this range starts before the oldest one."
+         : "No inference requests in this window.");
+  const nc = (d.clients || []).length;
+  const unatt = (d.clients || []).reduce((a, c) => a + (c.unattributed || 0), 0);
+  text($("n-clients"), nc
+    ? `${nc} client${nc === 1 ? "" : "s"}`
+      + (unatt ? ` \u00B7 ${fmtCompact(unatt, 0)} request${unatt === 1 ? "" : "s"} with no model named in the log` : "")
+      + (d.clients_complete === false
+           ? ` \u00B7 only covers requests since ${fmtClock(d.clients_from)}` : "")
+    : "");
+
   const maxTtft = Math.max(1, ...(d.slowest || []).map((r) => r.ttft_ms || 0));
   table("t-slowest",
     [{ label: "Time" }, { label: "Model" }, { label: "TTFT", num: true }, { label: "" },
@@ -1523,6 +1578,18 @@ function eventPill(e) {
   if (k === "truncation") return pill("truncated", "warn");
   if (k === "problem") return pill(e.level === "ERROR" ? "error" : "warning", e.level === "ERROR" ? "err" : "warn");
   return pill(k, "info");
+}
+
+/* Which models a client asked for, busiest first. Kept to two names so the
+   cell stays scannable, with the rest counted. Requests whose model the log
+   never named are stated rather than omitted -- silently dropping them would
+   make a client look like it used only the models that happened to be logged. */
+function modelMix(c) {
+  const ms = c.models || [];
+  const parts = ms.slice(0, 2).map((m) => `${m.model} \u00D7${fmtCompact(m.requests, 0)}`);
+  if (ms.length > 2) parts.push(`+${ms.length - 2} more`);
+  if (c.unattributed) parts.push(`${fmtCompact(c.unattributed, 0)} unattributed`);
+  return parts.join(", ") || "\u2014";
 }
 
 function barCell(frac, color) {
@@ -1845,7 +1912,8 @@ function renderVllm() {
   text($("v-hero"), fmtCompact(s.out_tok_per_s, 2));
   const hs = state.charts.vhero;
   const hspec = { type: "line", spark: true, t: ts.t,
-                  series: [{ name: "out tok/s", values: S.out_tok_per_s, color: sc(0) }] };
+                  fmt: (v) => fmtCompact(v, 2) + " tok/s",
+                  series: [{ name: "output", values: S.out_tok_per_s, color: sc(0) }] };
   if (hs) hs.update(hspec); else state.charts.vhero = new Chart($("v-hero-spark"), hspec);
 
   draw("vttft", "p-vttft", "l-vttft", {
