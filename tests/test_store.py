@@ -8,7 +8,7 @@ import unittest
 
 from inferwatch import metrics
 from inferwatch.store import (HIST_BOUNDS_MS, NBUCKETS, Store, hist_add,
-                           p_from_hist, sum_hists)
+                           p_from_hist, request_key, sum_hists)
 
 
 class TestHistogram(unittest.TestCase):
@@ -348,6 +348,156 @@ class TestPerClient(StoreCase):
         self.st.commit()
         self.assertEqual(len(metrics.by_client(self.st, self.base - 1, self.base + 60,
                                               limit=3)), 3)
+
+
+class TestRawCoverage(StoreCase):
+    """Raw-only breakdowns must distinguish "not stored" from "nothing happened"."""
+
+    def test_coverage_is_complete_when_rows_reach_back_far_enough(self):
+        now = time.time()
+        self.add(now - 3600, latency_ms=10.0)
+        self.st.commit()
+        cov = metrics.coverage(self.st, now - 1800)
+        self.assertTrue(cov["complete"])
+        self.assertAlmostEqual(cov["covers_from"], now - 3600)
+
+    def test_coverage_is_incomplete_when_the_window_predates_the_oldest_row(self):
+        now = time.time()
+        self.add(now - 3600, latency_ms=10.0)
+        self.st.commit()
+        self.assertFalse(metrics.coverage(self.st, now - 30 * 86400)["complete"])
+
+    def test_an_empty_table_is_never_reported_as_complete(self):
+        """With nothing stored, no window is covered -- returning True here
+        would let an empty result read as a genuinely idle window."""
+        cov = metrics.coverage(self.st, time.time() - 60)
+        self.assertIsNone(cov["covers_from"])
+        self.assertFalse(cov["complete"])
+
+    def test_coverage_tracks_retention_not_the_rollup_threshold(self):
+        """The bound is how long raw rows are KEPT, not the 6h point where other
+        queries switch to rollups. A 24h window over 7 days of rows is complete
+        even though summary() reports exact=False for it."""
+        now = time.time()
+        self.add(now - 7 * 86400, latency_ms=10.0)
+        self.add(now - 60, latency_ms=10.0)
+        self.st.commit()
+        self.assertTrue(metrics.coverage(self.st, now - 86400)["complete"])
+        self.assertFalse(metrics.summary(self.st, now - 86400, now)["exact"])
+
+    def test_the_raw_only_breakdowns_still_answer_a_long_window(self):
+        """They read raw rows directly, so a 24h range works as long as the rows
+        are there -- the finding was silent emptiness, not a hard limit."""
+        now = time.time()
+        self.add(now - 20 * 3600, endpoint="/api/chat", status=500,
+                 client_ip="10.0.0.1", latency_ms=10.0, ttft_ms=5.0)
+        self.st.commit()
+        start = now - 86400
+        self.assertEqual(len(metrics.by_endpoint(self.st, start, now)), 1)
+        self.assertEqual(len(metrics.status_breakdown(self.st, start, now)), 1)
+        self.assertEqual(len(metrics.recent_errors(self.st, start, now)), 1)
+        self.assertEqual(len(metrics.slowest(self.st, start, now, "ttft_ms")), 1)
+        self.assertEqual(len(metrics.recent_requests(self.st, start, now)), 1)
+        self.assertEqual(len(metrics.by_client(self.st, start, now)), 1)
+
+
+class TestDedupeMigration(unittest.TestCase):
+    """The one-time dedupe backfill must be one-time, and bounded."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "t.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _legacy_db(self, rows=12, dup_ts=None):
+        """Rewind a real database to the pre-schema-2 state.
+
+        Built from the live DDL rather than a hand-written subset, so the
+        migration under test meets the same columns and indexes it would on a
+        real upgrade -- a trimmed fixture silently diverges from it.
+        """
+        import sqlite3
+        st = Store(self.path)
+        st.db.close()
+        db = sqlite3.connect(self.path)
+        db.execute("DROP INDEX IF EXISTS idx_req_dedupe")
+        db.execute("DROP INDEX IF EXISTS idx_ev_dedupe")
+        for i in range(rows):
+            db.execute("INSERT INTO requests (ts,endpoint,class,method,client_ip,"
+                       "status,latency_ms,task_id) VALUES (?,?,?,?,?,?,?,?)",
+                       (1_700_000_000 + i, "/api/chat", "inference", "POST",
+                        "10.0.0.1", 200, 10.0, i))
+        for _ in range(dup_ts or 0):
+            db.execute("INSERT INTO requests (ts,endpoint,class,method,client_ip,"
+                       "status,latency_ms,task_id) VALUES (?,?,?,?,?,?,?,?)",
+                       (1_700_000_000.5, "/api/chat", "inference", "POST",
+                        "10.0.0.1", 200, 10.0, 7))
+        db.execute("UPDATE requests SET dedupe_key = NULL")
+        db.execute("UPDATE events SET dedupe_key = NULL")
+        db.commit(); db.close()
+
+    def test_backfill_fills_every_row_across_batch_boundaries(self):
+        self._legacy_db(rows=12)
+        st = Store(self.path)
+        try:
+            n = st.query("SELECT COUNT(*) n FROM requests WHERE dedupe_key IS NULL")[0]["n"]
+            self.assertEqual(n, 0)
+            self.assertEqual(st.query("SELECT COUNT(*) n FROM requests")[0]["n"], 12)
+        finally:
+            st.db.close()
+
+    def test_batching_walks_a_set_larger_than_one_batch(self):
+        """Each pass must shrink the candidate set, or the loop never ends."""
+        self._legacy_db(rows=12)
+        import sqlite3
+        db = sqlite3.connect(self.path)
+        db.execute("UPDATE requests SET dedupe_key = NULL")
+        db.commit(); db.close()
+        st = Store(self.path, read_only=False)
+        try:
+            # __init__ already keyed them; blank them again to drive the loop
+            # directly with a batch smaller than the row count.
+            st.db.execute("UPDATE requests SET dedupe_key = NULL")
+            st.db.execute("DROP INDEX IF EXISTS idx_req_dedupe")
+            done = st._backfill_dedupe("requests", request_key, batch=5)
+            self.assertEqual(done, 12)
+            self.assertEqual(
+                st.query("SELECT COUNT(*) n FROM requests WHERE dedupe_key IS NULL")[0]["n"], 0)
+        finally:
+            st.db.close()
+
+    def test_the_expensive_steps_are_skipped_once_the_index_exists(self):
+        """They ran on every startup: a full scan for NULLs plus a whole-table
+        GROUP BY. With the unique index present neither can find anything."""
+        self._legacy_db(rows=5)
+        st = Store(self.path)
+        st.db.close()
+        st2 = Store(self.path)
+        try:
+            self.assertTrue(st2._has_index("idx_req_dedupe"))
+            sqls = []
+            st2.db.set_trace_callback(sqls.append)
+            st2._migrate()
+            st2.db.set_trace_callback(None)
+            joined = " | ".join(" ".join(q.split()) for q in sqls)
+            self.assertTrue(sqls, "trace callback saw nothing -- test is not looking")
+            self.assertNotIn("dedupe_key IS NULL", joined)
+            self.assertNotIn("GROUP BY dedupe_key", joined)
+        finally:
+            st2.db.close()
+
+    def test_duplicates_present_before_the_index_are_collapsed(self):
+        """Three byte-identical rows (a replayed journal) must become one, or
+        CREATE UNIQUE INDEX would fail and the migration would abort."""
+        self._legacy_db(rows=0, dup_ts=3)
+        st = Store(self.path)
+        try:
+            self.assertEqual(st.query("SELECT COUNT(*) n FROM requests")[0]["n"], 1)
+            self.assertTrue(st._has_index("idx_req_dedupe"))
+        finally:
+            st.db.close()
 
 
 class TestMetricsSources(StoreCase):

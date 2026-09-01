@@ -190,6 +190,77 @@ class TestFileReader(FileCase):
         asyncio.run(go())
         self.assertIn("appeared later", self.seen)
 
+    def write_partial(self, text):
+        """Append text with NO trailing newline, as a mid-write writer leaves it."""
+        with open(self.path, "a") as fh:
+            fh.write(text)
+
+    def test_a_half_written_line_is_not_delivered_twice(self):
+        """readlines() hands back a trailing fragment when the writer has not
+        flushed its newline yet.  Consuming it and committing the offset past it
+        delivers the fragment as a whole line, then its remainder as another --
+        so a [GIN] line gets split and neither half parses."""
+        gin = ('[GIN] 2026/08/19 - 11:17:18 | 200 | 1.5s |'
+               '       192.0.2.10 | POST     "/api/chat"')
+        head, tail = gin[:40], gin[40:]
+
+        async def go():
+            self.write("complete line", mode="w")
+            rd = await self.follow(0.2)
+            self.write_partial(head)              # writer caught mid-line
+            await self.follow(0.2, reader=rd)
+            self.write_partial(tail + "\n")       # ...finishes it
+            await self.follow(0.2, reader=rd)
+
+        asyncio.run(go())
+        bodies = [m for _t, m in self.seen]
+        self.assertIn("complete line", bodies)
+        # The whole access line must arrive exactly once, intact.
+        self.assertIn(gin, bodies)
+        self.assertNotIn(head, bodies)
+        self.assertNotIn(tail, bodies)
+
+    def test_a_line_still_being_written_is_held_not_dropped(self):
+        """The fragment must be waited for, not skipped: the offset may not
+        advance past bytes that have not formed a line yet."""
+        async def go():
+            self.write_partial("half a line")
+            rd = await self.follow(0.2)
+            self.assertEqual([m for _t, m in self.seen], [])
+            self.write_partial(" now complete\n")
+            await self.follow(0.2, reader=rd)
+
+        asyncio.run(go())
+        self.assertEqual([m for _t, m in self.seen], ["half a line now complete"])
+
+    def test_a_held_fragment_is_flushed_when_the_file_rotates_away(self):
+        """A fragment is held because the writer might still finish it. Once the
+        file is rotated away it never will, so the held line must be emitted
+        rather than stranded -- the reader still has the old handle open."""
+        async def go():
+            self.write("first", mode="w")
+            self.write_partial("last line never terminated")
+            rd = FileReader(self.st, "src", {"reader": "file", "path": self.path},
+                            poll=0.02)
+            task = asyncio.create_task(
+                rd.run(lambda ts, msg: self.seen.append((ts, msg)), lambda now: None))
+            await asyncio.sleep(0.15)
+            # Rotate while the reader is running, so it still holds the handle.
+            os.rename(self.path, self.path + ".1")
+            self.write("after rotation", mode="w")
+            await asyncio.sleep(0.25)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(go())
+        bodies = [m for _t, m in self.seen]
+        self.assertIn("first", bodies)
+        self.assertIn("last line never terminated", bodies)
+        self.assertIn("after rotation", bodies)
+
     def test_timestamps_are_monotonic_over_a_mixed_log(self):
         """A real ollama log interleaves timestamped Go lines with bare slot
         lines; ordering must hold because the joins depend on it."""

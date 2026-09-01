@@ -300,7 +300,7 @@ def create_app(state: AppState) -> FastAPI:
             include_health = bool(state.config.get("dashboard.include_health")) \
                 if state.config else False
 
-        raw_from = metrics.raw_coverage(st)
+        raw_cov = metrics.coverage(st, start)
 
         def build():
             return {
@@ -313,10 +313,11 @@ def create_app(state: AppState) -> FastAPI:
                 "models": metrics.by_model(st, start, end),
                 "endpoints": metrics.by_endpoint(st, start, end),
                 "clients": metrics.by_client(st, start, end),
-                # by_client can only answer back to the oldest raw row; the
-                # dashboard says so rather than implying a full history.
-                "clients_complete": raw_from is not None and raw_from <= start,
-                "clients_from": raw_from,
+                # Several tables below can only answer back to the oldest raw
+                # row; the dashboard names the cutoff rather than implying a
+                # full history.  One flag, because they share the one limit.
+                "raw_complete": raw_cov["complete"],
+                "raw_from": raw_cov["covers_from"],
                 "statuses": metrics.status_breakdown(st, start, end),
                 "errors": metrics.recent_errors(st, start, end, 25),
                 "slowest": metrics.slowest(st, start, end, "ttft_ms", 10),
@@ -381,18 +382,23 @@ def create_app(state: AppState) -> FastAPI:
         start, end = _window(window)
         return metrics.gpu_series(state.store, start, end, step)
 
+    @app.get("/api/endpoints")
+    async def endpoints(window: str = "1h"):
+        """Traffic by endpoint and class.  Raw-only, like the other breakdowns."""
+        start, end = _window(window)
+        return {"window": window, "endpoints": metrics.by_endpoint(state.store, start, end),
+                **metrics.coverage(state.store, start)}
+
     @app.get("/api/clients")
     async def clients(window: str = "1h", limit: int = 25):
         """Per-client detail: models requested, context sizes, tokens, TTFT."""
         start, end = _window(window)
         rows = metrics.by_client(state.store, start, end, limit)
-        covers_from = metrics.raw_coverage(state.store)
+        # Client identity lives only on raw rows, so the answer is complete only
+        # back to the oldest surviving one.  Stated outright so a short list is
+        # not read as "few clients called".
         return {"window": window, "start": start, "end": end, "clients": rows,
-                # Client identity lives only on raw rows, so the answer is
-                # complete only back to the oldest surviving one.  Stated
-                # outright so a short list is not read as "few clients called".
-                "covers_from": covers_from,
-                "complete": covers_from is not None and covers_from <= start}
+                **metrics.coverage(state.store, start)}
 
     @app.get("/api/cache")
     async def cache(window: str = "1h", step: int | None = None):

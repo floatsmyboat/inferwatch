@@ -389,17 +389,21 @@ class Store:
         if cols and "n_ctx_slot" not in cols:
             self.db.execute("ALTER TABLE requests ADD COLUMN n_ctx_slot INTEGER")
 
-        for table, keyfn in (("requests", request_key), ("events", event_key)):
+        for table, keyfn, index in (("requests", request_key, "idx_req_dedupe"),
+                                    ("events", event_key, "idx_ev_dedupe")):
             cols = {c["name"] for c in self.db.execute(f"PRAGMA table_info({table})")}
             if "dedupe_key" not in cols:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN dedupe_key TEXT")
-                cols.add("dedupe_key")
-            missing = self.db.execute(
-                f"SELECT * FROM {table} WHERE dedupe_key IS NULL").fetchall()
-            for row in missing:
-                self.db.execute(f"UPDATE {table} SET dedupe_key = ? WHERE id = ?",
-                                (keyfn(dict(row)), row["id"]))
-            # collapse pre-existing duplicates, keeping the earliest row
+            if self._has_index(index):
+                # Already migrated.  The unique index makes both steps below
+                # impossible to need, and they are the expensive ones: the
+                # backfill scans every NULL row and the collapse is a full scan
+                # plus a GROUP BY over the whole table.  Running them on every
+                # startup cost that for nothing.
+                continue
+            self._backfill_dedupe(table, keyfn)
+            # Collapse duplicates already present (from a replayed journal),
+            # keeping the earliest row, or CREATE UNIQUE INDEX below would fail.
             self.db.execute(
                 f"DELETE FROM {table} WHERE id NOT IN"
                 f" (SELECT MIN(id) FROM {table} GROUP BY dedupe_key)")
@@ -407,6 +411,32 @@ class Store:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_req_dedupe ON requests(dedupe_key)")
         self.db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ev_dedupe ON events(dedupe_key)")
+
+    def _has_index(self, name: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+        return row is not None
+
+    def _backfill_dedupe(self, table: str, keyfn, batch: int = 5000) -> int:
+        """Fill dedupe_key on pre-schema-2 rows, a bounded batch at a time.
+
+        The key is computed in Python, so this cannot be one UPDATE statement.
+        Reading the whole table with fetchall() could mean a multi-hundred-MB
+        result and a long startup holding the write lock, so rows are taken in
+        batches instead; each pass shrinks the candidate set because the rows it
+        wrote no longer match.
+        """
+        done = 0
+        while True:
+            rows = self.db.execute(
+                f"SELECT * FROM {table} WHERE dedupe_key IS NULL LIMIT ?",
+                (batch,)).fetchall()
+            if not rows:
+                return done
+            self.db.executemany(
+                f"UPDATE {table} SET dedupe_key = ? WHERE id = ?",
+                [(keyfn(dict(r)), r["id"]) for r in rows])
+            done += len(rows)
 
     # -- config --------------------------------------------------------------
 

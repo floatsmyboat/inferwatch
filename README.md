@@ -409,6 +409,7 @@ tools, which otherwise wait forever on an open stream).
 | `/api/requests`, `/api/errors`, `/api/events`, `/api/gpu`, `/api/ps` | raw rows and timelines |
 | `/api/cache?window=1h` | Ollama prompt-cache occupancy, evictions, update cost |
 | `/api/clients?window=1h&limit=25` | per-client detail: models requested, context sizes, tokens, TTFT |
+| `/api/endpoints?window=1h` | traffic by endpoint and class |
 | `/api/config` (GET/PUT), `/api/config/reset` | settings |
 | `/api/sources` (GET/POST/PUT/DELETE), `/api/sources/probe` | monitored engines |
 | `/api/prefs`, `/api/status`, `/api/health` | dashboard defaults, collector state |
@@ -511,15 +512,20 @@ other does *not* give tokens per request. The API marks this with
 detail from vLLM, its request-level logging is the only source, and it logs
 prompt text — which this tool deliberately never stores.
 
-**Per-client detail reaches back only as far as raw retention.** Client
-addresses exist only on raw request rows; the rollups aggregate by model and
-class and carry no client column, so there is nothing to fall back to. Every
-per-client response therefore carries `covers_from` (the oldest surviving raw
-row) and `complete`, and the dashboard names the cutoff rather than implying a
-full history. Note that this bound is `retention.raw_days` (7 by default), not
-the 6-hour `RAW_WINDOW_S` that decides when *other* queries switch to rollups —
-a 7-day client breakdown is complete even though `summary()['exact']` is false
-for that span.
+**Some breakdowns reach back only as far as raw retention.** Endpoint, status
+code, client address and per-request identity exist only on raw request rows —
+the rollups aggregate by `(bucket, model, class)` and carry none of them — so
+`by_endpoint`, `status_breakdown`, `by_client`, `recent_errors`, `slowest` and
+`recent_requests` have nothing to degrade to. Past retention the honest answer
+is *not stored*, which is a different statement from *nothing happened*, so
+those responses carry `covers_from` (the oldest surviving raw row) and
+`complete`, and the dashboard's empty states name the cutoff instead of reading
+as an idle window.
+
+Note this bound is `retention.raw_days` (7 by default), **not** the 6-hour
+`RAW_WINDOW_S` that decides when *other* queries switch to the rollups for
+speed. A 7-day client breakdown is complete even though `summary()['exact']` is
+false for that span; conflating the two reports a full answer as a partial one.
 
 **A client's model mix is only as good as ollama's logging.** Ollama names the
 model on a per-request scheduler line, and when that line is absent the request

@@ -71,9 +71,36 @@ def _win(window: str) -> tuple[float, float]:
 
 
 def _note(exact: bool) -> str:
+    """Where a percentile came from.
+
+    The false branch is NOT about retention -- raw rows may well still exist.
+    Queries switch to the rollups once a range is long enough that scanning raw
+    rows stops being cheap, which is a much shorter threshold than how long
+    those rows are kept.
+    """
     return ("Percentiles are exact (computed from raw request rows)." if exact else
-            "Range exceeds raw retention: percentiles come from stored histograms "
-            "and are the UPPER BOUND of the containing bucket, not interpolated.")
+            "Range is long enough that this was answered from the stored "
+            "histograms, so percentiles are the UPPER BOUND of the containing "
+            "bucket, not interpolated. Means are exact either way.")
+
+
+def _raw_note(start: float) -> dict:
+    """Coverage fields for a tool that can only answer from raw request rows.
+
+    Endpoint, status code, client address and per-request identity are absent
+    from the rollups, so for these there is no degraded answer past retention --
+    only an empty one, which must not be mistaken for an idle window.
+    """
+    cov = metrics.coverage(store(), start)
+    out = {"complete": cov["complete"], "covers_from": _when(cov["covers_from"])}
+    if not cov["complete"]:
+        out["warning"] = (
+            f"this window starts before the oldest surviving raw request row "
+            f"({out['covers_from'] or 'none stored'}), and per-request detail has "
+            f"no rollup fallback -- the earlier part of the range is simply not "
+            f"stored. Raise retention.raw_days or shorten the window rather than "
+            f"reading a short list as low traffic.")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -182,7 +209,8 @@ def recent_errors(window: str = "24h", limit: int = 50) -> dict:
     start, end = _win(window)
     rows = metrics.recent_errors(store(), start, end, min(limit, 500))
     return {"window": window, "count": len(rows), "errors": _humanise(rows),
-            "statuses": metrics.status_breakdown(store(), start, end)}
+            "statuses": metrics.status_breakdown(store(), start, end),
+            **_raw_note(start)}
 
 
 @srv.tool(
@@ -202,7 +230,7 @@ def slowest_requests(window: str = "1h", by: str = "ttft_ms", limit: int = 20) -
     start, end = _win(window)
     rows = metrics.slowest(store(), start, end, by, min(limit, 200))
     return {"window": window, "sorted_by": by, "count": len(rows),
-            "requests": _humanise(rows),
+            "requests": _humanise(rows), **_raw_note(start),
             "notes": "queue_ms = latency_ms - total_ms (waiting, not working). "
                      "ttft_ms is llama.cpp's prompt eval time."}
 
@@ -227,6 +255,7 @@ def recent_requests(window: str = "1h", limit: int = 50,
     rows = metrics.recent_requests(store(), start, end, min(limit, 500),
                                    include_health_checks)
     return {"window": window, "count": len(rows), "requests": _humanise(rows),
+            **_raw_note(start),
             "notes": "attribution: 'exact' = timings definitely belong to this "
                      "request; 'ambiguous' = two requests finished together and "
                      "the pairing is a best guess; 'none' = failed before "
@@ -304,13 +333,10 @@ def client_stats(window: str = "1h", limit: int = 25) -> dict:
     st = store()
     start, end = _win(window)
     rows = metrics.by_client(st, start, end, limit)
-    covers_from = metrics.raw_coverage(st)
-    complete = covers_from is not None and covers_from <= start
     out: dict[str, Any] = {
         "window": window,
         "clients": _humanise([dict(c) for c in rows]),
-        "complete": complete,
-        "covers_from": _when(covers_from),
+        **_raw_note(start),
         "notes": [
             "Client identity exists only on raw request rows, so this reaches "
             "back only as far as raw retention (7 days by default); the rollups "
@@ -321,12 +347,6 @@ def client_stats(window: str = "1h", limit: int = 25) -> dict:
             "approach to a context shift.",
         ],
     }
-    if not complete:
-        out["warning"] = (
-            f"this window starts before the oldest surviving raw request row "
-            f"({out['covers_from']}), so the earlier part of it has no "
-            f"per-client detail at all -- raise retention.raw_days or ask for a "
-            f"shorter window rather than reading this as the full picture.")
     stale = sum(c["unattributed"] for c in rows)
     total = sum(c["requests"] for c in rows)
     if stale:

@@ -358,6 +358,14 @@ class FileReader(Reader):
     Resume state is (inode, offset).  If the inode changed the file was rotated
     and reading restarts at the beginning of the new one; if the file shrank it
     was truncated in place, so the offset is reset.
+
+    Only COMPLETE lines are consumed.  A read can land between a writer's
+    write() and its newline, and treating that fragment as a line would deliver
+    half a record, then its remainder as another -- so a `[GIN]` line would be
+    split and neither half would parse.  The offset therefore never advances
+    past a fragment; it is left for the next pass.  The one exception is a file
+    being rotated away, whose trailing fragment will never be completed and is
+    flushed rather than stranded.
     """
 
     kind = "file"
@@ -392,6 +400,9 @@ class FileReader(Reader):
 
                 if fh is None or inode != st.st_ino:
                     if fh:
+                        # This file gets no more writes, so any held-back
+                        # fragment is final rather than half-written.
+                        self._drain(fh, on_line)
                         fh.close()
                     fh = open(self.path, "r", encoding="utf-8", errors="replace")
                     if inode == st.st_ino and offset <= st.st_size:
@@ -410,24 +421,18 @@ class FileReader(Reader):
                     offset = 0
                     fh.seek(0)
 
-                chunk = fh.readlines()
-                if chunk:
-                    for line in chunk:
-                        line = line.rstrip("\n")
-                        if not line:
-                            continue
-                        ts = self.clock.feed(line)
-                        self.lines += 1
-                        on_line(ts, line)
-                    offset = fh.tell()
-                    inode = st.st_ino
+                read_any = self._consume(fh, on_line)
+                # tell() is the start of any fragment left behind, so the
+                # persisted offset re-reads it rather than skipping it.
+                offset = fh.tell()
+                inode = st.st_ino
 
                 now = time.time()
-                if chunk or now - last_commit > 1.0:
+                if read_any or now - last_commit > 1.0:
                     self.save_state({"inode": inode, "offset": offset})
                     on_flush(now)
                     last_commit = now
-                if not chunk:
+                if not read_any:
                     await asyncio.sleep(self.poll)
         except asyncio.CancelledError:
             if fh:
@@ -436,6 +441,51 @@ class FileReader(Reader):
         finally:
             if fh:
                 fh.close()
+
+    def _emit(self, line: str, on_line) -> None:
+        line = line.rstrip("\n")
+        if not line:
+            return
+        ts = self.clock.feed(line)
+        self.lines += 1
+        on_line(ts, line)
+
+    def _consume(self, fh, on_line) -> bool:
+        """Emit every complete line available, leaving a partial one in place.
+
+        Returns whether anything was emitted.  Reading line by line rather than
+        with readlines() is what makes holding the fragment possible: the
+        position before each read is recorded so an unterminated line can be
+        rewound to.  Text-mode seek only accepts a value tell() produced, which
+        is why the offset cannot simply be arithmetic on the fragment's length.
+        """
+        emitted = False
+        while True:
+            pos = fh.tell()
+            line = fh.readline()
+            if not line:
+                return emitted
+            if not line.endswith("\n"):
+                fh.seek(pos)           # incomplete: wait for the newline
+                return emitted
+            self._emit(line, on_line)
+            emitted = True
+
+    def _drain(self, fh, on_line) -> None:
+        """Flush whatever is left in a file we are about to stop reading.
+
+        Called only when the inode changed, i.e. the file was rotated away.  Its
+        last line may lack a newline because the writer moved on mid-record;
+        emitting it keeps the record when it was merely unterminated, and a
+        genuinely truncated one simply fails to parse downstream -- which beats
+        losing it silently.
+        """
+        try:
+            rest = fh.read()
+        except OSError:
+            return
+        for line in rest.split("\n"):
+            self._emit(line, on_line)
 
 
 # --------------------------------------------------------------------------

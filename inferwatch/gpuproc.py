@@ -121,17 +121,24 @@ def _ppid(pid: int) -> int | None:
         return None
 
 
-def descendants(root: int, limit: int = 4096) -> set[int]:
+def descendants(root: int) -> set[int]:
     """All pids under `root`, inclusive.
 
     Built by walking every process's parent upward rather than scanning for
     children repeatedly, so the whole tree costs one pass over /proc.
+
+    Every pid is examined.  An earlier version capped the scan at 4096 entries,
+    but os.listdir("/proc") has no meaningful order, so on a busy host that
+    dropped arbitrary processes from the parent map and silently under-reported
+    the tree -- which reads downstream as an engine holding fewer GPUs than it
+    does.  Nothing here caches, so a full pass is the honest option and costs
+    one stat per process.
     """
     try:
         pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
         return {root}
-    parents = {pid: _ppid(pid) for pid in pids[:limit]}
+    parents = {pid: _ppid(pid) for pid in pids}
     out = {root}
     for pid in parents:
         seen = set()
@@ -170,6 +177,16 @@ def port_of(url: str) -> int | None:
 
 
 def is_local(url: str) -> bool:
-    """Attribution only works for an engine on this host."""
-    host = re.sub(r"^\w+://", "", url or "").split(":")[0].split("/")[0]
-    return host in ("", "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]")
+    """Attribution only works for an engine on this host.
+
+    IPv6 literals are bracketed, and splitting the authority on ":" would leave
+    "[" as the host -- so "http://[::1]:8000" never matched the loopback list it
+    was already meant to be in, and a v6-bound instance silently lost its GPU
+    attribution.  The brackets are stripped before the port is.
+    """
+    host = re.sub(r"^\w+://", "", url or "").split("/")[0]
+    if host.startswith("["):
+        host = host[1:].split("]")[0]
+    else:
+        host = host.split(":")[0]
+    return host in ("", "localhost", "127.0.0.1", "0.0.0.0", "::1", "::")

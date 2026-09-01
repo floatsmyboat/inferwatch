@@ -40,6 +40,7 @@ class SourceRuntime:
         self.reader = None
         self.corr: Correlator | None = None
         self.vllm: VllmCollector | None = None
+        self.ps: PsPoller | None = None
 
     @property
     def name(self) -> str:
@@ -60,6 +61,14 @@ class SourceRuntime:
             # The most recent prompt-cache reading, so /api/status can say
             # whether the gauge is arriving at all.
             d["cache"] = self.corr.last_cache
+        if self.ps is not None:
+            # Held on the runtime rather than left a local, so /api/status can
+            # say when /api/ps was last read and whether it is answering --
+            # otherwise this was the one collector with no visibility.
+            last = self.ps.last or {}
+            d["ps"] = {"ts": last.get("ts"), "url": self.ps.base_url,
+                       "loaded_count": len(last.get("models") or []),
+                       "models": [m.get("name") for m in (last.get("models") or [])]}
         if self.vllm is not None:
             d["url"] = self.vllm.url
             d["scrapes"] = self.vllm.scrapes
@@ -190,14 +199,15 @@ class Supervisor:
                 corr.tick(now)
                 store.commit()
 
-            ps = PsPoller(self.store, rt.corr, cfg.get("url") or "http://127.0.0.1:11434",
-                          interval_getter=lambda: self.config.get(
-                              "collection.poll_interval_s"),
-                          on_live=self.hub.publish)
+            rt.ps = PsPoller(self.store, rt.corr,
+                             cfg.get("url") or "http://127.0.0.1:11434",
+                             interval_getter=lambda: self.config.get(
+                                 "collection.poll_interval_s"),
+                             on_live=self.hub.publish)
             rt.tasks = [
                 asyncio.create_task(rt.reader.run(on_line, on_flush),
                                     name=f"reader:{spec['name']}"),
-                asyncio.create_task(ps.run(), name=f"ps:{spec['name']}"),
+                asyncio.create_task(rt.ps.run(), name=f"ps:{spec['name']}"),
             ]
             log.info("source %r started (%s)", spec["name"], rt.reader.describe())
         elif spec["kind"] == "vllm":

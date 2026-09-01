@@ -325,6 +325,16 @@ def by_model(store, start: float, end: float) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# raw-only breakdowns
+#
+# Everything from here to `events()` reads the `requests` table directly and has
+# no rollup fallback, because the columns it groups by -- endpoint, status,
+# client address, per-request identity -- do not exist in the rollups.  Past raw
+# retention these return nothing; pair them with `coverage()` so an empty result
+# is reported as "not stored" rather than as an idle window.
+# --------------------------------------------------------------------------
+
 def by_endpoint(store, start: float, end: float) -> list[dict]:
     rows = store.query(
         "SELECT endpoint, class, COUNT(*) n,"
@@ -333,6 +343,25 @@ def by_endpoint(store, start: float, end: float) -> list[dict]:
         " ORDER BY n DESC LIMIT 50", (start, end))
     return [{"endpoint": r["endpoint"], "class": r["class"], "requests": r["n"],
              "errors": r["err"] or 0, "latency_ms_mean": r["lat_mean"]} for r in rows]
+
+
+def coverage(store, start: float) -> dict:
+    """Whether the raw request rows reach back as far as `start`.
+
+    Several breakdowns can ONLY come from raw rows, because the rollups
+    aggregate by (bucket, model, class) and carry no endpoint, status code,
+    client address or per-request identity at all.  There is therefore nothing
+    to degrade to for those: past retention the honest answer is "not stored",
+    which is a different statement from "nothing happened", and callers need to
+    be able to tell a caller which one they got.
+    """
+    first = raw_coverage(store)
+    return {
+        "covers_from": first,
+        "complete": first is not None and first <= start,
+        # True for every consumer of this: they read `requests` directly.
+        "raw_only": True,
+    }
 
 
 def raw_coverage(store) -> float | None:

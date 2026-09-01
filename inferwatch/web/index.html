@@ -433,6 +433,13 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
   </div>
 
   <div class="grid" style="margin-top:14px">
+    <div class="card"><header><h2>Endpoints</h2><span class="note" id="n-endpoints"></span></header>
+      <div class="tbl-wrap" id="t-endpoints"></div></div>
+    <div class="card"><header><h2>Status codes</h2><span class="note" id="n-statuses"></span></header>
+      <div class="tbl-wrap" id="t-statuses"></div></div>
+  </div>
+
+  <div class="grid" style="margin-top:14px">
     <div class="card"><header><h2>Slowest by TTFT</h2><span class="note">worst prefill in window</span></header>
       <div class="tbl-wrap" id="t-slowest"></div></div>
     <div class="card"><header><h2>Longest queue waits</h2><span class="note">time spent waiting, not working</span></header>
@@ -1447,6 +1454,28 @@ function renderTables() {
     }, "No inference requests in this window.");
   text($("n-models"), `${d.models.length} model${d.models.length === 1 ? "" : "s"}`);
 
+  table("t-endpoints",
+    [{ label: "Endpoint" }, { label: "Class" }, { label: "Requests", num: true },
+     { label: "Errors", num: true }, { label: "Latency mean", num: true }],
+    d.endpoints, (tr, e) => {
+      tr.appendChild(td(e.endpoint, false, true));
+      tr.appendChild(tdNode(pill(e.class, e.class === "inference" ? "ok" : "info")));
+      tr.appendChild(td(fmtCompact(e.requests, 0), true));
+      tr.appendChild(td(e.errors ? String(e.errors) : "0", true));
+      tr.appendChild(td(fmtMs(e.latency_ms_mean), true));
+    }, rawEmpty(d, "endpoint traffic"));
+  const ne = (d.endpoints || []).length;
+  text($("n-endpoints"), ne ? `${ne} endpoint${ne === 1 ? "" : "s"}, all classes` : "");
+
+  table("t-statuses",
+    [{ label: "Status" }, { label: "Class" }, { label: "Count", num: true }],
+    d.statuses, (tr, r) => {
+      tr.appendChild(tdNode(statusPill(r.status)));
+      tr.appendChild(tdNode(pill(r.class, r.class === "inference" ? "ok" : "info")));
+      tr.appendChild(td(fmtCompact(r.count, 0), true));
+    }, rawEmpty(d, "responses"));
+  text($("n-statuses"), "includes health checks");
+
   /* Per-client. "Context" pairs the largest prompt a client sent with the
      capacity of the slot it ran in, and bars the peak ratio -- that ratio is
      computed server-side per request, so it is never a peak prompt paired with
@@ -1474,17 +1503,14 @@ function renderTables() {
       tr.appendChild(td(fmtCompact(c.output_tokens, 0), true));
       tr.appendChild(td(fmtCompact(c.decode_tps, 1), true));
       tr.appendChild(td(fmtClock(c.last_seen)));
-    }, d.clients_complete === false
-         ? "Per-client detail comes from raw request rows, which are kept for "
-           + "retention.raw_days; this range starts before the oldest one."
-         : "No inference requests in this window.");
+    }, rawEmpty(d, "per-client detail"));
   const nc = (d.clients || []).length;
   const unatt = (d.clients || []).reduce((a, c) => a + (c.unattributed || 0), 0);
   text($("n-clients"), nc
     ? `${nc} client${nc === 1 ? "" : "s"}`
       + (unatt ? ` \u00B7 ${fmtCompact(unatt, 0)} request${unatt === 1 ? "" : "s"} with no model named in the log` : "")
-      + (d.clients_complete === false
-           ? ` \u00B7 only covers requests since ${fmtClock(d.clients_from)}` : "")
+      + (d.raw_complete === false
+           ? ` \u00B7 only covers requests since ${fmtClock(d.raw_from)}` : "")
     : "");
 
   const maxTtft = Math.max(1, ...(d.slowest || []).map((r) => r.ttft_ms || 0));
@@ -1498,7 +1524,7 @@ function renderTables() {
       tr.appendChild(tdNode(barCell(r.ttft_ms / maxTtft, css("--series-1"))));
       tr.appendChild(td(fmtCompact(r.prompt_tokens_total || r.prompt_tokens, 0), true));
       tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
-    });
+    }, rawEmpty(d, "per-request timings"));
 
   const maxQ = Math.max(1, ...(d.slowest_queue || []).map((r) => r.queue_ms || 0));
   table("t-slowq",
@@ -1511,7 +1537,7 @@ function renderTables() {
       tr.appendChild(tdNode(barCell(r.queue_ms / maxQ, css("--series-2"))));
       tr.appendChild(td(fmtMs(r.total_ms), true));
       tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
-    });
+    }, rawEmpty(d, "queue waits"));
 
   table("t-errors",
     [{ label: "Time" }, { label: "Status" }, { label: "Endpoint" }, { label: "Model" },
@@ -1523,7 +1549,7 @@ function renderTables() {
       tr.appendChild(td(r.model || "—"));
       tr.appendChild(td(r.client_ip || "—"));
       tr.appendChild(td(fmtMs(r.latency_ms), true));
-    }, "No errors in this window.");
+    }, rawEmpty(d, "errors"));
 
   table("t-events",
     [{ label: "Time" }, { label: "Event" }, { label: "Model" }, { label: "Duration", num: true },
@@ -1578,6 +1604,19 @@ function eventPill(e) {
   if (k === "truncation") return pill("truncated", "warn");
   if (k === "problem") return pill(e.level === "ERROR" ? "error" : "warning", e.level === "ERROR" ? "err" : "warn");
   return pill(k, "info");
+}
+
+/* Empty-state text for the tables that read raw request rows.
+   Those rows are kept for retention.raw_days, and past that there is nothing to
+   fall back to: the rollups aggregate by model and class and carry no endpoint,
+   status code, client address or per-request identity. So the message says
+   "not stored" rather than letting an empty table read as an idle window. */
+function rawEmpty(d, what) {
+  return d.raw_complete === false
+    ? `No ${what} stored for this range \u2014 per-request rows are kept for `
+      + `retention.raw_days, and this window starts before the oldest one `
+      + `(${fmtClock(d.raw_from)}).`
+    : `No ${what} in this window.`;
 }
 
 /* Which models a client asked for, busiest first. Kept to two names so the
