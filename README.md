@@ -327,7 +327,7 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | Field | Default | Required when | Notes |
 |---|---|---|---|
 | `reader` | `journald` | — | Where to read ollama's log from. Per-request metrics come from llama.cpp's debug lines, so one of these is required. One of `journald`, `file`, `docker`. |
-| `unit` | `ollama` | `reader=journald` |  |
+| `unit` | `ollama` | `reader=journald` | Also used to attribute GPUs: every process in this unit's cgroup is matched against nvidia-smi, so only the cards ollama actually holds appear on its pane. |
 | `path` | — | `reader=file` | Followed like tail -F, so rotation and truncation are handled. |
 | `container` | `ollama` | `reader=docker` |  |
 | `url` | `http://127.0.0.1:11434` | — | Used to poll /api/ps for resident models. |
@@ -338,7 +338,7 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | Field | Default | Required when | Notes |
 |---|---|---|---|
 | `url` | `http://127.0.0.1:8000` | — | The OpenAI-compatible server root. /metrics is read from here. |
-| `unit` | — | — | If set, the journal is also read for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
+| `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. The journal is also read from it for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
 | `api_key` | — | — | Sent as a bearer token if the server requires one. |
 
 #### Command-line flags
@@ -379,16 +379,44 @@ worth doing deliberately.
 
 ### Which GPUs belong to which engine
 
-A host often runs more than one engine, so plotting every card on an instance's
-pane would imply it uses all of them. Each vLLM instance's GPUs are resolved by
-following processes — the port it serves → the listening pid → its descendants →
-intersected with `nvidia-smi`'s compute processes → the cards those hold. The
-instance's cards carry the series colour and its VRAM tile counts only those;
-the host's other cards stay visible in grey, labelled "other engine".
+A host often runs more than one engine, so plotting every card on an engine's
+pane would imply it uses all of them. **Both** panes scope their GPU charts and
+tiles to the cards their engine actually holds: those carry the series colour
+and the aggregates (VRAM, watts, hottest card) count only them, while the host's
+other cards stay visible in grey, labelled "other engine".
 
-Attribution needs `ss`, a local instance, and nvidia-smi process visibility
-(often absent inside containers). When any of those is missing the pane says so
-and shows every card without emphasis, rather than guessing.
+GPUs are resolved by three methods, in descending order of trust:
+
+| Method | How | When it applies |
+|---|---|---|
+| **cgroup** | every pid in a unit's cgroup, intersected with `nvidia-smi`'s compute processes | a `unit` is configured on the source — the reliable one |
+| **pids** | ollama's own `runner.pid` log lines | Ollama, for the `llama-server` it spawned |
+| **port** | the listening pid → its descendants | last resort, no unit configured |
+
+Prefer configuring `unit`. The port walk assumes the processes holding the GPUs
+are children of whatever answers the port, and that is false for anything
+non-trivial: vLLM v1 runs its engine core and workers as separate processes, and
+a reverse proxy in front of the API server severs the link entirely. A cgroup is
+what survives reparenting. On the development host the URL's listener is in
+`vllm-proxy.service` while the workers are in `vllm-qwen38.service`, so only the
+cgroup method finds them — set `unit` to the unit running the **engine**, never
+the proxy.
+
+Three outcomes, rendered differently, because collapsing them is how a wrong
+answer gets presented as a right one:
+
+- **specific cards** — "holds GPU 2, 3 of 4 · via cgroup:vllm-qwen38.service",
+  with the method named so a surprising answer is diagnosable
+- **none** — attributed, and the engine is on no card (a CPU-only instance)
+- **unknown** — no nvidia-smi, no cgroup visibility, a remote engine, or an
+  empty result from the weakest method (far likelier to be the wrong process
+  tree than a genuinely idle engine). Every card is shown without emphasis and
+  the pane says it could not attribute.
+
+Attribution is re-resolved on an interval rather than cached once, and the
+stored answer records **when and how** it was learned. An earlier version cached
+the first success and let a failure be merged away, so a topology change never
+propagated and the pane kept presenting weeks-old indices as current fact.
 
 One filter row scopes everything below it. Every chart has a **Table** toggle
 showing the same series as numbers, so no value is reachable only by hovering.

@@ -1043,7 +1043,8 @@ function tile(label, value, unit, sub, alarm, swatch) {
 function renderKpis() {
   const d = state.data, s = d.summary;
   const k = $("kpis"); k.innerHTML = "";
-  const gpuNow = latestGpu();
+  const gv0 = gpuView((d.gpu || {}).gpus, (d.gpu_owned || {}).indices);
+  const gpuNow = latestFrom(gv0.cards);
   k.append(
     tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
     tile("TTFT p50", fmtMs(s.ttft_ms.p50), "", `p99 ${fmtMs(s.ttft_ms.p99)}`),
@@ -1061,19 +1062,24 @@ function renderKpis() {
     liveKvTile(s.ctx_usage),
     tile("Tokens out", fmtCompact(s.output_tokens, 0), "",
          `in ${fmtCompact(s.input_tokens, 0)} · ${fmtCompact(s.out_tok_per_s_wall, 2)}/s`),
-    gpuNow ? tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%",
-                  `VRAM ${fmtCompact(gpuNow.memUsed / 1024, 1)}/${fmtCompact(gpuNow.memTotal / 1024, 1)} GiB`)
-           : tile("GPU utilisation", "—", "", "no nvidia-smi samples")
+    gpuNow ? tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%", gv0.scope())
+           : tile("GPU utilisation", "—", "",
+                  gv0.known && gv0.owned.length === 0 ? "holds no GPU"
+                                                      : "no nvidia-smi samples")
   );
-  const hotO = hottest(d.gpu && d.gpu.gpus);
+  if (gpuNow) {
+    k.append(tile("VRAM in use", fmtCompact(gpuNow.memUsed / 1024, 1), "GiB",
+                  `of ${fmtCompact(gpuNow.memTotal / 1024, 1)} GiB · ${fmtPct(gpuNow.memUsed / (gpuNow.memTotal || 1))}`,
+                  gpuNow.memUsed / (gpuNow.memTotal || 1) > 0.95));
+  }
+  const hotO = hottest(gv0.cards);
   if (hotO) {
     k.append(tile("GPU temperature", fmtTemp(hotO.temp), "",
                   `hottest: GPU ${hotO.index}`, hotO.temp >= TEMP_ALARM_C));
   }
-  const wattsO = totalPower(d.gpu && d.gpu.gpus);
+  const wattsO = totalPower(gv0.cards);
   if (wattsO !== null) {
-    k.append(tile("GPU power", fmtCompact(wattsO, 0), "W",
-                  `across ${(d.gpu.gpus || []).length} device${(d.gpu.gpus || []).length === 1 ? "" : "s"}`));
+    k.append(tile("GPU power", fmtCompact(wattsO, 0), "W", gv0.scope()));
   }
 }
 
@@ -1177,6 +1183,65 @@ function tempChartSpec(gpus, t, labelFn, colorFn, fmtTick) {
   };
 }
 
+/* "4m", "2h" -- for saying how stale an attribution is without a full clock. */
+function fmtAgo(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "\u2014";
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 90) return `${s}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+/* One GPU view for both engine panes, so "GPU utilisation", "VRAM in use" and
+   "GPU power" mean the same thing on each. They did not before: the vLLM pane
+   scoped them to the cards it holds while the Ollama pane summed the whole
+   host, under identical labels.
+
+   `owned` carries three states, and they render differently:
+     null  -- attribution was not possible; every card is coloured and none is
+              claimed, since de-emphasising arbitrarily would be a guess
+     []    -- attributed, and this engine holds no card (a CPU-only instance)
+     [i..] -- exactly these
+
+   Colours come from a map built once, not a counter incremented while
+   rendering, so a card keeps the same colour on every chart however many times
+   a spec happens to ask for it. */
+function gpuView(gpus, owned) {
+  gpus = gpus || [];
+  const known = Array.isArray(owned);
+  const isMine = (i) => !known || owned.includes(i);
+  const colours = new Map();
+  let slot = 0;
+  for (const gpu of gpus) {
+    colours.set(gpu.index, isMine(gpu.index) ? sc(slot++) : css("--deemph"));
+  }
+  return {
+    known, owned, isMine,
+    all: gpus,
+    /* The cards this engine holds. Every aggregate -- tiles, hottest card,
+       total watts, total VRAM -- is computed over these, never the host. */
+    cards: known ? gpus.filter((x) => isMine(x.index)) : gpus,
+    label: (gpu) => `GPU ${gpu.index}`
+      + (gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : "")
+      + (known && !isMine(gpu.index) ? " (other engine)" : ""),
+    colour: (gpu) => colours.get(gpu.index) || css("--deemph"),
+    /* Tile sub-line: names the cards, or says plainly that it cannot. */
+    scope: () => !known ? "all devices (unattributed)"
+      : owned.length ? `GPU ${owned.join(", ")}` : "holds no GPU",
+    /* Panel note: adds the denominator and how the answer was reached. */
+    note: (how) => {
+      if (!gpus.length) return "no samples yet";
+      const via = how && how !== "unavailable" ? ` · via ${how}` : "";
+      if (!known) return `${gpus.length} device${gpus.length === 1 ? "" : "s"}; could not attribute`;
+      return (owned.length
+        ? `holds GPU ${owned.join(", ")} of ${gpus.length}`
+        : `holds none of the ${gpus.length} devices`) + via;
+    },
+  };
+}
+
+
 /* Most recent non-null reading across a set of GPUs, summed for memory and
    averaged for utilisation. */
 function latestFrom(gpus) {
@@ -1193,11 +1258,6 @@ function latestFrom(gpus) {
   }
   if (!seen) return null;
   return { util: util / seen, memUsed, memTotal };
-}
-
-function latestGpu() {
-  const g = state.data && state.data.gpu;
-  return latestFrom(g && g.gpus);
 }
 
 /* ------------------------------------------------------------- charts */
@@ -1305,46 +1365,53 @@ function renderCharts() {
   text($("n-err"), st.length ? st.map((x) => `${x.status}×${x.count}`).join("  ") : "none in window");
   text($("n-errtbl"), `${(d.errors || []).length} shown`);
 
-  /* GPU */
+  /* GPU. Scoped to the cards ollama actually holds -- nvidia-smi reports the
+     whole host, and this pane used to plot and total all of it. */
   const g = d.gpu || { t: [], gpus: [] };
-  const utilSeries = g.gpus.map((gpu, i) => ({
-    name: `GPU ${gpu.index}${gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : ""}`,
-    values: gpu.util_pct, color: sc(i),
-  }));
+  const owned = d.gpu_owned || {};
+  const gv = gpuView(g.gpus, owned.indices);
+
   draw("gpu", "p-gpu", "l-gpu", {
     type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
-    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick, series: utilSeries,
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((gpu) => ({ name: gv.label(gpu), values: gpu.util_pct,
+                                   color: gv.colour(gpu) })),
   });
-  text($("n-gpu"), g.gpus.length ? `${g.gpus.length} device${g.gpus.length > 1 ? "s" : ""}` : "no samples yet");
+  text($("n-gpu"), gv.note(owned.source));
 
   draw("gtemp", "p-gtemp", "l-gtemp",
-       tempChartSpec(g.gpus, g.t,
-                     (gpu) => `GPU ${gpu.index}`, (gpu, i) => sc(i), fmtTick));
+       tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   {
-    const hot = hottest(g.gpus);
+    const hot = hottest(gv.cards);
     text($("n-gtemp"), hot ? `hottest now ${fmtTemp(hot.temp)} on GPU ${hot.index}`
-                           : "no samples yet");
+                           : (g.gpus.length ? "no readings yet" : "no samples yet"));
   }
 
   draw("gpower", "p-gpower", "l-gpower",
-       powerChartSpec(g.gpus, g.t, (gpu) => `GPU ${gpu.index}`,
-                      (gpu, i) => sc(i), fmtTick));
+       powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   {
-    const w = totalPower(g.gpus);
-    text($("n-gpower"), w === null ? "no samples yet" : `${fmtWatts(w)} total now`);
+    const w = totalPower(gv.cards);
+    text($("n-gpower"), w === null ? "no samples yet"
+      : `${fmtWatts(w)} across ${gv.known ? "this engine's cards" : "all devices"}`);
   }
 
-  const vramSeries = g.gpus.map((gpu, i) => ({
-    name: `GPU ${gpu.index}`, values: gpu.mem_used.map((v) => v === null ? null : v / 1024),
-    color: sc(i),
-  }));
-  const vtotal = g.gpus.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
   draw("vram", "p-vram", "l-vram", {
     type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
-    fmtAxis: (v) => fmtCompact(v, 0), fmtTick, series: vramSeries,
-    yMax: g.gpus.length ? Math.max(...g.gpus.map((x) => (x.mem_total || 0) / 1024)) : undefined,
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    /* Ceiling from the cards this engine holds, so a larger card belonging to
+       another engine does not flatten this plot. */
+    yMax: gv.cards.length ? Math.max(...gv.cards.map((x) => (x.mem_total || 0) / 1024))
+                          : undefined,
+    series: g.gpus.map((gpu) => ({
+      name: gv.label(gpu),
+      values: gpu.mem_used.map((v) => v === null ? null : v / 1024),
+      color: gv.colour(gpu),
+    })),
   });
-  text($("n-vram"), vtotal ? `${fmtCompact(vtotal, 0)} GiB total across devices` : "");
+  const vtotal = gv.cards.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
+  text($("n-vram"), vtotal
+    ? `${fmtCompact(vtotal, 0)} GiB across ${gv.known ? "this engine's devices" : "all devices"}`
+    : "");
 
   /* hero sparkline: the same output-tok/s series, de-emphasised */
   const hs = state.charts.herospark;
@@ -1872,81 +1939,72 @@ function renderVllm() {
          s.error_rate > 0.01, s.errors ? css("--critical") : css("--good"))
   );
 
-  /* GPU panels. nvidia-smi reports the whole host, but an instance only holds
-     some of the cards, so the ones attributed to it carry the colour and the
-     rest are drawn in the de-emphasis grey. */
+  /* GPU panels, through the same view the Ollama pane uses: cards this instance
+     holds carry a colour, the rest are drawn in the de-emphasis grey. */
   const g = d.gpu || { t: [], gpus: [] };
   const inst = (d.instances || []).find((i) => i.source === d.source) || {};
-  const mine = inst.gpu_indices;                 // null = attribution unknown
-  const isMine = (i) => !mine || mine.includes(i);
-  const attributed = g.gpus.filter((x) => isMine(x.index));
-  const gpuNow = latestFrom(attributed);
+  const gv = gpuView(g.gpus, inst.gpu_indices);
+  const gpuNow = latestFrom(gv.cards);
 
   if (gpuNow) {
     k.append(
-      tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%",
-           mine ? `GPU ${mine.join(", ")}` : "all devices (unattributed)"),
+      tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%", gv.scope()),
       tile("VRAM in use", fmtCompact(gpuNow.memUsed / 1024, 1), "GiB",
            `of ${fmtCompact(gpuNow.memTotal / 1024, 1)} GiB · ${fmtPct(gpuNow.memUsed / (gpuNow.memTotal || 1))}`,
            gpuNow.memUsed / (gpuNow.memTotal || 1) > 0.95)
     );
   } else {
-    k.append(tile("GPU utilisation", "—", "", "no nvidia-smi samples"));
+    k.append(tile("GPU utilisation", "—", "",
+                  gv.known && gv.owned.length === 0 ? "holds no GPU"
+                                                    : "no nvidia-smi samples"));
   }
-  const hotV = hottest(attributed);
+  const hotV = hottest(gv.cards);
   if (hotV) {
     k.append(tile("GPU temperature", fmtTemp(hotV.temp), "",
                   `hottest: GPU ${hotV.index}`, hotV.temp >= TEMP_ALARM_C));
   }
-  const wattsV = totalPower(attributed);
+  const wattsV = totalPower(gv.cards);
   if (wattsV !== null) {
-    k.append(tile("GPU power", fmtCompact(wattsV, 0), "W",
-                  mine ? `GPU ${mine.join(", ")}` : "all devices (unattributed)"));
+    k.append(tile("GPU power", fmtCompact(wattsV, 0), "W", gv.scope()));
   }
 
-  const gpuLabel = (gpu) => `GPU ${gpu.index}` +
-    (gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : "") +
-    (mine && !isMine(gpu.index) ? " (other engine)" : "");
-  let slot = 0;
-  const gpuColour = (gpu) => isMine(gpu.index) ? sc(slot++) : css("--deemph");
-
-  slot = 0;
   draw("vtemp", "p-vtemp", "l-vtemp",
-       tempChartSpec(g.gpus, g.t, gpuLabel, gpuColour, fmtTick));
+       tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   text($("n-vtemp"), hotV
     ? `hottest of this instance's cards: ${fmtTemp(hotV.temp)} on GPU ${hotV.index}`
     : (g.gpus.length ? "no readings yet" : "no samples yet"));
 
-  slot = 0;
   draw("vpower", "p-vpower", "l-vpower",
-       powerChartSpec(g.gpus, g.t, gpuLabel, gpuColour, fmtTick));
+       powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   text($("n-vpower"), wattsV === null ? "no readings yet"
-    : `${fmtWatts(wattsV)} across this instance's cards`);
+    : `${fmtWatts(wattsV)} across ${gv.known ? "this instance's cards" : "all devices"}`);
 
-  slot = 0;
   draw("vgpu", "p-vgpu", "l-vgpu", {
     type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
     fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
-    series: g.gpus.map((gpu) => ({ name: gpuLabel(gpu), values: gpu.util_pct,
-                                   color: gpuColour(gpu) })),
+    series: g.gpus.map((gpu) => ({ name: gv.label(gpu), values: gpu.util_pct,
+                                   color: gv.colour(gpu) })),
   });
-  text($("n-vgpu"), !g.gpus.length ? "no samples yet"
-    : mine ? `this instance holds GPU ${mine.join(", ")} of ${g.gpus.length}`
-           : `${g.gpus.length} device${g.gpus.length > 1 ? "s" : ""}; could not attribute`);
+  /* Names how attribution was reached and how stale it is, because a wrong
+     answer here used to be indistinguishable from a right one. */
+  text($("n-vgpu"), gv.note(inst.gpu_source)
+    + (inst.gpu_age_s > 300 ? ` · checked ${fmtAgo(inst.gpu_age_s)} ago` : ""));
 
-  slot = 0;
   draw("vvram", "p-vvram", "l-vvram", {
     type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
     fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
-    yMax: g.gpus.length ? Math.max(...g.gpus.map((x) => (x.mem_total || 0) / 1024)) : undefined,
+    yMax: gv.cards.length ? Math.max(...gv.cards.map((x) => (x.mem_total || 0) / 1024))
+                          : undefined,
     series: g.gpus.map((gpu) => ({
-      name: gpuLabel(gpu),
+      name: gv.label(gpu),
       values: gpu.mem_used.map((v) => v === null ? null : v / 1024),
-      color: gpuColour(gpu),
+      color: gv.colour(gpu),
     })),
   });
-  const totalMine = attributed.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
-  text($("n-vvram"), totalMine ? `${fmtCompact(totalMine, 0)} GiB across this instance's devices` : "");
+  const totalMine = gv.cards.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
+  text($("n-vvram"), totalMine
+    ? `${fmtCompact(totalMine, 0)} GiB across ${gv.known ? "this instance's devices" : "all devices"}`
+    : "");
 
   text($("v-hero"), fmtCompact(s.out_tok_per_s, 2));
   const hs = state.charts.vhero;

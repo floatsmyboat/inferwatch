@@ -40,7 +40,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .gpuproc import gpus_for_port, is_local, port_of
+from . import gpuproc
 
 log = logging.getLogger("inferwatch.vllm")
 
@@ -315,6 +315,11 @@ class VllmCollector:
         self.name = source_name
         self.url = (cfg.get("url") or "http://127.0.0.1:8000").rstrip("/")
         self.api_key = cfg.get("api_key") or ""
+        # The unit is the strongest attribution key available, and the settings
+        # screen already collects it (for reading the journal).  Point it at the
+        # unit that actually runs the ENGINE: with a proxy in front of vLLM the
+        # URL's listener is a different unit holding no GPUs at all.
+        self.unit = (cfg.get("unit") or "").strip()
         self.interval_getter = interval_getter
         self.on_live = on_live or (lambda x: None)
         self.prev: Snapshot | None = None
@@ -322,35 +327,41 @@ class VllmCollector:
         self.last: dict = {}
         self.errors = 0
         self.scrapes = 0
-        # Which GPUs this instance's processes hold.  Resolved by walking the
-        # process tree, which is not free, so it is refreshed on an interval and
-        # whenever the engine restarts (workers get new pids).
+        # Which GPUs this instance's processes hold, and how that was learned.
+        # Resolution reads /proc, which is not free, so it is refreshed on an
+        # interval and whenever the engine restarts (workers get new pids).
         self.gpu_indices: list[int] | None = None
+        self.gpu_source: str = "unavailable"
+        self.gpu_ts: float | None = None
         self._gpu_checked = 0.0
         self._gpu_for_engine_start: float | None = None
 
     GPU_RECHECK_S = 60.0
 
     def resolve_gpus(self, engine_start: float | None, now: float) -> list[int] | None:
-        """GPU indices for this instance, refreshed when stale or after a restart."""
+        """GPU indices for this instance, refreshed when stale or after a restart.
+
+        Re-resolved even when the last answer was a confident one, because the
+        old code only retried while `gpu_indices` was None: once it had an
+        answer it kept returning it, so a topology change was never noticed.
+        """
         fresh = (now - self._gpu_checked) < self.GPU_RECHECK_S
         same_engine = engine_start == self._gpu_for_engine_start
-        if fresh and same_engine and self.gpu_indices is not None:
+        if fresh and same_engine:
             return self.gpu_indices
         self._gpu_checked = now
         self._gpu_for_engine_start = engine_start
-        if not is_local(self.url):
-            self.gpu_indices = None      # a remote engine's GPUs are not ours
-            return None
-        port = port_of(self.url)
-        if port is None:
-            self.gpu_indices = None
-            return None
+        self.gpu_ts = now
+        # A configured unit can be attributed even for a remote URL, since the
+        # cgroup is read here rather than through the URL; only the port walk
+        # needs the engine to be local.
+        port = gpuproc.port_of(self.url) if gpuproc.is_local(self.url) else None
         try:
-            self.gpu_indices = gpus_for_port(port)
+            self.gpu_indices, self.gpu_source = gpuproc.resolve(
+                unit=self.unit or None, port=port)
         except Exception:
             log.debug("gpu attribution failed for %r", self.name, exc_info=True)
-            self.gpu_indices = None
+            self.gpu_indices, self.gpu_source = None, "unavailable"
         return self.gpu_indices
 
     # -- one scrape ------------------------------------------------------
@@ -469,11 +480,18 @@ class VllmCollector:
                 gpus = await loop.run_in_executor(
                     None, self.resolve_gpus, snap.engine_start, snap.ts)
                 live["gpu_indices"] = gpus
+                live["gpu_source"] = self.gpu_source
+                # gpu_known: this scrape reached the engine and genuinely
+                # looked, so its answer -- including "cannot attribute" -- is
+                # authoritative and may clear a stale one.
                 self.store.upsert_vllm_instance(
-                    self.name, last_seen=snap.ts, engine_start=snap.engine_start,
+                    self.name, gpu_known=True,
+                    last_seen=snap.ts, engine_start=snap.engine_start,
                     model=snap.model, reachable=1, error=None,
                     info_json=json.dumps(snap.info) if snap.info else None,
-                    gpu_indices=json.dumps(gpus) if gpus is not None else None)
+                    gpu_indices=json.dumps(gpus) if gpus is not None else None,
+                    gpu_source=self.gpu_source if gpus is not None else None,
+                    gpu_ts=self.gpu_ts if gpus is not None else None)
                 self.store.commit()
                 self.errors = 0
                 self.on_live({"type": "vllm", **live})
@@ -482,6 +500,8 @@ class VllmCollector:
                 if self.errors in (1, 5) or self.errors % 30 == 0:
                     log.warning("vllm source %r unreachable at %s: %s",
                                 self.name, self.url, e)
+                # gpu_known stays False: an unreachable scrape looked at
+                # nothing, so whatever was learned while it was up survives.
                 self.store.upsert_vllm_instance(
                     self.name, last_seen=time.time(), reachable=0, error=str(e)[:300])
                 self.store.commit()

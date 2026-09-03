@@ -56,6 +56,7 @@ import subprocess
 import time
 import urllib.request
 
+from . import gpuproc
 from .models import ModelIndex
 from .parse import parse_line
 
@@ -115,6 +116,13 @@ class Correlator:
         self.last_cache: dict | None = None
         # Load-time KV sizing, buffered until the load event it belongs to.
         self.pending_kv: dict = {}
+        # pid -> when it was last mentioned, for the llama-server processes
+        # ollama spawned.  Ollama logs `runner.pid` on its scheduler lines, so
+        # this is an exact GPU-attribution key that costs nothing to keep (it
+        # was parsed and discarded before).  A dead pid is harmless -- it simply
+        # will not appear among nvidia-smi's compute processes -- so entries are
+        # pruned by age rather than matched to an unload.
+        self.runner_pids: dict[int, float] = {}
 
     # -- public entry point --------------------------------------------------
 
@@ -355,9 +363,18 @@ class Correlator:
 
     # -- go lines ------------------------------------------------------------
 
+    RUNNER_PID_TTL_S = 3600.0
+
     def _on_go(self, ts: float, ev: dict) -> None:
         model = ev.get("model")
         blob = ev.get("blob")
+        pid = ev.get("runner_pid")
+        if pid:
+            self.runner_pids[pid] = ts
+            if len(self.runner_pids) > 8:
+                cutoff = ts - self.RUNNER_PID_TTL_S
+                self.runner_pids = {p: t for p, t in self.runner_pids.items()
+                                    if t >= cutoff} or {pid: ts}
         if model:
             self.recent_model = model
             if blob:
@@ -593,16 +610,54 @@ class GpuPoller:
 
 
 class PsPoller:
-    """Polls one ollama instance's /api/ps for resident models."""
+    """Polls one ollama instance's /api/ps, and attributes its GPUs.
+
+    Ollama had no GPU attribution at all: every card on the host was plotted on
+    its pane, and its tiles summed VRAM and watts across all of them -- so
+    another engine's memory and power were reported as ollama's.  That is the
+    exact thing `gpuproc` exists to prevent, and the vLLM pane already avoided
+    it, so the two panes disagreed about what their identical tiles meant.
+    """
+
+    GPU_RECHECK_S = 30.0
 
     def __init__(self, store, corr: Correlator, base_url: str, interval_getter,
-                 on_live=None):
+                 on_live=None, unit: str = ""):
         self.store = store
         self.corr = corr
         self.base_url = base_url
         self.interval_getter = interval_getter
         self.on_live = on_live or (lambda x: None)
+        self.unit = (unit or "").strip()
         self.last: dict = {}
+        self.gpu_indices: list[int] | None = None
+        self.gpu_source: str = "unavailable"
+        self.gpu_ts: float | None = None
+        self._gpu_checked = 0.0
+
+    def resolve_gpus(self, now: float) -> list[int] | None:
+        """Attribute ollama's GPUs, re-checked on an interval.
+
+        Re-resolved rather than cached once, because ollama's runners come and
+        go with keep-alive: a model unloading genuinely changes the answer to
+        "holds nothing", and that has to be able to propagate.
+        """
+        if now - self._gpu_checked < self.GPU_RECHECK_S:
+            return self.gpu_indices
+        self._gpu_checked = now
+        self.gpu_ts = now
+        # runner.pid from the log is exact where available; the unit's cgroup
+        # covers runners it never mentioned.
+        pids = sorted(self.corr.runner_pids) if self.corr else []
+        port = (gpuproc.port_of(self.base_url)
+                if gpuproc.is_local(self.base_url) else None)
+        try:
+            self.gpu_indices, self.gpu_source = gpuproc.resolve(
+                unit=self.unit or None, pids=pids, port=port)
+        except Exception:
+            log.debug("gpu attribution failed for ollama", exc_info=True)
+            self.gpu_indices, self.gpu_source = None, "unavailable"
+        return self.gpu_indices
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -613,7 +668,10 @@ class PsPoller:
                 inflight = self.corr.inflight if self.corr else 0
                 self.store.insert_ps_sample(ts, len(ps), ps, inflight)
                 self.store.commit()
-                self.last = {"ts": ts, "models": ps, "inflight": inflight}
+                await loop.run_in_executor(None, self.resolve_gpus, ts)
+                self.last = {"ts": ts, "models": ps, "inflight": inflight,
+                             "gpu_indices": self.gpu_indices,
+                             "gpu_source": self.gpu_source}
                 self.on_live({"type": "sample", **self.last})
             except asyncio.CancelledError:
                 raise

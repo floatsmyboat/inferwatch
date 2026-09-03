@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
 # (0.1s-30s), coarse in the tail.  Last bucket is the overflow (inf).
@@ -238,9 +238,17 @@ CREATE TABLE IF NOT EXISTS vllm_instances (
     error        TEXT,
     info_json    TEXT,
     -- GPU indices this instance's processes actually hold, as a JSON array.
-    -- NULL means attribution was not possible (remote instance, no `ss`, or
-    -- nvidia-smi cannot see the processes) -- which is different from "none".
-    gpu_indices  TEXT
+    -- NULL means attribution was not possible (remote instance, no cgroup
+    -- visibility, or nvidia-smi cannot be asked) -- which is different from
+    -- "[]", meaning asked and holding none.
+    gpu_indices  TEXT,
+    -- How that was resolved ("cgroup:vllm-qwen38.service", "port:8000", ...)
+    -- and when.  Both exist because a stale attribution used to be
+    -- indistinguishable from a current one: a failed resolution was COALESCEd
+    -- over the last good answer, so a topology change never propagated and the
+    -- UI kept presenting weeks-old indices as fact.
+    gpu_source   TEXT,
+    gpu_ts       REAL
 );
 
 CREATE TABLE IF NOT EXISTS rollup_1h (
@@ -381,6 +389,14 @@ class Store:
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(vllm_instances)")}
         if cols and "gpu_indices" not in cols:
             self.db.execute("ALTER TABLE vllm_instances ADD COLUMN gpu_indices TEXT")
+
+        # schema 6: how and when GPU attribution was resolved.
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(vllm_instances)")}
+        if cols:
+            for col, decl in (("gpu_source", "TEXT"), ("gpu_ts", "REAL")):
+                if col not in cols:
+                    self.db.execute(
+                        f"ALTER TABLE vllm_instances ADD COLUMN {col} {decl}")
 
         # schema 5: the slot KV capacity a request ran against.  Rows written
         # before it keep NULL, so live-KV occupancy is simply unavailable for
@@ -532,26 +548,48 @@ class Store:
                 " (ts,source,metric,model,bounds,counts,observations,sum_value)"
                 " VALUES (?,?,?,?,?,?,?,?)", rows)
 
-    def upsert_vllm_instance(self, source: str, **fields) -> None:
+    def upsert_vllm_instance(self, source: str, gpu_known: bool = False,
+                             **fields) -> None:
+        """Record one scrape's view of an instance.
+
+        `gpu_known` says whether this caller actually looked at the GPUs.  It
+        matters because the two failure modes need opposite handling:
+
+          * an unreachable scrape looked at nothing, so it must not wipe the
+            attribution learned while the engine was up (gpu_known=False, the
+            stored value is kept);
+          * a reachable scrape that tried and could not attribute has produced a
+            real answer -- "no longer knowable" -- and must be allowed to CLEAR
+            the old one (gpu_known=True).
+
+        Collapsing those was the bug: a topology change turned resolution into a
+        permanent NULL, every NULL was COALESCEd away, and the UI went on
+        displaying the indices from before the change.
+        """
         cols = ("last_seen", "engine_start", "model", "reachable", "error",
-                "info_json", "gpu_indices")
+                "info_json", "gpu_indices", "gpu_source", "gpu_ts")
         vals = {c: fields.get(c) for c in cols}
+        # Only an authoritative look may overwrite with NULL.
+        gpu_set = ("gpu_indices=excluded.gpu_indices,"
+                   " gpu_source=excluded.gpu_source, gpu_ts=excluded.gpu_ts"
+                   if gpu_known else
+                   "gpu_indices=COALESCE(excluded.gpu_indices, gpu_indices),"
+                   " gpu_source=COALESCE(excluded.gpu_source, gpu_source),"
+                   " gpu_ts=COALESCE(excluded.gpu_ts, gpu_ts)")
         with self.lock:
-            # A scrape that only reports unreachability must not wipe the model,
-            # engine start or GPU attribution learned when it was up, so each of
-            # those keeps its stored value when the new one is NULL.
             self.db.execute(
                 "INSERT INTO vllm_instances(source,last_seen,engine_start,model,"
-                "reachable,error,info_json,gpu_indices) VALUES(?,?,?,?,?,?,?,?)"
+                "reachable,error,info_json,gpu_indices,gpu_source,gpu_ts)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(source) DO UPDATE SET last_seen=excluded.last_seen,"
                 " engine_start=COALESCE(excluded.engine_start, engine_start),"
                 " model=COALESCE(excluded.model, model),"
                 " reachable=excluded.reachable, error=excluded.error,"
                 " info_json=COALESCE(excluded.info_json, info_json),"
-                " gpu_indices=COALESCE(excluded.gpu_indices, gpu_indices)",
+                f" {gpu_set}",
                 (source, vals["last_seen"], vals["engine_start"], vals["model"],
                  vals["reachable"], vals["error"], vals["info_json"],
-                 vals["gpu_indices"]))
+                 vals["gpu_indices"], vals["gpu_source"], vals["gpu_ts"]))
 
     # -- meta ----------------------------------------------------------------
 

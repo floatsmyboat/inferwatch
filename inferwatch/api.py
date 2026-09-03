@@ -90,6 +90,20 @@ class AppState:
         rt = self.supervisor.ollama_runtime() if self.supervisor else None
         return rt.corr if rt else None
 
+    def ollama_gpus(self) -> dict:
+        """Which GPUs the Ollama source holds, and how that was resolved.
+
+        `indices` is None for "could not attribute" and [] for "attributed, and
+        it holds none" -- the dashboard renders those differently, so they are
+        never collapsed into one another.
+        """
+        rt = self.supervisor.ollama_runtime() if self.supervisor else None
+        ps = getattr(rt, "ps", None) if rt else None
+        if ps is None:
+            return {"indices": None, "source": "unavailable", "ts": None}
+        return {"indices": ps.gpu_indices, "source": ps.gpu_source,
+                "ts": ps.gpu_ts}
+
 
 def _window(window: str) -> tuple[float, float]:
     try:
@@ -301,6 +315,8 @@ def create_app(state: AppState) -> FastAPI:
                 if state.config else False
 
         raw_cov = metrics.coverage(st, start)
+        # Read outside build(): it touches the live supervisor, not SQLite.
+        gpu_owned = state.ollama_gpus()
 
         def build():
             return {
@@ -326,6 +342,7 @@ def create_app(state: AppState) -> FastAPI:
                 "include_health": include_health,
                 "events": metrics.events(st, start, end, None, 40),
                 "gpu": metrics.gpu_series(st, start, end, step),
+                "gpu_owned": gpu_owned,
                 "cache": metrics.cache_summary(st, start, end),
                 "cache_series": metrics.cache_series(st, start, end, step),
                 "live": metrics.loaded_models(st),
@@ -414,7 +431,8 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/api/ps")
     async def ps():
-        return metrics.loaded_models(state.store)
+        return {**metrics.loaded_models(state.store),
+                "gpu_owned": state.ollama_gpus()}
 
     # ------------------------------------------------------------------- SSE
 

@@ -198,7 +198,7 @@ def finish_reasons(store, source: str, start: float, end: float) -> list[dict]:
 def instances(store) -> list[dict]:
     rows = store.query(
         "SELECT source,last_seen,engine_start,model,reachable,error,info_json,"
-        "gpu_indices FROM vllm_instances ORDER BY source")
+        "gpu_indices,gpu_source,gpu_ts FROM vllm_instances ORDER BY source")
     out = []
     for r in rows:
         d = dict(r)
@@ -207,6 +207,9 @@ def instances(store) -> list[dict]:
         # an empty list ("attributed, and it holds no GPU").
         raw = d.pop("gpu_indices", None)
         d["gpu_indices"] = _loads(raw, None) if raw else None
+        # How old the attribution is, so the UI can show it rather than implying
+        # every reading is current.
+        d["gpu_age_s"] = (time.time() - d["gpu_ts"]) if d.get("gpu_ts") else None
         d["reachable"] = bool(d["reachable"])
         d["stale_s"] = (time.time() - d["last_seen"]) if d["last_seen"] else None
         out.append(d)

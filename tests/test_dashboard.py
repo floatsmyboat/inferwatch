@@ -465,5 +465,111 @@ class TestClientMarkup(unittest.TestCase):
         self.assertNotIn('id="t-vclients"', vllm)
 
 
+class TestGpuView(unittest.TestCase):
+    """Both engine panes render GPU ownership through one helper."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import quickjs
+        except ImportError:
+            raise unittest.SkipTest("quickjs not installed")
+        js = script(read())
+        src = "\n".join(extract_function(js, n) for n in
+                         ("fmtCompact", "gpuView", "fmtAgo"))
+        # sc()/css() reach for the DOM; stub them with stable markers.
+        src = ("function sc(i) { return 'series-' + i; }\n"
+               "function css(v) { return v; }\n") + src
+        cls.ctx = quickjs.Context()
+        cls.ctx.eval(src)
+
+    def view(self, indices, n=4):
+        gpus = ", ".join('{"index":%d,"name":"NVIDIA RTX","mem_total":16311}' % i
+                         for i in range(n))
+        owned = "null" if indices is None else str(list(indices))
+        return f"gpuView([{gpus}], {owned})"
+
+    def js(self, expr):
+        return self.ctx.eval(expr)
+
+    def test_only_owned_cards_are_aggregated(self):
+        """The Ollama pane summed VRAM and watts across every card on the host,
+        so another engine's memory was reported as ollama's."""
+        self.assertEqual(self.js(self.view([2, 3]) + ".cards.length"), 2)
+        self.assertEqual(
+            self.js("JSON.stringify(" + self.view([2, 3]) + ".cards.map(c=>c.index))"),
+            "[2,3]")
+
+    def test_unknown_attribution_keeps_every_card(self):
+        """Null means could-not-tell. De-emphasising an arbitrary subset would
+        be a guess, so nothing is claimed and every card stays coloured."""
+        v = self.view(None)
+        self.assertEqual(self.js(v + ".cards.length"), 4)
+        self.assertFalse(self.js(v + ".known"))
+        self.assertEqual(self.js(v + ".scope()"), "all devices (unattributed)")
+
+    def test_an_engine_holding_nothing_is_distinct_from_unknown(self):
+        v = self.view([])
+        self.assertTrue(self.js(v + ".known"))
+        self.assertEqual(self.js(v + ".cards.length"), 0)
+        self.assertEqual(self.js(v + ".scope()"), "holds no GPU")
+
+    def test_foreign_cards_are_labelled_and_de_emphasised(self):
+        v = self.view([2, 3])
+        self.assertIn("(other engine)", self.js(v + ".label({index:0,name:'NVIDIA RTX'})"))
+        self.assertEqual(self.js(v + ".colour({index:0})"), "--deemph")
+        self.assertNotIn("(other engine)", self.js(v + ".label({index:2,name:'NVIDIA RTX'})"))
+
+    def test_a_card_keeps_one_colour_however_often_it_is_asked(self):
+        """Colours used to come from a counter incremented during rendering and
+        reset by hand before each draw, so one missed reset would recolour a
+        card between charts."""
+        v = self.view([1, 3])
+        first = self.js(v + ".colour({index:3})")
+        expr = ("(function(){const v=" + self.view([1, 3]) + ";"
+                "for(let i=0;i<5;i++){v.colour({index:1});v.colour({index:3});}"
+                "return v.colour({index:3});})()")
+        self.assertEqual(self.js(expr), first)
+
+    def test_owned_cards_take_the_series_palette_in_index_order(self):
+        v = self.view([1, 3])
+        self.assertEqual(self.js(v + ".colour({index:1})"), "series-0")
+        self.assertEqual(self.js(v + ".colour({index:3})"), "series-1")
+
+    def test_the_note_states_the_denominator_and_the_method(self):
+        self.assertEqual(self.js(self.view([2, 3]) + '.note("cgroup:vllm-qwen38.service")'),
+                         "holds GPU 2, 3 of 4 \u00b7 via cgroup:vllm-qwen38.service")
+        self.assertEqual(self.js(self.view([]) + '.note("cgroup:x")'),
+                         "holds none of the 4 devices \u00b7 via cgroup:x")
+        self.assertEqual(self.js(self.view(None) + '.note("unavailable")'),
+                         "4 devices; could not attribute")
+
+    def test_no_samples_says_so_rather_than_claiming_zero_cards(self):
+        self.assertEqual(self.js("gpuView([], [1]).note('cgroup:x')"), "no samples yet")
+
+    def test_age_is_rendered_compactly(self):
+        for secs, want in ((5, "5s"), (600, "10m"), (7200, "2h"), (200000, "2d")):
+            self.assertEqual(self.js(f"fmtAgo({secs})"), want)
+        self.assertEqual(self.js("fmtAgo(null)"), "\u2014")
+
+
+class TestGpuMarkupSymmetry(unittest.TestCase):
+    def test_both_panes_go_through_the_shared_view(self):
+        js = script(read())
+        self.assertGreaterEqual(js.count("gpuView("), 3,
+                                "expected the helper plus one call per pane")
+
+    def test_neither_pane_aggregates_the_raw_host_list(self):
+        """Regression: hottest()/totalPower()/latestGpu() over d.gpu.gpus
+        attributed every card on the box to whichever engine was on screen."""
+        js = script(read())
+        for banned in ("hottest(d.gpu && d.gpu.gpus)", "totalPower(d.gpu && d.gpu.gpus)",
+                       "latestGpu()"):
+            self.assertNotIn(banned, js, banned)
+
+    def test_the_hand_reset_colour_counter_is_gone(self):
+        self.assertNotIn("slot = 0;\n  draw(", script(read()))
+
+
 if __name__ == "__main__":
     unittest.main()

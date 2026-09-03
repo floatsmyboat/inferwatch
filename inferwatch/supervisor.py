@@ -69,6 +69,9 @@ class SourceRuntime:
             d["ps"] = {"ts": last.get("ts"), "url": self.ps.base_url,
                        "loaded_count": len(last.get("models") or []),
                        "models": [m.get("name") for m in (last.get("models") or [])]}
+            d["gpu_indices"] = self.ps.gpu_indices
+            d["gpu_source"] = self.ps.gpu_source
+            d["gpu_ts"] = self.ps.gpu_ts
         if self.vllm is not None:
             d["url"] = self.vllm.url
             d["scrapes"] = self.vllm.scrapes
@@ -203,7 +206,11 @@ class Supervisor:
                              cfg.get("url") or "http://127.0.0.1:11434",
                              interval_getter=lambda: self.config.get(
                                  "collection.poll_interval_s"),
-                             on_live=self.hub.publish)
+                             on_live=self.hub.publish,
+                             # Only meaningful for a journald source; the file
+                             # and docker readers have no unit to attribute by,
+                             # and resolve() falls through to the other methods.
+                             unit=cfg.get("unit") or "")
             rt.tasks = [
                 asyncio.create_task(rt.reader.run(on_line, on_flush),
                                     name=f"reader:{spec['name']}"),
