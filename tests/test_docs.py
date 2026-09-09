@@ -42,9 +42,22 @@ class TestConfigReference(unittest.TestCase):
             self.assertTrue(s.help.strip(), f"{s.key} has no help text")
 
     def test_regenerating_is_idempotent(self):
+        """Regenerating a current README must not change it.
+
+        The original is restored afterwards. Without that this test WRITES to
+        the repo, so a genuinely stale README fails once and then silently
+        passes forever after -- which is what happened when the SwarmUI source
+        kind was added: two real failures healed themselves on the next run.
+        """
         before = readme()
-        subprocess.run([sys.executable, GENERATOR], capture_output=True, cwd=ROOT)
-        self.assertEqual(readme(), before)
+        try:
+            subprocess.run([sys.executable, GENERATOR], capture_output=True, cwd=ROOT)
+            after = readme()
+        finally:
+            if readme() != before:
+                with open(README, "w", encoding="utf-8") as fh:
+                    fh.write(before)
+        self.assertEqual(after, before)
 
 
 class TestReadmeCoversTheBasics(unittest.TestCase):

@@ -24,6 +24,7 @@ import asyncio
 import logging
 
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
+from .images import ImagesPoller, SwarmLogCollector
 from .models import ModelIndex
 from .readers import build_reader
 from .vllm import VllmCollector
@@ -41,6 +42,8 @@ class SourceRuntime:
         self.corr: Correlator | None = None
         self.vllm: VllmCollector | None = None
         self.ps: PsPoller | None = None
+        self.images: ImagesPoller | None = None
+        self.swarm_log: SwarmLogCollector | None = None
 
     @property
     def name(self) -> str:
@@ -72,6 +75,18 @@ class SourceRuntime:
             d["gpu_indices"] = self.ps.gpu_indices
             d["gpu_source"] = self.ps.gpu_source
             d["gpu_ts"] = self.ps.gpu_ts
+        if self.images is not None:
+            d["url"] = self.images.url
+            d["polls"] = self.images.polls
+            d["consecutive_errors"] = self.images.errors
+            d["backends"] = [
+                {k: b.get(k) for k in ("backend", "url", "status", "queue_pending",
+                                       "gpu_indices", "gpu_source", "version")}
+                for b in (self.images.last or {}).get("backends", [])]
+        if self.swarm_log is not None:
+            d["backend_ports"] = dict(self.swarm_log.backend_ports)
+            d["swarm_version"] = self.swarm_log.version
+            d["stats"] = dict(self.swarm_log.stats)
         if self.vllm is not None:
             d["url"] = self.vllm.url
             d["scrapes"] = self.vllm.scrapes
@@ -217,6 +232,50 @@ class Supervisor:
                 asyncio.create_task(rt.ps.run(), name=f"ps:{spec['name']}"),
             ]
             log.info("source %r started (%s)", spec["name"], rt.reader.describe())
+        elif spec["kind"] == "swarmui":
+            store = self.store
+            name = spec["name"]
+            if (cfg.get("reader") or "journald") != "none":
+                rt.swarm_log = SwarmLogCollector(
+                    name, on_event=self.store.insert_image_event)
+
+                def on_line(ts, msg, lc=rt.swarm_log):
+                    lc.feed(ts, msg)
+
+                def on_flush(now, store=store):
+                    store.commit()
+            else:
+                def on_line(ts, msg):
+                    return None
+
+                def on_flush(now):
+                    return None
+
+            def resume_ts(store=store, name=name):
+                """Where this source's own timeline left off.
+
+                Its own events, not the ollama request table: resuming a
+                SwarmUI source from another engine's newest row would skip
+                whatever happened in between.
+                """
+                row = store.query(
+                    "SELECT MAX(ts) t FROM image_events WHERE source = ?", (name,))
+                return row[0]["t"] if row and row[0]["t"] else None
+
+            rt.reader = build_reader(self.store, name, cfg,
+                                     backfill=self.config.get("collection.backfill"),
+                                     resume_ts=resume_ts)
+            rt.images = ImagesPoller(
+                self.store, name, cfg,
+                interval_getter=lambda: self.config.get("collection.poll_interval_s"),
+                on_live=self.hub.publish, log_collector=rt.swarm_log)
+            rt.tasks = [
+                asyncio.create_task(rt.reader.run(on_line, on_flush),
+                                    name=f"reader:{name}"),
+                asyncio.create_task(rt.images.run(), name=f"images:{name}"),
+            ]
+            log.info("source %r started (swarmui %s, %s)", name, rt.images.url,
+                     rt.reader.describe())
         elif spec["kind"] == "vllm":
             rt.vllm = VllmCollector(
                 self.store, spec["name"], cfg,
@@ -246,7 +305,12 @@ class Supervisor:
                                    if rt.kind == "ollama"), None),
             "vllm_sources": [rt.name for rt in self.runtimes.values()
                              if rt.kind == "vllm"],
+            "image_sources": [rt.name for rt in self.runtimes.values()
+                              if rt.kind == "swarmui"],
         }
+
+    def image_runtimes(self) -> list[SourceRuntime]:
+        return [rt for rt in self.runtimes.values() if rt.kind == "swarmui"]
 
     def ollama_runtime(self) -> SourceRuntime | None:
         return next((rt for rt in self.runtimes.values() if rt.kind == "ollama"), None)

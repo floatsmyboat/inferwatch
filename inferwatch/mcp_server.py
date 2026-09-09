@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import metrics, vllm_metrics
+from . import image_metrics, metrics, vllm_metrics
 from .store import Store
 
 from .main import default_db, env
@@ -34,6 +34,11 @@ srv = MCPServer(
     instructions=(
         "Metrics for locally served LLMs. Two engines, deliberately different "
         "tool sets, because they expose different things:\n\n"
+        "IMAGE GENERATION (tools prefixed image_) covers SwarmUI and its ComfyUI "
+        "backends, a third engine family with no tokens, no TTFT and no context "
+        "window -- its unit of work is a generation with a duration, the models "
+        "the workflow loaded, and a node that may have thrown. Durations there "
+        "are exact.\n\n"
         "OLLAMA (tools without a prefix) is reconstructed from its debug log, so "
         "PER-REQUEST detail exists: time-to-first-token, token counts, client "
         "address, HTTP status, queue wait, prompt-cache reuse, model load times. "
@@ -416,7 +421,8 @@ def health() -> dict:
     row = st.query("SELECT COUNT(*) n, MIN(ts) first, MAX(ts) last FROM requests")[0]
     counts = {}
     for table in ("requests", "events", "gpu_samples", "ps_samples",
-                  "ollama_cache_samples", "rollup_1m", "rollup_1h"):
+                  "ollama_cache_samples", "image_generations", "image_events",
+                  "rollup_1m", "rollup_1h"):
         counts[table] = st.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
     out: dict[str, Any] = {
         "db_path": st.path,
@@ -432,6 +438,118 @@ def health() -> dict:
                           "ollama since collection began, or the collector is "
                           "not running.")
     return out
+
+
+def _image_source(source: str | None) -> str | None:
+    if source:
+        return source
+    known = image_metrics.sources(store())
+    return known[0]["source"] if known else None
+
+
+@srv.tool(
+    title="Get image generation summary",
+    description="SwarmUI / ComfyUI activity over a window: how many images were "
+                "generated, how long they took, what share failed and on which "
+                "node, which models were used, and the queue depth behind them. "
+                "Durations here are EXACT -- ComfyUI timestamps every execution "
+                "event, so no histogram estimate is involved.",
+)
+def image_summary(source: str | None = None, window: str = "24h") -> dict:
+    """Summarise image generation over a window.
+
+    Args:
+        source: Image source name; the only configured one is used by default.
+        window: Relative duration to search.
+    """
+    st = store()
+    src = _image_source(source)
+    if src is None:
+        return {"warning": "no SwarmUI/ComfyUI source has reported yet",
+                "sources": []}
+    start, end = _win(window)
+    cov = image_metrics.coverage(st, start)
+    out: dict[str, Any] = {
+        "window": window, "source": src,
+        "summary": image_metrics.summary(st, src, start, end),
+        "models": image_metrics.by_model(st, src, start, end),
+        "backends": image_metrics.backends(st, src),
+        "complete": cov["complete"], "covers_from": _when(cov["covers_from"]),
+        "notes": [
+            "Generations are counted from ComfyUI's /history, which is the only "
+            "source with a stable id for one. The SwarmUI log is a separate "
+            "timeline and never a second count, so `swarm_timing` describes the "
+            "same work from the orchestrator's side rather than more of it.",
+            "prep_ms is queueing plus model load and gen_ms is the sampling; a "
+            "generation that got slower in prep is a different problem from one "
+            "that got slower in gen.",
+        ],
+    }
+    if not cov["complete"]:
+        out["warning"] = (
+            f"this window starts before the oldest stored generation "
+            f"({out['covers_from'] or 'none stored'}); image rows have no rollup "
+            f"fallback, so the earlier part is simply not stored.")
+    return out
+
+
+@srv.tool(
+    title="Get image generation failures",
+    description="Everything that went wrong in SwarmUI / ComfyUI over a window: "
+                "generations that threw (with the failing node, its class and "
+                "the exception), API calls that never reached a backend, and the "
+                "Python stderr behind them. Also ranks which node class fails "
+                "most, which usually points at the workflow rather than the box.",
+)
+def image_failures(source: str | None = None, window: str = "24h",
+                   limit: int = 30) -> dict:
+    """List image generation failures and their causes.
+
+    Args:
+        source: Image source name; the only configured one is used by default.
+        window: Relative duration to search.
+        limit: Maximum rows of each kind to return.
+    """
+    st = store()
+    src = _image_source(source)
+    if src is None:
+        return {"warning": "no SwarmUI/ComfyUI source has reported yet"}
+    start, end = _win(window)
+    f = image_metrics.failures(st, src, start, end, min(limit, 200))
+    f["generation_errors"] = _humanise(f["generation_errors"])
+    f["log_errors"] = _humanise(f["log_errors"])
+    f["window"] = window
+    f["source"] = src
+    f["notes"] = ("generation_errors failed inside ComfyUI and carry the node "
+                  "that raised; log_errors come from SwarmUI and include calls "
+                  "that never reached a backend. They are different problems, "
+                  "so they are not merged.")
+    return f
+
+
+@srv.tool(
+    title="List image generations",
+    description="Recent SwarmUI / ComfyUI generations with their model, "
+                "duration, status and every model the workflow loaded.",
+)
+def image_generations(source: str | None = None, window: str = "24h",
+                      limit: int = 40) -> dict:
+    """List recent image generations.
+
+    Args:
+        source: Image source name; the only configured one is used by default.
+        window: Relative duration to search.
+        limit: Maximum rows to return.
+    """
+    st = store()
+    src = _image_source(source)
+    if src is None:
+        return {"warning": "no SwarmUI/ComfyUI source has reported yet"}
+    start, end = _win(window)
+    rows = image_metrics.recent_generations(st, src, start, end, min(limit, 200))
+    return {"window": window, "source": src, "count": len(rows),
+            "generations": _humanise(rows),
+            **image_metrics.coverage(st, start)}
 
 
 @srv.tool(

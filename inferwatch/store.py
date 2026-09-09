@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
 # (0.1s-30s), coarse in the tail.  Last bucket is the overflow (inf).
@@ -128,6 +128,84 @@ CREATE TABLE IF NOT EXISTS ollama_cache_samples (
     ckpt_created     INTEGER,
     saves            INTEGER
 ) WITHOUT ROWID;
+
+-- ----------------------------------------------------------------------
+-- Image generation (SwarmUI / ComfyUI).
+--
+-- A third engine family with a genuinely different unit of work: there are no
+-- tokens, no TTFT and no context window, so none of it belongs in `requests`.
+-- What it has instead is a generation with a duration, a set of models the
+-- workflow loaded, and a node that may have thrown.
+--
+-- Generations are counted ONCE, from ComfyUI's /history, because that is the
+-- only source with a stable identity for them (`prompt_id`), node-level error
+-- detail, and the model names read out of the workflow graph.  The SwarmUI
+-- journal describes the same work from the orchestrator's side, but joining
+-- the two would mean guessing which log line goes with which prompt_id -- so
+-- it feeds `image_events` instead, as a timeline, and is never a second count.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS image_generations (
+    source        TEXT NOT NULL,
+    prompt_id     TEXT NOT NULL,   -- ComfyUI's uuid: the identity
+    ts            REAL NOT NULL,   -- when it finished (or last was heard of)
+    started_ts    REAL,
+    status        TEXT,            -- success | error | running
+    total_ms      REAL,
+    model         TEXT,            -- primary checkpoint, for grouping
+    models_json   TEXT,            -- every model the graph loaded, by node role
+    node_count    INTEGER,
+    cached_nodes  INTEGER,         -- nodes skipped because their result was cached
+    error_node    TEXT,
+    error_type    TEXT,            -- the node class that raised
+    error_message TEXT,
+    PRIMARY KEY (source, prompt_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_imggen_ts    ON image_generations(ts);
+CREATE INDEX IF NOT EXISTS idx_imggen_model ON image_generations(model, ts);
+
+-- Polled gauges: one row per backend per tick, plus one for the orchestrator
+-- itself (backend '').  Queue depth is the number that explains a slow
+-- generation that was not actually slow to generate.
+CREATE TABLE IF NOT EXISTS image_samples (
+    ts               REAL NOT NULL,
+    source           TEXT NOT NULL,
+    backend          TEXT NOT NULL DEFAULT '',   -- '' is the SwarmUI-level row
+    status           TEXT,
+    queue_running    INTEGER,
+    queue_pending    INTEGER,
+    live_gens        INTEGER,     -- SwarmUI's own view of in-flight work
+    waiting_gens     INTEGER,
+    loading_models   INTEGER,
+    vram_total       INTEGER,     -- bytes, as the backend reports them
+    vram_free        INTEGER,
+    torch_vram_total INTEGER,
+    torch_vram_free  INTEGER,
+    gpu_indices      TEXT,        -- JSON array; NULL when not attributable
+    PRIMARY KEY (ts, source, backend)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_imgsample ON image_samples(source, backend, ts);
+
+-- The SwarmUI journal's timeline: request/finish lines with the prep-vs-gen
+-- split, WebAPI failures that never reached a backend, backend lifecycle, and
+-- the Python stderr behind a failed generation.
+CREATE TABLE IF NOT EXISTS image_events (
+    id            INTEGER PRIMARY KEY,
+    ts            REAL NOT NULL,
+    source        TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    level         TEXT,
+    backend_index INTEGER,
+    model         TEXT,
+    user          TEXT,
+    route         TEXT,
+    prep_ms       REAL,        -- SwarmUI only: queue + model load
+    gen_ms        REAL,        -- SwarmUI only: the sampling itself
+    msg           TEXT,
+    detail_json   TEXT,
+    dedupe_key    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_imgev_ts   ON image_events(ts);
+CREATE INDEX IF NOT EXISTS idx_imgev_kind ON image_events(kind, ts);
 
 -- Model load/unload/warning/error timeline.
 CREATE TABLE IF NOT EXISTS events (
@@ -298,6 +376,17 @@ def request_key(r: dict) -> str:
                      "latency_ms", "task_id"))
 
 
+def image_event_key(e: dict) -> str:
+    """Stable identity for a SwarmUI log event.
+
+    Includes the message because several of these repeat verbatim within a
+    second (four identical WebAPI errors in the same millisecond appear in this
+    host's history), and the timestamp alone would collapse them.
+    """
+    return "|".join(_f(e.get(k)) for k in
+                    ("ts", "source", "kind", "backend_index", "msg", "route"))
+
+
 def event_key(e: dict) -> str:
     return "|".join(_f(e.get(k)) for k in ("ts", "kind", "model", "msg", "duration_ms"))
 
@@ -423,6 +512,9 @@ class Store:
             self.db.execute(
                 f"DELETE FROM {table} WHERE id NOT IN"
                 f" (SELECT MIN(id) FROM {table} GROUP BY dedupe_key)")
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_imgev_dedupe"
+            " ON image_events(dedupe_key)")
         self.db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_req_dedupe ON requests(dedupe_key)")
         self.db.execute(
@@ -651,6 +743,54 @@ class Store:
                 f" VALUES ({placeholders})",
                 tuple(row.get(c) for c in self.CACHE_COLS))
 
+    # -- image generation ----------------------------------------------------
+
+    GEN_COLS = ("source", "prompt_id", "ts", "started_ts", "status", "total_ms",
+                "model", "models_json", "node_count", "cached_nodes",
+                "error_node", "error_type", "error_message")
+
+    def insert_image_generation(self, row: dict) -> None:
+        """One generation, keyed by (source, prompt_id).
+
+        REPLACE rather than IGNORE: a generation seen while still running is
+        re-polled once it finishes, and the finished view supersedes it.
+        """
+        cols = ",".join(self.GEN_COLS)
+        placeholders = ",".join("?" * len(self.GEN_COLS))
+        with self.lock:
+            self.db.execute(
+                f"INSERT OR REPLACE INTO image_generations ({cols})"
+                f" VALUES ({placeholders})",
+                tuple(row.get(c) for c in self.GEN_COLS))
+
+    SAMPLE_COLS = ("ts", "source", "backend", "status", "queue_running",
+                   "queue_pending", "live_gens", "waiting_gens", "loading_models",
+                   "vram_total", "vram_free", "torch_vram_total", "torch_vram_free",
+                   "gpu_indices")
+
+    def insert_image_sample(self, row: dict) -> None:
+        cols = ",".join(self.SAMPLE_COLS)
+        placeholders = ",".join("?" * len(self.SAMPLE_COLS))
+        with self.lock:
+            self.db.execute(
+                f"INSERT OR REPLACE INTO image_samples ({cols})"
+                f" VALUES ({placeholders})",
+                tuple(row.get(c, "" if c == "backend" else None)
+                      for c in self.SAMPLE_COLS))
+
+    def insert_image_event(self, e: dict) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO image_events"
+                " (ts,source,kind,level,backend_index,model,user,route,prep_ms,"
+                "  gen_ms,msg,detail_json,dedupe_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (e.get("ts"), e.get("source"), e.get("kind"), e.get("level"),
+                 e.get("backend_index"), e.get("model"), e.get("user"),
+                 e.get("route"), e.get("prep_ms"), e.get("gen_ms"), e.get("msg"),
+                 json.dumps(e["detail"]) if e.get("detail") else None,
+                 image_event_key(e)))
+
     def insert_gpu_samples(self, ts: float, gpus: list[dict]) -> None:
         with self.lock:
             self.db.executemany(
@@ -761,13 +901,24 @@ class Store:
             n_ps = self.db.execute("DELETE FROM ps_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_cache = self.db.execute("DELETE FROM ollama_cache_samples WHERE ts < ?",
                                       (samp_cut,)).rowcount
+            # Generations are the image equivalent of a request row, so they
+            # follow raw retention; the gauges and the log timeline follow the
+            # sample retention like every other polled series.
+            n_ig = self.db.execute("DELETE FROM image_generations WHERE ts < ?",
+                                   (raw_cut,)).rowcount
+            n_is = self.db.execute("DELETE FROM image_samples WHERE ts < ?",
+                                   (samp_cut,)).rowcount
+            n_ie = self.db.execute("DELETE FROM image_events WHERE ts < ?",
+                                   (samp_cut,)).rowcount
             n_ev = self.db.execute("DELETE FROM events WHERE ts < ?", (samp_cut,)).rowcount
             n_vs = self.db.execute("DELETE FROM vllm_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_vh = self.db.execute("DELETE FROM vllm_hist WHERE ts < ?", (samp_cut,)).rowcount
             self.db.commit()
         return {"requests": n_req, "gpu_samples": n_gpu, "ps_samples": n_ps,
                 "ollama_cache_samples": n_cache, "events": n_ev,
-                "vllm_samples": n_vs, "vllm_hist": n_vh}
+                "vllm_samples": n_vs, "vllm_hist": n_vh,
+                "image_generations": n_ig, "image_samples": n_is,
+                "image_events": n_ie}
 
     # -- reads ---------------------------------------------------------------
 

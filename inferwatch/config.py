@@ -157,6 +157,12 @@ BY_KEY = {s.key: s for s in SPEC}
 # --------------------------------------------------------------------------
 
 OLLAMA_READERS = ["journald", "file", "docker"]
+# SwarmUI can be monitored over HTTP alone, so its log is optional in a way
+# ollama's is not -- ollama has no metrics endpoint at all, while SwarmUI and
+# ComfyUI expose queue depth, VRAM and the generations themselves over their
+# APIs.  Reading the journal adds the prep/gen timing split and the backend
+# stderr behind a failure.
+SWARM_READERS = ["journald", "file", "docker", "none"]
 
 SOURCE_KINDS = {
     "ollama": {
@@ -182,6 +188,42 @@ SOURCE_KINDS = {
             {"key": "models_dir", "label": "Models directory", "type": "str", "default": "",
              "help": "Optional. Resolves blob digests to model names on load events. "
                      "Defaults to $OLLAMA_MODELS or ~/.ollama/models."},
+        ],
+    },
+    "swarmui": {
+        "label": "SwarmUI / ComfyUI",
+        "fields": [
+            {"key": "url", "label": "SwarmUI base URL", "type": "str",
+             "default": "http://127.0.0.1:7801",
+             "help": "Polled for queue depth and backend health. Its API needs "
+                     "no key for a local install."},
+            {"key": "reader", "label": "Log source", "type": "enum",
+             "choices": SWARM_READERS, "default": "journald",
+             "help": "Optional, unlike ollama's. Adds SwarmUI's prep-vs-gen "
+                     "timing split, WebAPI failures that never reached a "
+                     "backend, and the Python stderr behind a failed "
+                     "generation. 'none' polls the APIs only."},
+            {"key": "unit", "label": "systemd unit", "type": "str",
+             "default": "swarmui", "when": {"reader": "journald"},
+             "help": "Also the fallback for GPU attribution, though each "
+                     "self-started ComfyUI is usually resolved exactly by its "
+                     "own port."},
+            {"key": "path", "label": "Log file path", "type": "str", "default": "",
+             "when": {"reader": "file"},
+             "help": "SwarmUI's own rotated logs under Data/Logs work here."},
+            {"key": "container", "label": "Container name or id", "type": "str",
+             "default": "", "when": {"reader": "docker"}},
+            {"key": "backends", "label": "ComfyUI backend URLs", "type": "str",
+             "default": "",
+             "help": "Optional, comma separated. Leave empty and the backend "
+                     "ports are discovered from the log, which is the only "
+                     "place SwarmUI publishes them. Required when the reader "
+                     "is 'none'."},
+            {"key": "history_limit", "label": "Generations per poll", "type": "str",
+             "default": "64",
+             "help": "How many /history entries to read each tick. ComfyUI "
+                     "keeps this in memory only, so a larger number costs "
+                     "little and survives a burst between polls."},
         ],
     },
     "vllm": {
@@ -233,6 +275,24 @@ def validate_source(kind: str, name: str, cfg: dict) -> dict:
             raise ValueError(f"reader '{reader}' requires '{required}' to be set")
     if kind == "vllm" and not out.get("url"):
         raise ValueError("a vLLM source needs a base URL")
+    if kind == "swarmui":
+        if not out.get("url"):
+            raise ValueError("a SwarmUI source needs a base URL")
+        reader = out.get("reader") or "journald"
+        required = {"journald": "unit", "file": "path", "docker": "container"}.get(reader)
+        if required and not out.get(required):
+            raise ValueError(f"reader '{reader}' requires '{required}' to be set")
+        # With no log there is nothing to discover the backend ports from, so
+        # they have to be given -- otherwise the source would silently collect
+        # queue depth and no generations at all.
+        if reader == "none" and not out.get("backends"):
+            raise ValueError(
+                "reader 'none' requires 'backends' (comma-separated ComfyUI "
+                "URLs); the backend ports are otherwise only discoverable from "
+                "the log")
+        limit = str(out.get("history_limit") or "64")
+        if not limit.isdigit() or not (1 <= int(limit) <= 1000):
+            raise ValueError("history_limit must be a whole number from 1 to 1000")
     return out
 
 

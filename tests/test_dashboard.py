@@ -571,5 +571,109 @@ class TestGpuMarkupSymmetry(unittest.TestCase):
         self.assertNotIn("slot = 0;\n  draw(", script(read()))
 
 
+class TestImagesTab(unittest.TestCase):
+    def setUp(self):
+        self.html = read()
+        self.js = script(self.html)
+
+    def test_the_tab_exists_and_is_reachable(self):
+        self.assertIn('data-tab="images"', self.html)
+        self.assertIn('id="tab-images"', self.html)
+        self.assertIn('"images"', self.js)
+
+    def test_the_tab_ships_hidden(self):
+        """Only the first tab may be visible initially, or every panel renders
+        at once on load."""
+        section = self.html[self.html.index('id="tab-images"'):]
+        self.assertTrue(section[:120].strip().startswith('id="tab-images" hidden'))
+
+    def test_it_is_switchable_and_refreshable(self):
+        self.assertIn('"ollama", "vllm", "images", "settings"', self.js)
+        self.assertIn("refreshImages()", self.js)
+
+    def test_no_token_panels_leaked_in(self):
+        """Image generation has no tokens, TTFT or context; a tile borrowed
+        from the token engines would read as permanently blank."""
+        section = self.html[self.html.index('id="tab-images"'):
+                            self.html.index('id="tab-vllm"')]
+        for wrong in ("Time to first token", "tok/s", "Prompt cache", "TTFT"):
+            self.assertNotIn(wrong, section, wrong)
+
+    def test_it_says_where_the_numbers_come_from(self):
+        section = self.html[self.html.index('id="tab-images"'):
+                            self.html.index('id="tab-vllm"')]
+        self.assertIn("ComfyUI's history", section)
+        self.assertIn("never a second count", section)
+
+    def test_failures_use_the_status_colour_not_a_series_hue(self):
+        """Status colours are reserved: they mean a state, not an identity."""
+        i = self.js.index('draw("ifail"')
+        self.assertIn('css("--critical")', self.js[i:i + 400])
+
+    def test_queue_and_vram_are_not_on_one_axis(self):
+        """Two measures of different scale get two charts, never a second
+        y-axis."""
+        self.assertIn('draw("iqueue"', self.js)
+        self.assertIn('draw("ivram"', self.js)
+        i = self.js.index('draw("iqueue"')
+        spec = self.js[i:self.js.index('draw(', i + 5)]     # this call only
+        self.assertNotIn("vram", spec.lower())
+        self.assertIn("queue_pending", spec)
+
+
+class TestImagesHelpers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import quickjs
+        except ImportError:
+            raise unittest.SkipTest("quickjs not installed")
+        js = script(read())
+        src = "\n".join(extract_function(js, n) for n in
+                         ("fmtCompact", "shortModel", "firstLine", "extraModels"))
+        cls.ctx = quickjs.Context()
+        cls.ctx.eval(src)
+
+    def js(self, expr):
+        return self.ctx.eval(expr)
+
+    def test_a_checkpoint_is_shown_without_its_folder_or_suffix(self):
+        self.assertEqual(
+            self.js("shortModel('OfficialStableDiffusion/sd3.5_large_fp8_scaled.safetensors')"),
+            "sd3.5_large_fp8_scaled")
+        self.assertEqual(self.js("shortModel('flux.gguf')"), "flux")
+
+    def test_a_missing_model_is_a_dash(self):
+        self.assertEqual(self.js("shortModel(null)"), "\u2014")
+        self.assertEqual(self.js("shortModel('')"), "\u2014")
+
+    def test_an_exception_shows_its_first_line(self):
+        self.assertEqual(
+            self.js(r"firstLine('RuntimeError: bad clip\n\nIf the clip is from a checkpoint')"),
+            "RuntimeError: bad clip")
+
+    def test_a_very_long_line_is_clipped_with_an_ellipsis(self):
+        got = self.js("firstLine('%s')" % ("z" * 400))
+        self.assertLessEqual(len(got), 160)
+        self.assertGreater(len(got), 100, "clipped so hard it says nothing")
+        self.assertTrue(got.endswith("\u2026"))
+
+    def test_extra_models_exclude_the_primary(self):
+        models = ('[{"name":"Flux/flux.safetensors"},{"name":"lora/detail.safetensors"},'
+                  '{"name":"vae/ae.sft"}]')
+        self.assertEqual(self.js(f"extraModels({models}, 'Flux/flux.safetensors')"),
+                         "detail, ae")
+
+    def test_extra_models_are_summarised_not_truncated_silently(self):
+        models = "[" + ",".join('{"name":"m%d.safetensors"}' % i for i in range(6)) + "]"
+        got = self.js(f"extraModels({models}, null)")
+        self.assertTrue(got.endswith("+3"), got)
+
+    def test_a_workflow_with_only_a_checkpoint_shows_a_dash(self):
+        self.assertEqual(
+            self.js("extraModels([{\"name\":\"a.safetensors\"}], 'a.safetensors')"),
+            "\u2014")
+
+
 if __name__ == "__main__":
     unittest.main()

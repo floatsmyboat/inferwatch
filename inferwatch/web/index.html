@@ -291,6 +291,7 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
   <nav class="tabs" id="tabs" role="tablist">
     <button role="tab" data-tab="ollama" aria-selected="true">Ollama</button>
     <button role="tab" data-tab="vllm" aria-selected="false">vLLM</button>
+    <button role="tab" data-tab="images" aria-selected="false">Images</button>
     <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
   </nav>
 
@@ -311,6 +312,9 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     </label>
     <label class="inline" id="vsource-wrap" hidden>Instance
       <select id="vsource"></select>
+    </label>
+    <label class="inline" id="isource-wrap" hidden>Instance
+      <select id="isource"></select>
     </label>
     <div class="spacer"></div>
     <label class="inline"><input type="checkbox" id="autorefresh" checked> Auto-refresh</label>
@@ -454,6 +458,106 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     <div class="card"><header><h2>Recent requests</h2><span class="note" id="n-reqs"></span></header>
       <div class="tbl-wrap" id="t-requests"></div></div>
   </div>
+  </section>
+
+  <!-- ================================================================
+       Images tab (SwarmUI / ComfyUI).  A third engine family with a
+       different unit of work: no tokens, no TTFT, no context window.  What
+       it has is a generation with a duration, the models a workflow loaded,
+       and a node that may have thrown -- so the panels are about throughput,
+       how long a picture takes, and what failed, not about tokens.
+       ================================================================ -->
+  <section id="tab-images" hidden>
+    <div class="banner show" id="images-note" style="border-left-color:var(--series-3)">
+      <span class="ico" aria-hidden="true">i</span>
+      <span>Generations are counted from <strong>ComfyUI's history</strong>, the only
+      source with a stable id for one. SwarmUI's log is a separate timeline
+      (prep-vs-gen split, API failures, backend stderr) and never a second count.
+      Durations here are <strong>exact</strong> &mdash; every one is measured.</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="flabel" id="i-hero-label">Generations per hour</div>
+        <div class="figure"><span id="i-hero">&mdash;</span><span class="unit">/h</span></div>
+      </div>
+      <div class="spark plot" id="i-hero-spark"></div>
+    </div>
+
+    <div class="kpis" id="i-kpis"></div>
+
+    <div class="grid">
+      <div class="card" id="c-irate">
+        <header><h2>Generation rate</h2><span class="note" id="n-irate"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-irate"></div><div class="plot" id="p-irate"></div>
+        <div class="tbl-wrap" id="t-irate" hidden></div>
+      </div>
+
+      <div class="card" id="c-idur">
+        <header><h2>Time per image</h2><span class="note">exact percentiles; every duration is measured</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-idur"></div><div class="plot" id="p-idur"></div>
+        <div class="tbl-wrap" id="t-idur" hidden></div>
+      </div>
+
+      <div class="card" id="c-ifail">
+        <header><h2>Failures</h2><span class="note" id="n-ifail"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-ifail"></div><div class="plot" id="p-ifail"></div>
+        <div class="tbl-wrap" id="t-ifail" hidden></div>
+      </div>
+
+      <div class="card" id="c-iqueue">
+        <header><h2>Queue depth</h2><span class="note">work waiting behind the backends</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-iqueue"></div><div class="plot" id="p-iqueue"></div>
+        <div class="tbl-wrap" id="t-iqueue" hidden></div>
+      </div>
+
+      <div class="card" id="c-ivram">
+        <header><h2>VRAM held by backends</h2><span class="note" id="n-ivram"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-ivram"></div><div class="plot" id="p-ivram"></div>
+        <div class="tbl-wrap" id="t-ivram" hidden></div>
+      </div>
+
+      <div class="card" id="c-igpu">
+        <header><h2>GPU utilisation</h2><span class="note" id="n-igpu"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-igpu"></div><div class="plot" id="p-igpu"></div>
+        <div class="tbl-wrap" id="t-igpu" hidden></div>
+      </div>
+    </div>
+
+    <div class="grid one" style="margin-top:14px">
+      <div class="card"><header><h2>Per-model summary</h2><span class="note" id="n-imodels"></span></header>
+        <div class="tbl-wrap" id="t-imodels"></div></div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Backends</h2><span class="note" id="n-ibackends"></span></header>
+        <div class="tbl-wrap" id="t-ibackends"></div></div>
+      <div class="card"><header><h2>What fails most</h2><span class="note">by the node class that raised</span></header>
+        <div class="tbl-wrap" id="t-inodes"></div></div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Failed generations</h2><span class="note" id="n-igenerr"></span></header>
+        <div class="tbl-wrap" id="t-igenerr"></div></div>
+      <div class="card"><header><h2>SwarmUI log errors</h2><span class="note">never reached a backend, so ComfyUI cannot see these</span></header>
+        <div class="tbl-wrap" id="t-ilogerr"></div></div>
+    </div>
+
+    <div class="grid one" style="margin-top:14px">
+      <div class="card"><header><h2>Recent generations</h2><span class="note" id="n-igens"></span></header>
+        <div class="tbl-wrap" id="t-igens"></div></div>
+    </div>
+
+    <div class="grid one" style="margin-top:14px">
+      <div class="card"><header><h2>SwarmUI timeline</h2><span class="note">requests, backend lifecycle and stderr</span></header>
+        <div class="tbl-wrap" id="t-ievents"></div></div>
+    </div>
   </section>
 
   <!-- ================================================================
@@ -1836,19 +1940,22 @@ document.querySelectorAll(".card .tools").forEach((tools) => {
 state.tab = "ollama";
 state.vsource = "";
 state.vdata = null;
+state.isource = "";
+state.idata = null;
 state.settings = null;
 
 function switchTab(name) {
   state.tab = name;
   for (const btn of $("tabs").querySelectorAll("button"))
     btn.setAttribute("aria-selected", String(btn.dataset.tab === name));
-  for (const t of ["ollama", "vllm", "settings"])
+  for (const t of ["ollama", "vllm", "images", "settings"])
     $("tab-" + t).hidden = t !== name;
   // The filter row scopes the metric tabs only, and each shows a different
   // dimension selector.
   document.querySelector(".filters").hidden = name === "settings";
   $("model-wrap").hidden = name !== "ollama";
   $("vsource-wrap").hidden = name !== "vllm";
+  $("isource-wrap").hidden = name !== "images";
   history.replaceState(null, "", "?" + new URLSearchParams({
     tab: name, window: state.window,
   }));
@@ -1858,6 +1965,7 @@ function switchTab(name) {
 function refreshActive() {
   if (state.tab === "ollama") return refresh();
   if (state.tab === "vllm") return refreshVllm();
+  if (state.tab === "images") return refreshImages();
   return refreshSettings();
 }
 
@@ -1865,6 +1973,288 @@ $("tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-tab]");
   if (b) switchTab(b.dataset.tab);
 });
+
+/* =====================================================================
+   Images tab (SwarmUI / ComfyUI)
+   ===================================================================== */
+let iRefreshing = false;
+async function refreshImages() {
+  if (iRefreshing) return;
+  iRefreshing = true;
+  $("tab-images").querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.isource ? `&source=${encodeURIComponent(state.isource)}` : "");
+    state.idata = await jget("/api/images/dashboard" + q);
+    renderImages();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    $("tab-images").querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    iRefreshing = false;
+  }
+}
+
+function renderImages() {
+  const d = state.idata;
+  const sel = $("isource");
+  const names = (d.sources || []).map((x) => x.source);
+  if (sel.dataset.names !== names.join("|")) {
+    sel.dataset.names = names.join("|");
+    sel.innerHTML = "";
+    for (const n of names) {
+      const o = document.createElement("option"); o.value = n; text(o, n);
+      sel.appendChild(o);
+    }
+  }
+  if (d.source) { state.isource = d.source; sel.value = d.source; }
+
+  if (!d.summary) {
+    text($("i-hero"), "—");
+    text($("images-note").querySelector("span:last-child"),
+         d.hint || "No SwarmUI/ComfyUI source configured.");
+    return;
+  }
+  renderImageTiles();
+  renderImageCharts();
+  renderImageTables();
+}
+
+function renderImageTiles() {
+  const d = state.idata, s = d.summary;
+  const k = $("i-kpis"); k.innerHTML = "";
+  text($("i-hero"), fmtCompact(s.gen_per_hour, 1));
+
+  const back = d.backends || [];
+  const queued = back.reduce((a, b) => a + (b.queue_pending || 0), 0);
+  const running = back.reduce((a, b) => a + (b.queue_running || 0), 0);
+
+  k.append(
+    tile("Generations", fmtCompact(s.generations, 0), "",
+         s.running ? `${s.running} still running` : "completed in window"),
+    tile("Failed", fmtPct(s.error_rate), "",
+         `${fmtCompact(s.errors, 0)} of ${fmtCompact(s.generations, 0)}`,
+         s.error_rate > 0.05,
+         s.errors ? css("--critical") : css("--good")),
+    tile("Time per image", fmtMs(s.duration_ms.p50), "",
+         `p90 ${fmtMs(s.duration_ms.p90)} · max ${fmtMs(s.duration_ms_max)}`),
+    tile("Busy", fmtPct(s.busy_fraction), "", "of wall clock spent generating"),
+    tile("Queue", fmtCompact(queued + running, 0), "",
+         `${running} running · ${queued} waiting`, queued > 0),
+    tile("Models used", fmtCompact(s.models_used, 0), "", "distinct checkpoints"),
+  );
+  /* SwarmUI's split is the only place prep is visible, and a generation that
+     grew in prep is a different problem from one that grew in gen. */
+  if (s.swarm_timing && s.swarm_timing.samples) {
+    k.append(tile("Prep vs gen", fmtMs(s.swarm_timing.prep_ms_mean), "",
+                  `mean prep · gen ${fmtMs(s.swarm_timing.gen_ms_mean)}`,
+                  (s.swarm_timing.prep_ms_mean || 0) > 10000));
+  }
+  if (s.webapi_errors) {
+    k.append(tile("API errors", fmtCompact(s.webapi_errors, 0), "",
+                  "never reached a backend", true, css("--warning")));
+  }
+}
+
+function renderImageCharts() {
+  const d = state.idata, ts = d.timeseries, S = ts.series;
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
+
+  draw("irate", "p-irate", "l-irate", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + "/h",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "generations/hour", values: S.gen_per_hour, color: sc(0) }],
+  });
+  text($("n-irate"), `${fmtCompact(d.summary.generations, 0)} in window`);
+
+  draw("idur", "p-idur", "l-idur", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: fmtMs, fmtTick,
+    series: [
+      { name: "p50", values: S.dur_p50, color: sc(0) },
+      { name: "p90", values: S.dur_p90, color: sc(1) },
+    ],
+  });
+
+  /* Status palette, not a series colour: this means a state, not an identity. */
+  draw("ifail", "p-ifail", "l-ifail", {
+    type: "bar", t: ts.t, fmt: (v) => fmtCompact(v, 1) + "/h",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "failures/hour", values: S.err_per_hour,
+               color: css("--critical"), kind: "rect" }],
+  });
+  const nodes = (d.failures || {}).by_node_type || [];
+  text($("n-ifail"), nodes.length
+    ? `worst: ${nodes[0].error_type} (${nodes[0].count})`
+    : "none in window");
+
+  draw("iqueue", "p-iqueue", "l-iqueue", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1), fmtAxis: (v) => fmtCompact(v, 0),
+    fmtTick,
+    series: [
+      { name: "waiting", values: S.queue_pending, color: sc(0) },
+      { name: "running", values: S.queue_running, color: sc(1) },
+    ],
+  });
+
+  draw("ivram", "p-ivram", "l-ivram", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "VRAM held", values: S.vram_used_gib, color: sc(2) }],
+  });
+  text($("n-ivram"), "as the backends report it, not nvidia-smi");
+
+  /* GPU, scoped to the cards these backends hold -- the same view both other
+     panes use, so the tiles mean the same thing here. */
+  const g = d.gpu || { t: [], gpus: [] };
+  const owned = [];
+  for (const b of d.backends || []) {
+    for (const i of b.gpu_indices || []) if (!owned.includes(i)) owned.push(i);
+  }
+  const anyKnown = (d.backends || []).some((b) => Array.isArray(b.gpu_indices));
+  const gv = gpuView(g.gpus, anyKnown ? owned.sort((a, b) => a - b) : null);
+  draw("igpu", "p-igpu", "l-igpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((gpu) => ({ name: gv.label(gpu), values: gpu.util_pct,
+                                   color: gv.colour(gpu) })),
+  });
+  text($("n-igpu"), gv.note(null));
+
+  const hs = state.charts.iherospark;
+  const hspec = { type: "line", spark: true, t: ts.t,
+                  fmt: (v) => fmtCompact(v, 1) + "/h",
+                  series: [{ name: "generations", values: S.gen_per_hour, color: sc(0) }] };
+  if (hs) hs.update(hspec); else state.charts.iherospark = new Chart($("i-hero-spark"), hspec);
+}
+
+function renderImageTables() {
+  const d = state.idata;
+
+  table("t-imodels",
+    [{ label: "Model" }, { label: "Generations", num: true }, { label: "Failed", num: true },
+     { label: "" }, { label: "Mean", num: true }, { label: "Fastest", num: true },
+     { label: "Slowest", num: true }, { label: "Last used" }],
+    d.models, (tr, m) => {
+      tr.appendChild(td(m.model, false, true));
+      tr.appendChild(td(fmtCompact(m.generations, 0), true));
+      tr.appendChild(td(m.errors ? String(m.errors) : "0", true));
+      tr.appendChild(tdNode(barCell(m.error_rate,
+        m.error_rate > 0.05 ? css("--critical") : css("--good"))));
+      tr.appendChild(td(fmtMs(m.duration_ms_mean), true));
+      tr.appendChild(td(fmtMs(m.duration_ms_min), true));
+      tr.appendChild(td(fmtMs(m.duration_ms_max), true));
+      tr.appendChild(td(fmtClock(m.last_used)));
+    }, "No generations in this window.");
+  const nm = (d.models || []).length;
+  text($("n-imodels"), nm ? `${nm} model${nm === 1 ? "" : "s"} · bar is the failure rate` : "");
+
+  table("t-ibackends",
+    [{ label: "Backend" }, { label: "Status" }, { label: "GPU" },
+     { label: "VRAM", num: true }, { label: "" }, { label: "Queue", num: true },
+     { label: "Last seen" }],
+    (d.backends || []).filter((b) => b.backend), (tr, b) => {
+      tr.appendChild(td(b.backend, false, true));
+      tr.appendChild(tdNode(pill(b.status || "unknown",
+        b.status === "running" ? "ok" : "err")));
+      tr.appendChild(td(Array.isArray(b.gpu_indices)
+        ? (b.gpu_indices.length ? b.gpu_indices.join(", ") : "none") : "—"));
+      tr.appendChild(td(b.vram_used === null || b.vram_used === undefined ? "—"
+        : `${fmtCompact(b.vram_used / (1 << 30), 1)} / ${fmtCompact((b.vram_total || 0) / (1 << 30), 1)} GiB`, true));
+      tr.appendChild(tdNode(barCell(b.vram_used_pct,
+        (b.vram_used_pct || 0) > 0.9 ? css("--warning") : css("--series-3"))));
+      tr.appendChild(td(`${b.queue_running || 0} / ${b.queue_pending || 0}`, true));
+      /* A backend that stopped answering keeps its last sample, so the age is
+         shown rather than letting a stale row read as current. */
+      tr.appendChild(td(b.stale_s > 120 ? fmtAgo(b.stale_s) + " ago" : "now"));
+    }, "No backends reporting.");
+  const nb = (d.backends || []).filter((b) => b.backend).length;
+  text($("n-ibackends"), nb ? `${nb} backend${nb === 1 ? "" : "s"} · running / waiting` : "");
+
+  const nodes = (d.failures || {}).by_node_type || [];
+  const worst = Math.max(1, ...nodes.map((n) => n.count));
+  table("t-inodes",
+    [{ label: "Node class" }, { label: "Failures", num: true }, { label: "" }],
+    nodes, (tr, n) => {
+      tr.appendChild(td(n.error_type, false, true));
+      tr.appendChild(td(fmtCompact(n.count, 0), true));
+      tr.appendChild(tdNode(barCell(n.count / worst, css("--critical"))));
+    }, "Nothing failed in this window.");
+
+  const gerr = (d.failures || {}).generation_errors || [];
+  table("t-igenerr",
+    [{ label: "Time" }, { label: "Model" }, { label: "Node" }, { label: "Error" }],
+    gerr, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(td(shortModel(r.model), false, true));
+      tr.appendChild(td(r.error_type || "—"));
+      tr.appendChild(td(firstLine(r.error_message)));
+    }, "No failed generations in this window.");
+  text($("n-igenerr"), gerr.length ? `${gerr.length} shown` : "");
+
+  table("t-ilogerr",
+    [{ label: "Time" }, { label: "Kind" }, { label: "Backend" }, { label: "Detail" }],
+    (d.failures || {}).log_errors || [], (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(pill(r.kind.replace(/_/g, " "),
+        r.level === "Error" ? "err" : "warn")));
+      tr.appendChild(td(r.backend_index === null || r.backend_index === undefined
+        ? "—" : `ComfyUI-${r.backend_index}`));
+      tr.appendChild(td(firstLine(r.msg)));
+    }, "Nothing in the SwarmUI log for this window.");
+
+  table("t-igens",
+    [{ label: "Time" }, { label: "Status" }, { label: "Model" }, { label: "Took", num: true },
+     { label: "Nodes", num: true }, { label: "Cached", num: true }, { label: "Also loaded" }],
+    d.generations, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(pill(r.status || "?",
+        r.status === "success" ? "ok" : r.status === "running" ? "info" : "err")));
+      tr.appendChild(td(shortModel(r.model), false, true));
+      tr.appendChild(td(fmtMs(r.total_ms), true));
+      tr.appendChild(td(fmtCompact(r.node_count, 0), true));
+      tr.appendChild(td(fmtCompact(r.cached_nodes, 0), true));
+      tr.appendChild(td(extraModels(r.models, r.model)));
+    }, "No generations in this window.");
+  text($("n-igens"), `${(d.generations || []).length} shown`
+    + (d.complete === false ? ` · only covers generations since ${fmtClock(d.covers_from)}` : ""));
+
+  table("t-ievents",
+    [{ label: "Time" }, { label: "Event" }, { label: "Backend" }, { label: "Detail" }],
+    d.events, (tr, e) => {
+      tr.appendChild(td(fmtClock(e.ts)));
+      tr.appendChild(tdNode(pill(e.kind.replace(/_/g, " "),
+        e.level === "Error" ? "err" : e.level === "Warning" ? "warn" : "info")));
+      tr.appendChild(td(e.backend_index === null || e.backend_index === undefined
+        ? "—" : `ComfyUI-${e.backend_index}`));
+      tr.appendChild(td(firstLine(e.msg)));
+    }, "Nothing in the SwarmUI log for this window.");
+}
+
+/* Checkpoints live in folders and the folder is rarely the interesting half. */
+function shortModel(name) {
+  if (!name) return "—";
+  return name.split("/").pop().replace(/\.(safetensors|ckpt|gguf|pt|pth|sft)$/i, "");
+}
+
+/* An exception message is often a paragraph; the first line is the claim. */
+function firstLine(text_) {
+  if (!text_) return "";
+  const line = String(text_).split("\n")[0].trim();
+  return line.length > 160 ? line.slice(0, 157) + "\u2026" : line;
+}
+
+/* Everything the workflow loaded besides the checkpoint already in its own
+   column -- the LoRA stack is usually what actually differs between runs. */
+function extraModels(models, primary) {
+  const rest = (models || [])
+    .filter((m) => m.name !== primary)
+    .map((m) => shortModel(m.name));
+  const seen = [...new Set(rest)];
+  if (!seen.length) return "—";
+  return seen.slice(0, 3).join(", ") + (seen.length > 3 ? ` +${seen.length - 3}` : "");
+}
 
 /* =====================================================================
    vLLM tab
@@ -2079,6 +2469,7 @@ function renderVllm() {
 }
 
 $("vsource").addEventListener("change", (e) => { state.vsource = e.target.value; refreshVllm(); });
+$("isource").addEventListener("change", (e) => { state.isource = e.target.value; refreshImages(); });
 
 /* =====================================================================
    Settings tab
@@ -2362,8 +2753,12 @@ if (PARAMS.has("window")) {
   }
 }
 if (PARAMS.get("model")) state.model = PARAMS.get("model");
-if (PARAMS.get("source")) state.vsource = PARAMS.get("source");
-const startTab = ["ollama", "vllm", "settings"].includes(PARAMS.get("tab"))
+if (PARAMS.get("source")) {
+  /* One ?source= scopes whichever engine tab is open; they never share a tab. */
+  state.vsource = PARAMS.get("source");
+  state.isource = PARAMS.get("source");
+}
+const startTab = ["ollama", "vllm", "images", "settings"].includes(PARAMS.get("tab"))
   ? PARAMS.get("tab") : "ollama";
 
 /* Apply the defaults chosen in the settings screen before the first fetch, so

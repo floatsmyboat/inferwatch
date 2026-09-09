@@ -23,7 +23,7 @@ import urllib.request
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import metrics, vllm_metrics
+from . import image_metrics, metrics, vllm_metrics
 from .config import SOURCE_KINDS, ConfigError, validate_source
 
 log = logging.getLogger("inferwatch.api")
@@ -292,6 +292,85 @@ def create_app(state: AppState) -> FastAPI:
         start, end = _window(window)
         return vllm_metrics.timeseries(state.store, source, start, end, step)
 
+    # --------------------------------------------------------------- images
+
+    def _image_source(source: str | None) -> str | None:
+        if source:
+            return source
+        known = image_metrics.sources(state.store)
+        return known[0]["source"] if known else None
+
+    @app.get("/api/images/sources")
+    async def image_sources():
+        return {"sources": image_metrics.sources(state.store),
+                "backends": image_metrics.backends(state.store),
+                "running": (state.supervisor.status() if state.supervisor else {})}
+
+    @app.get("/api/images/dashboard")
+    async def images_dashboard(source: str | None = None, window: str = Query("24h"),
+                               step: int | None = None):
+        """Everything the Images tab needs, in one time slice."""
+        start, end = _window(window)
+        st = state.store
+        loop = asyncio.get_running_loop()
+        known = image_metrics.sources(st)
+        source = _image_source(source)
+        if source is None:
+            return {"window": window, "start": start, "end": end, "sources": [],
+                    "source": None, "summary": None, "timeseries": None,
+                    "hint": "No SwarmUI/ComfyUI source configured. Add one in Settings."}
+
+        def build():
+            return {
+                "window": window, "start": start, "end": end, "now": time.time(),
+                "source": source, "sources": known,
+                "summary": image_metrics.summary(st, source, start, end),
+                "timeseries": image_metrics.timeseries(st, source, start, end, step),
+                "models": image_metrics.by_model(st, source, start, end),
+                "backends": image_metrics.backends(st, source),
+                "generations": image_metrics.recent_generations(st, source, start, end, 60),
+                "slowest": image_metrics.slowest(st, source, start, end, 10),
+                "failures": image_metrics.failures(st, source, start, end, 30),
+                "events": image_metrics.events(st, source, start, end, None, 40),
+                "gpu": metrics.gpu_series(st, start, end, step),
+                **image_metrics.coverage(st, start),
+            }
+
+        return await loop.run_in_executor(None, build)
+
+    @app.get("/api/images/summary")
+    async def images_summary(source: str | None = None, window: str = "24h"):
+        start, end = _window(window)
+        return image_metrics.summary(state.store, _image_source(source), start, end)
+
+    @app.get("/api/images/timeseries")
+    async def images_timeseries(source: str | None = None, window: str = "24h",
+                                step: int | None = None):
+        start, end = _window(window)
+        return image_metrics.timeseries(state.store, _image_source(source),
+                                        start, end, step)
+
+    @app.get("/api/images/models")
+    async def images_models(source: str | None = None, window: str = "24h"):
+        start, end = _window(window)
+        return {"models": image_metrics.by_model(state.store, _image_source(source),
+                                                 start, end)}
+
+    @app.get("/api/images/failures")
+    async def images_failures(source: str | None = None, window: str = "24h",
+                              limit: int = 50):
+        start, end = _window(window)
+        return image_metrics.failures(state.store, _image_source(source),
+                                      start, end, limit)
+
+    @app.get("/api/images/generations")
+    async def images_generations(source: str | None = None, window: str = "24h",
+                                 limit: int = 100):
+        start, end = _window(window)
+        return {"generations": image_metrics.recent_generations(
+            state.store, _image_source(source), start, end, limit),
+            **image_metrics.coverage(state.store, start)}
+
     # ------------------------------------------------------------- composite
 
     @app.get("/api/prefs")
@@ -493,6 +572,33 @@ def _probe(kind: str, cfg: dict) -> dict:
         return {"ok": True, "detail": f"reachable; model {snap.model or 'unknown'}, "
                                       f"{len(snap.hist)} histograms, "
                                       f"{len(snap.counters)} counters"}
+    if kind == "swarmui":
+        from .images import FetchError, SwarmClient
+        url = (cfg.get("url") or "").rstrip("/")
+        notes = []
+        try:
+            sw = SwarmClient(url)
+            st = sw.status()
+            notes.append(f"SwarmUI reachable at {url}; "
+                         f"backend status {(st.get('backend_status') or {}).get('status')}")
+        except FetchError as e:
+            return {"ok": False, "detail": f"could not reach {url}: {e}"}
+        explicit = [u.strip() for u in (cfg.get("backends") or "").split(",") if u.strip()]
+        if explicit:
+            from .images import ComfyClient
+            for u in explicit:
+                try:
+                    v = (ComfyClient(u).system_stats().get("system") or {})
+                    notes.append(f"{u}: ComfyUI {v.get('comfyui_version')}")
+                except FetchError as e:
+                    return {"ok": False, "detail": f"backend {u} unreachable: {e}"}
+        elif (cfg.get("reader") or "journald") == "none":
+            return {"ok": False,
+                    "detail": "reader 'none' needs explicit backend URLs, or no "
+                              "generations will be collected"}
+        else:
+            notes.append("backend ports will be discovered from the log")
+        return {"ok": True, "detail": "; ".join(notes)}
     if kind == "ollama":
         reader = cfg.get("reader") or "journald"
         notes = []

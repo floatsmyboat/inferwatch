@@ -198,12 +198,25 @@ class Reader:
 
     kind = "base"
 
-    def __init__(self, store, source: str, cfg: dict):
+    def __init__(self, store, source: str, cfg: dict, resume_ts=None):
         self.store = store
         self.source = source
         self.cfg = cfg
         self.lines = 0
         self.errors = 0
+        # How far this source has already been read, for a FIRST run with no
+        # stored cursor.  Injected because it is engine-specific: an ollama
+        # source asks the `requests` table, a SwarmUI source asks its own event
+        # timeline, and a reader that assumed one of them would resume a
+        # different engine's source from the wrong point.
+        self._resume_ts = resume_ts or self._resume_ts_from_requests
+
+    def _resume_ts_from_requests(self) -> float | None:
+        try:
+            row = self.store.query("SELECT MAX(ts) t FROM requests")
+        except Exception:
+            return None
+        return row[0]["t"] if row and row[0]["t"] else None
 
     @property
     def state_key(self) -> str:
@@ -237,8 +250,9 @@ class JournaldReader(Reader):
 
     kind = "journald"
 
-    def __init__(self, store, source: str, cfg: dict, backfill: str = "-2 days"):
-        super().__init__(store, source, cfg)
+    def __init__(self, store, source: str, cfg: dict, backfill: str = "-2 days",
+                 resume_ts=None):
+        super().__init__(store, source, cfg, resume_ts)
         self.unit = cfg.get("unit") or "ollama"
         self.backfill = backfill
         self.cursor_stale = False
@@ -248,12 +262,9 @@ class JournaldReader(Reader):
         return f"journald unit={self.unit}"
 
     def _resume_since(self) -> str:
-        try:
-            row = self.store.query("SELECT MAX(ts) t FROM requests")
-        except Exception:
-            row = None
-        if row and row[0]["t"]:
-            return "@" + str(int(row[0]["t"] - 60))
+        seen = self._resume_ts()
+        if seen:
+            return "@" + str(int(seen - 60))
         return to_journalctl_since(self.backfill)
 
     def _usable_cursor(self) -> str | None:
@@ -370,8 +381,9 @@ class FileReader(Reader):
 
     kind = "file"
 
-    def __init__(self, store, source: str, cfg: dict, poll: float = 0.5):
-        super().__init__(store, source, cfg)
+    def __init__(self, store, source: str, cfg: dict, poll: float = 0.5,
+                 resume_ts=None):
+        super().__init__(store, source, cfg, resume_ts)
         self.path = os.path.expanduser(cfg.get("path") or "")
         self.poll = poll
         self.clock = TimestampTracker()
@@ -501,8 +513,9 @@ class DockerReader(Reader):
 
     kind = "docker"
 
-    def __init__(self, store, source: str, cfg: dict, backfill: str = "-2 days"):
-        super().__init__(store, source, cfg)
+    def __init__(self, store, source: str, cfg: dict, backfill: str = "-2 days",
+                 resume_ts=None):
+        super().__init__(store, source, cfg, resume_ts)
         self.container = cfg.get("container") or ""
         self.binary = cfg.get("docker_binary") or ""
         self.backfill = backfill
@@ -518,9 +531,9 @@ class DockerReader(Reader):
         state = self.load_state()
         if state.get("since"):
             return state["since"]
-        row = self.store.query("SELECT MAX(ts) t FROM requests")
-        if row and row[0]["t"]:
-            return datetime.fromtimestamp(row[0]["t"] - 60).astimezone().isoformat()
+        seen = self._resume_ts()
+        if seen:
+            return datetime.fromtimestamp(seen - 60).astimezone().isoformat()
         return to_docker_since(self.backfill)
 
     async def run(self, on_line, on_flush) -> None:
@@ -578,14 +591,33 @@ class DockerReader(Reader):
             await asyncio.sleep(5)
 
 
-READERS = {"journald": JournaldReader, "file": FileReader, "docker": DockerReader}
+class NullReader(Reader):
+    """Reads nothing, for a source monitored over HTTP alone.
+
+    Present so "no log" is a configurable choice rather than a special case the
+    supervisor has to branch on.
+    """
+
+    kind = "none"
+
+    def describe(self) -> str:
+        return "no log reader"
+
+    async def run(self, on_line, on_flush) -> None:
+        while True:
+            await asyncio.sleep(3600)
 
 
-def build_reader(store, source: str, cfg: dict, backfill: str = "-2 days") -> Reader:
+READERS = {"journald": JournaldReader, "file": FileReader,
+           "docker": DockerReader, "none": NullReader}
+
+
+def build_reader(store, source: str, cfg: dict, backfill: str = "-2 days",
+                 resume_ts=None) -> Reader:
     kind = (cfg.get("reader") or "journald").lower()
     cls = READERS.get(kind)
     if cls is None:
         raise ValueError(f"unknown reader {kind!r}; expected one of {sorted(READERS)}")
-    if cls is FileReader:
-        return cls(store, source, cfg)
-    return cls(store, source, cfg, backfill=backfill)
+    if cls in (FileReader, NullReader):
+        return cls(store, source, cfg, resume_ts=resume_ts)
+    return cls(store, source, cfg, backfill=backfill, resume_ts=resume_ts)

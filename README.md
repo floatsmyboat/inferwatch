@@ -28,7 +28,7 @@ break inference.
 
 ---
 
-## The two engines are not symmetric, and the tool does not pretend otherwise
+## The engines are not symmetric, and the tool does not pretend otherwise
 
 This is the central design fact, so it is worth stating plainly.
 
@@ -50,6 +50,36 @@ get separate charts rather than sharing an axis, and each is aggregated the way
 its unit demands: utilisation averages across cards, VRAM and watts sum,
 temperature reports the hottest card. Temperature is the one series not plotted
 from zero — a 33–68 °C range starting at 0 wastes most of the plot.
+
+### And a third family: image generation
+
+SwarmUI and its ComfyUI backends are further from either of those than they are
+from each other. There are **no tokens, no time-to-first-token and no context
+window**; the unit of work is a generation with a duration, the models a
+workflow loaded, and a node that may have thrown. So it gets its own tab, its
+own tables and its own MCP tools rather than blank columns in someone else's.
+
+Two sources feed it, and only one of them counts:
+
+| | ComfyUI `/history` | SwarmUI journal |
+|---|---|---|
+| Generations | **the count** — stable `prompt_id`, ms timestamps | a timeline, never a second count |
+| Models | read out of the workflow graph | the name on the request line |
+| Errors | failing node, its class, the exception | WebAPI failures + backend stderr |
+| Timing | total, measured | prep vs gen, split |
+
+Joining them would mean guessing which log line belongs to which `prompt_id`,
+and a request for N images produces N finish lines — so a 1:1 pairing would
+misattribute every batch. They are kept apart instead: generations come from
+`/history`, and SwarmUI's prep-versus-gen split is reported as its own
+aggregate. Durations here are **exact**; every one is measured, so unlike the
+token engines there is no bucketed-percentile caveat.
+
+Backend ports are published exactly once, when SwarmUI starts its backends
+(`Self-Start ComfyUI-0 on port 7821 started.`). They are learned from the log,
+**remembered across restarts**, and as a last resort probed on the conventional
+range — a collector restarted mid-life resumes the journal past those lines and
+would otherwise collect queue depth and no generations at all.
 
 So they get **separate dashboard tabs, separate tables and separate MCP tools**.
 No attempt is made to reconstruct per-request rows for vLLM by differencing
@@ -333,6 +363,18 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `url` | `http://127.0.0.1:11434` | — | Used to poll /api/ps for resident models. |
 | `models_dir` | — | — | Optional. Resolves blob digests to model names on load events. Defaults to $OLLAMA_MODELS or ~/.ollama/models. |
 
+**SwarmUI / ComfyUI** (`--kind swarmui`)
+
+| Field | Default | Required when | Notes |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:7801` | — | Polled for queue depth and backend health. Its API needs no key for a local install. |
+| `reader` | `journald` | — | Optional, unlike ollama's. Adds SwarmUI's prep-vs-gen timing split, WebAPI failures that never reached a backend, and the Python stderr behind a failed generation. 'none' polls the APIs only. One of `journald`, `file`, `docker`, `none`. |
+| `unit` | `swarmui` | `reader=journald` | Also the fallback for GPU attribution, though each self-started ComfyUI is usually resolved exactly by its own port. |
+| `path` | — | `reader=file` | SwarmUI's own rotated logs under Data/Logs work here. |
+| `container` | — | `reader=docker` |  |
+| `backends` | — | — | Optional, comma separated. Leave empty and the backend ports are discovered from the log, which is the only place SwarmUI publishes them. Required when the reader is 'none'. |
+| `history_limit` | `64` | — | How many /history entries to read each tick. ComfyUI keeps this in memory only, so a larger number costs little and survives a burst between polls. |
+
 **vLLM** (`--kind vllm`)
 
 | Field | Default | Required when | Notes |
@@ -362,20 +404,24 @@ Flags that pin a setting outrank both the environment and the Settings tab; the 
 
 <!-- END generated: configuration reference -->
 
-### Scope: one Ollama source, many vLLM sources
+### Scope: one Ollama source; many vLLM and SwarmUI sources
 
-vLLM rows are keyed by source throughout, so any number of vLLM instances can be
-monitored side by side. The Ollama tables (`requests`, `events`, `ps_samples`)
-are **not** source-partitioned, so exactly one Ollama source runs at a time;
-enabling a second logs a warning and ignores it rather than silently blending two
-instances into one set of numbers. Partitioning those tables is a schema change
-worth doing deliberately.
+vLLM and SwarmUI rows are keyed by source throughout, so any number of those
+instances can be monitored side by side. The Ollama tables (`requests`,
+`events`, `ps_samples`) are **not** source-partitioned, so exactly one Ollama
+source runs at a time; enabling a second logs a warning and ignores it rather
+than silently blending two instances into one set of numbers. Partitioning those
+tables is a schema change worth doing deliberately.
+
+One SwarmUI source covers all of that install's ComfyUI backends, which are
+discovered rather than configured; the per-backend rows are keyed by backend
+name within the source.
 
 ---
 
 ## Dashboard
 
-`http://127.0.0.1:7070` — three tabs: **Ollama**, **vLLM**, **Settings**.
+`http://127.0.0.1:7070` — four tabs: **Ollama**, **vLLM**, **Images**, **Settings**.
 
 ### Which GPUs belong to which engine
 
@@ -438,6 +484,8 @@ tools, which otherwise wait forever on an open stream).
 | `/api/cache?window=1h` | Ollama prompt-cache occupancy, evictions, update cost |
 | `/api/clients?window=1h&limit=25` | per-client detail: models requested, context sizes, tokens, TTFT |
 | `/api/endpoints?window=1h` | traffic by endpoint and class |
+| `/api/images/dashboard?window=24h&source=` | everything the Images tab needs, one time slice |
+| `/api/images/summary`, `/api/images/timeseries`, `/api/images/models`, `/api/images/failures`, `/api/images/generations`, `/api/images/sources` | image breakdowns |
 | `/api/config` (GET/PUT), `/api/config/reset` | settings |
 | `/api/sources` (GET/POST/PUT/DELETE), `/api/sources/probe` | monitored engines |
 | `/api/prefs`, `/api/status`, `/api/health` | dashboard defaults, collector state |
@@ -470,6 +518,9 @@ always matches the number on screen.
 | `gpu_status` | per-device util/VRAM/temp/power |
 | `cache_status` | Ollama prompt-cache occupancy and eviction pressure, plus live KV usage |
 | `client_stats` | who is calling, for which models, at what context size |
+| `image_summary` | SwarmUI/ComfyUI throughput, durations, models, backends |
+| `image_failures` | what failed, by node class, and what never reached a backend |
+| `image_generations` | recent generations with every model the workflow loaded |
 | `list_sources`, `get_settings` | what is monitored, and how it is configured |
 | `health` | is collection working, is debug logging on |
 | `run_sql`, `describe_schema` | read-only SELECT escape hatch, with units |
@@ -479,8 +530,11 @@ always matches the number on screen.
 ## Retention
 
 - Raw per-request rows (Ollama): **7 days** (`retention.raw_days`).
-- GPU samples, events, prompt-cache samples, vLLM rows: **30 days**
-  (`retention.sample_days`).
+- GPU samples, events, prompt-cache samples, image samples and the image event
+  timeline, vLLM rows: **30 days** (`retention.sample_days`).
+- Image generations follow the **raw** window, being the image equivalent of a
+  request row. There are no rollups for them, so past retention the answer is
+  "not stored" and `complete`/`covers_from` say so.
 - `rollup_1m` and `rollup_1h`: **kept indefinitely**.
 
 Rollups store fixed-bucket **histograms** of TTFT and latency, not pre-computed
@@ -562,6 +616,20 @@ rather than dropped or guessed. On this host the rate has ranged from 100% named
 to 0% named on different days, so a client showing mostly `unattributed` is a
 statement about the log, not about the client.
 
+**Image generations are counted from ComfyUI, never from SwarmUI's log.**
+The log describes the same work from the orchestrator's side, but a request for
+N images produces N "Generated an image" lines and nothing ties either to a
+`prompt_id`. Counting both would double-count; joining them would guess. So the
+log is a timeline and the count comes from `/history` alone — which does mean a
+generation driven through ComfyUI directly, bypassing SwarmUI, still appears
+(correctly), while one that failed inside SwarmUI before reaching a backend
+appears only as a log error.
+
+**ComfyUI's history is in memory, not on disk.** It is polled, so a backend
+restarting between polls loses whatever it had not yet reported. At the default
+interval that is a few seconds' exposure; `history_limit` controls how much of
+the ring is re-read each tick.
+
 **The Ollama prompt-cache gauge is sampled on ollama's schedule.** A `cache
 state` line is logged only when ollama runs a cache update, so the series is
 unevenly spaced and a window with no samples means "no cache updates happened",
@@ -626,6 +694,9 @@ inferwatch/parse.py        ollama log line parsers (pure, fixture-tested)
 inferwatch/readers.py      journald / file / docker log readers
 inferwatch/collect.py      correlator, GPU + model pollers, maintainer
 inferwatch/vllm.py         Prometheus scraper, delta and reset handling
+inferwatch/parse_swarm.py  SwarmUI log line parsers (pure, fixture-tested)
+inferwatch/images.py       SwarmUI/ComfyUI poller, history ingest, log collector
+inferwatch/image_metrics.py image-generation query layer
 inferwatch/gpuproc.py      maps GPUs to the process tree holding them
 inferwatch/vllm_metrics.py vLLM query layer
 inferwatch/metrics.py      ollama query layer (shared by API and MCP)
