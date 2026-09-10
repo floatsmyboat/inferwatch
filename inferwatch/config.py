@@ -241,11 +241,110 @@ SOURCE_KINDS = {
                      "'could not attribute'. The journal is also read from it "
                      "for HTTP status codes, client addresses and engine errors, "
                      "which /metrics does not expose."},
-            {"key": "api_key", "label": "API key (optional)", "type": "str", "default": "",
-             "help": "Sent as a bearer token if the server requires one."},
+            {"key": "api_key", "label": "API key (optional)", "type": "str",
+             "default": "", "secret": True,
+             "help": "Sent as a bearer token if the server requires one. "
+                     "Prefer an indirection like ${VLLM_API_KEY} over pasting "
+                     "the value: what is stored here goes into the database in "
+                     "plain text, and a reference keeps the secret in the "
+                     "environment or an EnvironmentFile instead."},
         ],
     },
 }
+
+
+# What a redacted secret reads as, and the value a client may send back to mean
+# "leave it as it is".  A round-trip through the settings screen must not
+# overwrite a real key with its own mask, which is the classic way redaction
+# turns into data loss.
+REDACTED = "***redacted***"
+
+# "${NAME}" or "$NAME" -- an indirection, not a secret, so it is shown rather
+# than masked: seeing WHICH variable is referenced is the useful part.
+_VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def secret_fields(kind: str) -> set:
+    """Keys in a source's config whose value must never be served back."""
+    return {f["key"] for f in SOURCE_KINDS.get(kind, {}).get("fields", [])
+            if f.get("secret")}
+
+
+def is_secret_ref(value) -> bool:
+    """True when the whole value is an environment reference, not a literal."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return _VAR_REF.sub("", text) == ""
+
+
+def resolve_secret(value, environ=None) -> str:
+    """Expand ${VAR} / $VAR references in a stored secret.
+
+    Lets the secret live in the environment (or a systemd EnvironmentFile)
+    while the database holds only a pointer to it.  An unset variable resolves
+    to empty rather than to the literal "${VAR}", so the request goes out with
+    no Authorization header and fails as a clean 401 instead of sending a
+    nonsense bearer token.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    env = environ if environ is not None else __import__("os").environ
+    missing = []
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        got = env.get(name)
+        if got is None:
+            missing.append(name)
+            return ""
+        return got
+
+    out = _VAR_REF.sub(sub, text)
+    if missing:
+        import logging
+        logging.getLogger("inferwatch.config").warning(
+            "secret references unset environment variable(s) %s; requesting "
+            "without credentials", ", ".join(sorted(set(missing))))
+    return out
+
+
+def redact_config(kind: str, cfg: dict) -> dict:
+    """A copy of `cfg` safe to serve: literal secrets replaced by REDACTED.
+
+    An empty value stays empty, so a caller can still tell "nothing is set"
+    from "set, and you may not read it".
+    """
+    out = dict(cfg or {})
+    for key in secret_fields(kind):
+        value = out.get(key)
+        if value and not is_secret_ref(value):
+            out[key] = REDACTED
+    return out
+
+
+def redact_sources(rows: list) -> list:
+    """Redact every source in a list_sources() result."""
+    return [{**s, "config": redact_config(s.get("kind", ""), s.get("config") or {})}
+            for s in rows]
+
+
+def merge_secrets(kind: str, incoming: dict, stored: dict | None) -> dict:
+    """Apply a client's config edit without letting a mask overwrite a secret.
+
+    REDACTED means "unchanged", so the stored value is kept.  Any other value
+    -- including the empty string -- is taken at face value, so clearing a key
+    still works.
+    """
+    out = dict(incoming or {})
+    for key in secret_fields(kind):
+        if out.get(key) == REDACTED:
+            if stored and stored.get(key) is not None:
+                out[key] = stored[key]
+            else:
+                out.pop(key, None)
+    return out
 
 
 def source_defaults(kind: str) -> dict:
@@ -369,7 +468,9 @@ class Config:
                 for s in SPEC
             ],
             "source_kinds": SOURCE_KINDS,
-            "sources": self.store.list_sources(),
+            # Redacted: this is what the settings screen renders, and it is
+            # served by an API with no authentication.
+            "sources": redact_sources(self.store.list_sources()),
         }
 
     # -- writes ----------------------------------------------------------

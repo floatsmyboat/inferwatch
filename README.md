@@ -254,13 +254,57 @@ Override with `HOST=0.0.0.0 PORT=7070 DATADIR=... ./scripts/install-systemd.sh`.
 
 ### Exposing it on a network
 
-There is **no authentication**. The dashboard is read-only (GET only) and stores
-no prompt or response text — only counts, timings, model names and client
-addresses. Restrict it at the firewall:
+There is **no authentication**, and the API is **not read-only**. It stores no
+prompt or response text — only counts, timings, model names and client addresses
+— but anyone who can reach the port can also write:
+
+| Endpoint | What an unauthenticated caller can do |
+|---|---|
+| `PUT /api/config`, `POST /api/config/reset` | change any setting not pinned by env or flag |
+| `POST /api/sources`, `PUT`/`DELETE /api/sources/{id}` | add, edit or remove a monitored engine |
+| `POST /api/sources/probe` | make the server fetch an arbitrary URL, with an arbitrary bearer token |
+
+That last one is a server-side request forgery primitive: the probe exists so a
+typo surfaces before a source is saved, and it will dial whatever it is given.
+
+So the firewall is not belt-and-braces, it is the only control:
 
 ```bash
 sudo ufw allow from 192.168.1.0/24 to any port 7070 proto tcp comment "inferwatch"
 ```
+
+Better still, leave `server.host` at `127.0.0.1` and put something that
+authenticates in front of it.
+
+#### Secrets
+
+A vLLM source's `api_key` is stored in the `sources` table **in plain text** —
+SQLite has no encryption here, and the collector needs the value to send it as a
+bearer token. So prefer an indirection:
+
+```bash
+inferwatch sources add --kind vllm vllm-prod \
+    --set url=http://127.0.0.1:8000 --set 'api_key=${VLLM_API_KEY}'
+```
+
+`${VAR}` and `$VAR` are expanded when the request is made, so the database holds
+only the pointer and the secret stays in the environment (a systemd
+`EnvironmentFile=` is the natural home). An unset variable resolves to empty and
+logs a warning, so the request fails as a clean 401 rather than sending a
+literal `${VAR}` as the token.
+
+Whatever is stored, it is **masked on every read**: `/api/sources`,
+`/api/config`, the Settings tab, `inferwatch sources list`, and the MCP
+`list_sources` and `run_sql` tools all report `***redacted***` instead of the
+value. A reference like `${VLLM_API_KEY}` is shown as itself, since knowing
+which variable is referenced is useful and the reference is not the secret.
+Sending `***redacted***` back in a `PUT` means "leave it unchanged", so editing
+a source through the API cannot overwrite a key with its own mask; sending an
+empty string still clears it.
+
+Note that a literal passed as `--set api_key=…` is visible in this process's
+command line to any local user for as long as the command runs, which is a
+second reason to prefer the reference form.
 
 ---
 
@@ -381,7 +425,7 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 |---|---|---|---|
 | `url` | `http://127.0.0.1:8000` | — | The OpenAI-compatible server root. /metrics is read from here. |
 | `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. The journal is also read from it for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
-| `api_key` | — | — | Sent as a bearer token if the server requires one. |
+| `api_key` | — | — | Sent as a bearer token if the server requires one. Prefer an indirection like ${VLLM_API_KEY} over pasting the value: what is stored here goes into the database in plain text, and a reference keeps the secret in the environment or an EnvironmentFile instead. |
 
 #### Command-line flags
 

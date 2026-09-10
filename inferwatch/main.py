@@ -319,7 +319,7 @@ def stats(args) -> None:
 
 def sources_cmd(args) -> None:
     """List, add, enable/disable or remove monitored engines from the CLI."""
-    from .config import SOURCE_KINDS, validate_source
+    from .config import SOURCE_KINDS, redact_sources, validate_source
     from .store import Store
     store = Store(args.db)
 
@@ -328,7 +328,7 @@ def sources_cmd(args) -> None:
         if not rows:
             print("no sources configured")
             return
-        for s in rows:
+        for s in redact_sources(rows):
             flag = "on " if s["enabled"] else "off"
             detail = " ".join(f"{k}={v}" for k, v in (s["config"] or {}).items() if v)
             print(f"  [{s['id']:>3}] {flag} {s['kind']:<7} {s['name']:<16} {detail}")
@@ -400,7 +400,11 @@ def parse_args(argv=None):
     sp.add_argument("name", nargs="?", help="source name (or id)")
     sp.add_argument("--kind", default="vllm", help="ollama | vllm")
     sp.add_argument("--set", action="append",
-                    help="config entry as key=value; repeatable")
+                    help="config entry as key=value; repeatable. A secret is "
+                         "better given as a reference than a literal "
+                         "(api_key='${VLLM_API_KEY}'): a literal is visible to "
+                         "anyone who can read this process's command line, and "
+                         "is stored in the database in plain text")
     args = p.parse_args(argv)
     if args.cmd is None:
         args.cmd = "serve"

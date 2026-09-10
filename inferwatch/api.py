@@ -24,7 +24,8 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import image_metrics, metrics, vllm_metrics
-from .config import SOURCE_KINDS, ConfigError, validate_source
+from .config import (SOURCE_KINDS, ConfigError, merge_secrets, redact_sources,
+                     resolve_secret, validate_source)
 
 log = logging.getLogger("inferwatch.api")
 
@@ -191,7 +192,10 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/api/sources")
     async def list_sources():
-        return {"sources": state.store.list_sources(), "kinds": SOURCE_KINDS,
+        # Redacted: there is no authentication on this API, so a secret served
+        # here is readable by anything that can reach the port.
+        return {"sources": redact_sources(state.store.list_sources()),
+                "kinds": SOURCE_KINDS,
                 "running": (state.supervisor.status() if state.supervisor else {})}
 
     @app.post("/api/sources")
@@ -199,6 +203,9 @@ def create_app(state: AppState) -> FastAPI:
         kind = (body or {}).get("kind")
         name = (body or {}).get("name")
         cfg = (body or {}).get("config") or {}
+        # A new source has nothing stored, so a mask sent here is a mistake
+        # rather than "unchanged"; merge_secrets drops it.
+        cfg = merge_secrets(kind, cfg, None)
         try:
             clean = validate_source(kind, name, cfg)
         except (ValueError, KeyError) as e:
@@ -218,6 +225,9 @@ def create_app(state: AppState) -> FastAPI:
             raise HTTPException(status_code=404, detail="no such source")
         cfg = body.get("config")
         if cfg is not None:
+            # The client only ever saw the mask, so a round-trip must not
+            # overwrite the real key with it.
+            cfg = merge_secrets(existing["kind"], cfg, existing.get("config"))
             try:
                 cfg = validate_source(existing["kind"], body.get("name")
                                       or existing["name"], cfg)
@@ -241,6 +251,10 @@ def create_app(state: AppState) -> FastAPI:
         kind = (body or {}).get("kind")
         cfg = (body or {}).get("config") or {}
         loop = asyncio.get_running_loop()
+        # A probe describes UNSAVED config, so there is no stored secret to
+        # merge; this drops a mask rather than dialling out with "***redacted***"
+        # as the bearer token, which would fail in a confusing way.
+        cfg = merge_secrets(kind, cfg, None)
         try:
             validate_source(kind, (body or {}).get("name") or "probe", cfg)
         except (ValueError, KeyError) as e:
@@ -562,7 +576,8 @@ def _probe(kind: str, cfg: dict) -> dict:
         from .vllm import ScrapeError, Snapshot, fetch, parse_prometheus
         url = (cfg.get("url") or "").rstrip("/")
         try:
-            text = fetch(f"{url}/metrics", cfg.get("api_key") or "", timeout=6.0)
+            text = fetch(f"{url}/metrics", resolve_secret(cfg.get("api_key")),
+                         timeout=6.0)
         except ScrapeError as e:
             return {"ok": False, "detail": f"could not read {url}/metrics: {e}"}
         snap = Snapshot(time.time(), parse_prometheus(text))

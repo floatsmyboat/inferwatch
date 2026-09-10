@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 
 from . import gpuproc
+from .config import resolve_secret
 
 log = logging.getLogger("inferwatch.vllm")
 
@@ -314,7 +315,9 @@ class VllmCollector:
         self.store = store
         self.name = source_name
         self.url = (cfg.get("url") or "http://127.0.0.1:8000").rstrip("/")
-        self.api_key = cfg.get("api_key") or ""
+        # Resolved at use, so a "${VLLM_API_KEY}" indirection keeps the
+        # secret in the environment rather than in the database.
+        self.api_key = resolve_secret(cfg.get("api_key"))
         # The unit is the strongest attribution key available, and the settings
         # screen already collects it (for reading the journal).  Point it at the
         # unit that actually runs the ENGINE: with a proxy in front of vLLM the

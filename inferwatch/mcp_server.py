@@ -24,6 +24,8 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import image_metrics, metrics, vllm_metrics
+from .config import (REDACTED, SOURCE_KINDS, is_secret_ref, redact_sources,
+                     secret_fields)
 from .store import Store
 
 from .main import default_db, env
@@ -640,11 +642,14 @@ def vllm_timeseries(source: str | None = None, window: str = "1h",
 )
 def list_sources() -> dict:
     """List monitored engines and how each is collected."""
-    rows = store().list_sources()
+    rows = redact_sources(store().list_sources())
     return {"sources": rows, "count": len(rows),
             "notes": "Ollama metrics come from the log reader shown; vLLM from "
                      "the URL's /metrics endpoint. One Ollama source runs at a "
-                     "time; vLLM instances may be many."}
+                     "time; vLLM instances may be many. Secrets read as "
+                     f"{REDACTED!r}; a ${{VAR}} indirection is shown as itself, "
+                     "since knowing which variable is referenced is useful and "
+                     "the reference is not the secret."}
 
 
 @srv.tool(
@@ -718,9 +723,10 @@ def run_sql(sql: str, limit: int = 200) -> dict:
         raise ValueError("only one statement at a time")
     rows = store().query(sql)
     truncated = len(rows) > limit
+    out = [_redact_row(dict(r)) for r in rows[:limit]]
     return {"columns": list(rows[0].keys()) if rows else [],
-            "rows": [dict(r) for r in rows[:limit]],
-            "row_count": len(rows[:limit]),
+            "rows": out,
+            "row_count": len(out),
             "truncated": truncated}
 
 
@@ -764,6 +770,34 @@ def describe_schema() -> dict:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+def _redact_row(row: dict) -> dict:
+    """Mask secrets in an arbitrary query result.
+
+    `sources.config_json` holds a source's whole configuration as JSON, api_key
+    included, so a read-only SELECT was enough to read it back out. The column
+    is masked wherever it appears rather than the table being blocked, which
+    keeps the escape hatch useful for everything else about a source.
+    """
+    for key, value in list(row.items()):
+        if key != "config_json" or not isinstance(value, str):
+            continue
+        try:
+            cfg = json.loads(value)
+        except ValueError:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        # The kind is not in the JSON, so every kind's secret keys are masked.
+        secrets = set()
+        for kind in SOURCE_KINDS:
+            secrets |= secret_fields(kind)
+        for field in secrets:
+            if cfg.get(field) and not is_secret_ref(cfg[field]):
+                cfg[field] = REDACTED
+        row[key] = json.dumps(cfg)
+    return row
+
 
 def _when(ts: float | None) -> str | None:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else None
