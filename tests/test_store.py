@@ -350,6 +350,121 @@ class TestPerClient(StoreCase):
                                               limit=3)), 3)
 
 
+class TestConcurrency(StoreCase):
+    """Concurrency is derived from request intervals, not read off the poll."""
+
+    def setUp(self):
+        super().setUp()
+        # Aligned to an hour so bucket boundaries land where the arithmetic in
+        # these tests expects; series buckets are floored to the step, so an
+        # unaligned base silently shifts the first one.
+        self.base = 1_699_999_200.0
+
+    def req(self, start, dur, **kw):
+        """One request occupying [start, start+dur]."""
+        self.add(self.base + start + dur, started_ts=self.base + start,
+                 latency_ms=dur * 1000.0, total_ms=dur * 1000.0, **kw)
+
+    def window(self):
+        return self.base, self.base + 600
+
+    def test_sequential_requests_never_overlap(self):
+        self.req(0, 10); self.req(20, 10); self.req(40, 10)
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertEqual(c["peak"], 1)
+        self.assertEqual(c["requests"], 3)
+
+    def test_two_overlapping_requests_peak_at_two(self):
+        self.req(0, 30); self.req(10, 30)
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertEqual(c["peak"], 2)
+        # 0-10 one, 10-30 two, 30-40 one: 20s at level two.
+        self.assertAlmostEqual(c["seconds_at_level"]["2"], 20.0, places=3)
+        self.assertAlmostEqual(c["seconds_at_level"]["1"], 20.0, places=3)
+
+    def test_a_burst_between_polls_is_still_seen(self):
+        """The whole reason for deriving this rather than sampling: three
+        requests inside one second would be invisible to a 5-second gauge."""
+        self.req(0, 0.4); self.req(0.1, 0.4); self.req(0.2, 0.4)
+        self.st.commit()
+        self.assertEqual(metrics.concurrency(self.st, *self.window())["peak"], 3)
+
+    def test_the_mean_is_time_weighted_over_the_whole_window(self):
+        """So an idle stretch pulls it down -- 'how busy was it', not 'how busy
+        when busy'."""
+        self.req(0, 60)            # 60 request-seconds in a 600s window
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertAlmostEqual(c["mean"], 0.1, places=4)
+
+    def test_an_interval_is_clipped_to_the_window(self):
+        """A request that began before the window still contributes the part
+        inside it."""
+        self.req(-100, 150)        # runs from -100 to +50
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertEqual(c["peak"], 1)
+        self.assertAlmostEqual(c["seconds_at_level"]["1"], 50.0, places=3)
+
+    def test_slot_capacity_and_saturation(self):
+        self.req(0, 30); self.req(10, 30)
+        self.st.insert_ps_sample(self.base + 1, 1, [], 2, slots=2)
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertEqual(c["slots"], 2)
+        self.assertAlmostEqual(c["saturated_s"], 20.0, places=3)
+        self.assertIsNotNone(c["utilisation"])
+
+    def test_unknown_capacity_is_none_not_zero(self):
+        """No load observed means capacity is unknown; zero would make
+        utilisation look infinite and saturation look total."""
+        self.req(0, 10)
+        self.st.insert_ps_sample(self.base + 1, 1, [], 1)      # slots omitted
+        self.st.commit()
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertIsNone(c["slots"])
+        self.assertIsNone(c["utilisation"])
+        self.assertIsNone(c["saturated_fraction"])
+
+    def test_rows_without_a_start_are_skipped(self):
+        """started_ts comes from the access log's latency; without it the
+        interval is unknown and must not be invented."""
+        self.add(self.base + 5, latency_ms=None)
+        self.st.commit()
+        self.assertEqual(metrics.concurrency(self.st, *self.window())["requests"], 0)
+
+    def test_health_checks_do_not_count_as_traffic(self):
+        self.req(0, 30, **{"class": "health"})
+        self.req(1, 30, **{"class": "health"})
+        self.st.commit()
+        self.assertEqual(metrics.concurrency(self.st, *self.window())["peak"], 0)
+
+    def test_the_series_splits_a_segment_across_buckets(self):
+        """A request spanning a bucket boundary is charged to both, not to
+        whichever one it started in."""
+        self.req(0, 120)
+        self.st.commit()
+        ts = metrics.concurrency_series(self.st, self.base, self.base + 180, step=60)
+        self.assertEqual(ts["series"]["peak"][0], 1)
+        self.assertEqual(ts["series"]["peak"][1], 1)
+        self.assertAlmostEqual(ts["series"]["mean"][0], 1.0, places=3)
+
+    def test_a_reader_predating_the_slots_column_degrades(self):
+        """Migrations only run read-write, so the MCP server can be new code on
+        an old database; a missing column must not raise."""
+        self.st.db.execute("ALTER TABLE ps_samples RENAME TO ps_old")
+        self.st.db.execute("CREATE TABLE ps_samples (ts REAL PRIMARY KEY,"
+                           " loaded_count INTEGER, models_json TEXT, inflight INTEGER)")
+        self.st.db.commit()
+        self.assertFalse(self.st.has_column("ps_samples", "slots"))
+        c = metrics.concurrency(self.st, *self.window())
+        self.assertIsNone(c["slots"])
+        metrics.concurrency_series(self.st, *self.window())   # must not raise
+        metrics.loaded_models(self.st)
+
+
 class TestRawCoverage(StoreCase):
     """Raw-only breakdowns must distinguish "not stored" from "nothing happened"."""
 

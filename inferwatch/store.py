@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
 # (0.1s-30s), coarse in the tail.  Last bucket is the overflow (inf).
@@ -90,7 +90,10 @@ CREATE TABLE IF NOT EXISTS ps_samples (
     ts           REAL PRIMARY KEY,
     loaded_count INTEGER,
     models_json  TEXT,     -- /api/ps payload, trimmed
-    inflight     INTEGER   -- requests in flight per the correlator
+    inflight     INTEGER,  -- requests in flight per the correlator
+    -- Concurrent slots across resident runners (the sum of each runner's -np).
+    -- NULL when no load has been observed, which is different from zero.
+    slots        INTEGER
 ) WITHOUT ROWID;
 
 -- ----------------------------------------------------------------------
@@ -479,6 +482,12 @@ class Store:
         if cols and "gpu_indices" not in cols:
             self.db.execute("ALTER TABLE vllm_instances ADD COLUMN gpu_indices TEXT")
 
+        # schema 8: slot capacity alongside the in-flight gauge, so
+        # utilisation is computable rather than just occupancy.
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(ps_samples)")}
+        if cols and "slots" not in cols:
+            self.db.execute("ALTER TABLE ps_samples ADD COLUMN slots INTEGER")
+
         # schema 6: how and when GPU attribution was resolved.
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(vllm_instances)")}
         if cols:
@@ -800,11 +809,14 @@ class Store:
                 [(ts, g["index"], g.get("name"), g.get("util_pct"), g.get("mem_used"),
                   g.get("mem_total"), g.get("temp_c"), g.get("power_w")) for g in gpus])
 
-    def insert_ps_sample(self, ts: float, loaded_count: int, models: list, inflight: int) -> None:
+    def insert_ps_sample(self, ts: float, loaded_count: int, models: list,
+                         inflight: int, slots: int | None = None) -> None:
         with self.lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO ps_samples (ts,loaded_count,models_json,inflight)"
-                " VALUES (?,?,?,?)", (ts, loaded_count, json.dumps(models), inflight))
+                "INSERT OR REPLACE INTO ps_samples"
+                " (ts,loaded_count,models_json,inflight,slots)"
+                " VALUES (?,?,?,?,?)",
+                (ts, loaded_count, json.dumps(models), inflight, slots))
 
     def commit(self) -> None:
         with self.lock:
@@ -921,6 +933,23 @@ class Store:
                 "image_events": n_ie}
 
     # -- reads ---------------------------------------------------------------
+
+    def has_column(self, table: str, column: str) -> bool:
+        """Whether a column exists, for readers that may predate a migration.
+
+        Migrations only run on a read-write open, deliberately: a read-only
+        consumer must not mutate the file.  So the MCP server, which is always
+        read-only, can be running new code against a database the collector has
+        not upgraded yet -- and a query naming a new column would raise instead
+        of degrading.
+        """
+        try:
+            with self.lock:
+                cols = {c["name"] for c in
+                        self.db.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            return False
+        return column in cols
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self.lock:

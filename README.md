@@ -526,6 +526,7 @@ tools, which otherwise wait forever on an open stream).
 | `/api/vllm/summary`, `/api/vllm/timeseries`, `/api/vllm/instances` | vLLM breakdowns |
 | `/api/requests`, `/api/errors`, `/api/events`, `/api/gpu`, `/api/ps` | raw rows and timelines |
 | `/api/cache?window=1h` | Ollama prompt-cache occupancy, evictions, update cost |
+| `/api/concurrency?window=1h` | requests in flight at once, peak/mean and slot capacity |
 | `/api/clients?window=1h&limit=25` | per-client detail: models requested, context sizes, tokens, TTFT |
 | `/api/endpoints?window=1h` | traffic by endpoint and class |
 | `/api/images/dashboard?window=24h&source=` | everything the Images tab needs, one time slice |
@@ -552,6 +553,48 @@ Opens the same SQLite file read-only (`mode=ro` plus `PRAGMA query_only`) and
 answers through the same query layer as the dashboard, so a number it reports
 always matches the number on screen.
 
+### Serving it over HTTP
+
+`--transport streamable-http` (or `sse`) serves it as a network service instead
+of a subprocess:
+
+```bash
+sudo ./scripts/install-mcp-key.sh          # writes /etc/inferwatch/mcp-api-key, 0640
+inferwatch-mcp --transport streamable-http --port 7071
+```
+
+Then point a client at `http://127.0.0.1:7071/mcp` with
+`Authorization: Bearer <key>` (or `X-API-Key: <key>`, for clients that can only
+set a plain header).
+
+**An API key is required, and the server refuses to start without one.** Over
+stdio there is nothing to protect — the client spawns the process and owns both
+ends of the pipe. Over HTTP every tool here reads the metrics database, client
+addresses included, and `run_sql` is a general read-only query tool over all of
+it. So HTTP without a key fails closed with instructions rather than starting
+quietly; `--allow-unauthenticated` exists for a socket nothing else can reach
+and logs a warning each time.
+
+The key is looked up in this order, and never lives in the repository or the
+metrics database:
+
+| Source | Notes |
+|---|---|
+| `--api-key-file PATH` | explicit, wins |
+| `$INFERWATCH_MCP_API_KEY` | the value — natural for a systemd `EnvironmentFile=` |
+| `$INFERWATCH_MCP_API_KEY_FILE` | a path |
+| `/etc/inferwatch/mcp-api-key` | the default |
+
+A world-readable key file is **refused**, not warned about. Group-readable is
+allowed, which is how you hand it to a unit (`--group inferwatch`). A file
+containing `INFERWATCH_MCP_API_KEY=…` is accepted as well as a bare key, since
+a key file and an EnvironmentFile look alike at 2am.
+
+`--host` defaults to `127.0.0.1` and `--port` to `7071`. Both were previously
+unreachable: the SDK's own default is `127.0.0.1:8000`, which collides with a
+vLLM server on the same box, and there was no flag or environment variable to
+move it.
+
 | Tool | Purpose |
 |---|---|
 | `get_summary`, `get_timeseries` | Ollama headline metrics and series |
@@ -561,6 +604,7 @@ always matches the number on screen.
 | `vllm_summary`, `vllm_timeseries`, `vllm_instances` | vLLM metrics, reachability, GPU attribution |
 | `gpu_status` | per-device util/VRAM/temp/power |
 | `cache_status` | Ollama prompt-cache occupancy and eviction pressure, plus live KV usage |
+| `concurrency` | requests in flight at once, and how close to slot capacity |
 | `client_stats` | who is calling, for which models, at what context size |
 | `image_summary` | SwarmUI/ComfyUI throughput, durations, models, backends |
 | `image_failures` | what failed, by node class, and what never reached a backend |
@@ -673,6 +717,22 @@ appears only as a log error.
 restarting between polls loses whatever it had not yet reported. At the default
 interval that is a few seconds' exposure; `history_limit` controls how much of
 the ring is re-read each tick.
+
+**In-flight requests are measured; queued ones are not observable.** Ollama
+serves `OLLAMA_NUM_PARALLEL` requests per runner (an upper bound — an
+architecture that cannot serve concurrently is loaded with one slot regardless,
+so capacity is the summed `-np` across resident runners, not a configured
+number). Concurrency is derived from overlapping `[started_ts, ts]` intervals,
+so it is exact and catches a burst that begins and ends between two 5-second
+samples.
+
+What cannot be reported is a **queue depth**. A queued request is given no slot,
+so it emits no runner lines until it starts; ollama logs no queue length; and
+llama.cpp's own `/metrics`, which counts deferred requests, is not enabled —
+ollama passes neither `--metrics` nor `--slots` to the runner. The observable
+consequence of queueing is `queue_ms` on the request that waited, plus the time
+spent with every slot busy (`saturated_s`). Silence on the concurrency panel is
+therefore not evidence that nothing waited.
 
 **The Ollama prompt-cache gauge is sampled on ollama's schedule.** A `cache
 state` line is logged only when ollama runs a cache update, so the series is

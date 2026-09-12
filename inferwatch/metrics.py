@@ -648,11 +648,171 @@ def cache_series(store, start: float, end: float, step: int | None = None) -> di
             "counts": counts, "series": series}
 
 
+# --------------------------------------------------------------------------
+# concurrency
+# --------------------------------------------------------------------------
+
+def _overlap_segments(rows, start: float, end: float):
+    """Sweep request intervals into (t0, t1, level) segments.
+
+    Concurrency is derived from the intervals themselves rather than read off
+    the 5-second sample, because the sample cannot see a burst that begins and
+    ends between two ticks.  Every request already stores `started_ts` (its
+    completion time minus the wall latency the access log reported) and `ts`,
+    so the true number in flight at any instant is just how many intervals
+    cover it.
+
+    Intervals are clipped to the window, so a request that began before it
+    still contributes the part that falls inside.
+    """
+    events = []
+    for r in rows:
+        s0 = max(r["s"], start)
+        s1 = min(r["e"], end)
+        if s1 <= s0:
+            continue
+        events.append((s0, 1))
+        events.append((s1, -1))
+    if not events:
+        return []
+    events.sort()
+    segments = []
+    level = 0
+    prev = events[0][0]
+    for t, delta in events:
+        if t > prev:
+            segments.append((prev, t, level))
+            prev = t
+        level += delta
+    return segments
+
+
+def concurrency(store, start: float, end: float, model: str | None = None) -> dict:
+    """How many requests were in flight at once, and how close to capacity.
+
+    `peak` and `mean` are exact: they come from the intervals, not the poll.
+    `slots` is the summed -np across resident runners at the most recent
+    sample, so `saturated_s` is the time spent with every slot busy -- which is
+    when a further request has to wait.
+
+    NOTE what is absent: requests that were QUEUED. Ollama gives a queued
+    request no slot, so it emits no runner lines and the collector cannot see
+    it until it starts; ollama logs no queue depth, and the runner's own
+    /metrics (which counts deferred requests) is not enabled by ollama. The
+    observable consequence of queueing is `queue_ms` on the request that
+    waited, not a gauge of how many were waiting.
+    """
+    span = max(1e-9, end - start)
+    params: list = [start, end]
+    clause = _model_clause(model, params)
+    rows = store.query(
+        "SELECT started_ts s, ts e FROM requests"
+        " WHERE ts >= ? AND started_ts < ? AND started_ts IS NOT NULL"
+        f" AND class IN ('inference','embed'){clause}", tuple(params))
+    segments = _overlap_segments(rows, start, end)
+
+    peak = 0
+    weighted = 0.0
+    at_level: dict[int, float] = {}
+    for t0, t1, level in segments:
+        dt = t1 - t0
+        peak = max(peak, level)
+        weighted += level * dt
+        if level:
+            at_level[level] = at_level.get(level, 0.0) + dt
+
+    # A reader may predate the migration that added this column.
+    slots = None
+    if store.has_column("ps_samples", "slots"):
+        srow = store.query(
+            "SELECT slots FROM ps_samples WHERE ts >= ? AND ts < ?"
+            " AND slots IS NOT NULL ORDER BY ts DESC LIMIT 1", (start, end))
+        slots = srow[0]["slots"] if srow else None
+    sampled = store.query(
+        "SELECT MAX(inflight) mx FROM ps_samples WHERE ts >= ? AND ts < ?",
+        (start, end))
+    saturated_s = (sum(dt for lvl, dt in at_level.items() if lvl >= slots)
+                   if slots else None)
+
+    return {
+        "start": start, "end": end, "span_s": span, "exact": True,
+        "peak": peak,
+        # Time-weighted over the whole window, so an idle stretch pulls it down
+        # -- this is "how busy was it", not "how busy when busy".
+        "mean": weighted / span,
+        "slots": slots,
+        "utilisation": (weighted / span / slots) if slots else None,
+        "saturated_s": saturated_s,
+        "saturated_fraction": (saturated_s / span) if saturated_s is not None else None,
+        # Seconds spent at each level, which is what tells a brief spike apart
+        # from sustained concurrency.
+        "seconds_at_level": {str(k): v for k, v in sorted(at_level.items())},
+        # The 5s gauge, kept alongside because it counts something slightly
+        # different: tasks the correlator is tracking, including ones whose
+        # access line has not arrived, so it can read higher than `peak`.
+        "sampled_peak": (sampled[0]["mx"] if sampled and sampled[0]["mx"] is not None
+                         else None),
+        "requests": len(rows),
+    }
+
+
+def concurrency_series(store, start: float, end: float, step: int | None = None,
+                       model: str | None = None) -> dict:
+    """Per-bucket concurrency: peak, time-weighted mean, and slot capacity."""
+    span = max(1.0, end - start)
+    step = step or pick_step(span)
+    nb = int(span // step) + 1
+    base = int(start // step) * step
+    series = {k: [None] * nb for k in ("peak", "mean", "slots", "saturated_s")}
+
+    params: list = [start, end]
+    clause = _model_clause(model, params)
+    rows = store.query(
+        "SELECT started_ts s, ts e FROM requests"
+        " WHERE ts >= ? AND started_ts < ? AND started_ts IS NOT NULL"
+        f" AND class IN ('inference','embed'){clause}", tuple(params))
+
+    weighted = [0.0] * nb
+    peaks = [0] * nb
+    touched = [False] * nb
+    for t0, t1, level in _overlap_segments(rows, start, end):
+        # A segment can straddle buckets, so it is split across them rather
+        # than charged to whichever one it started in.
+        i = int((t0 - base) // step)
+        while i < nb and base + i * step < t1:
+            lo = max(t0, base + i * step)
+            hi = min(t1, base + (i + 1) * step)
+            if hi > lo and 0 <= i < nb:
+                weighted[i] += level * (hi - lo)
+                peaks[i] = max(peaks[i], level)
+                touched[i] = True
+            i += 1
+
+    if store.has_column("ps_samples", "slots"):
+        for r in store.query(
+                "SELECT ts, slots FROM ps_samples WHERE ts >= ? AND ts < ?"
+                " AND slots IS NOT NULL ORDER BY ts", (start, end)):
+            i = int((r["ts"] - base) // step)
+            if 0 <= i < nb:
+                series["slots"][i] = r["slots"]
+
+    for i in range(nb):
+        if touched[i]:
+            series["peak"][i] = peaks[i]
+            series["mean"][i] = weighted[i] / step
+    return {"start": base, "step": step, "n": nb, "exact": True,
+            "t": [base + i * step for i in range(nb)],
+            "series": series}
+
+
 def loaded_models(store) -> dict:
-    rows = store.query("SELECT ts,loaded_count,models_json,inflight FROM ps_samples"
-                       " ORDER BY ts DESC LIMIT 1")
+    cols = "ts,loaded_count,models_json,inflight"
+    if store.has_column("ps_samples", "slots"):
+        cols += ",slots"
+    rows = store.query(f"SELECT {cols} FROM ps_samples ORDER BY ts DESC LIMIT 1")
     if not rows:
-        return {"ts": None, "loaded_count": 0, "models": [], "inflight": 0}
+        return {"ts": None, "loaded_count": 0, "models": [], "inflight": 0,
+                "slots": None}
     import json
     r = rows[0]
     try:
@@ -660,7 +820,8 @@ def loaded_models(store) -> dict:
     except ValueError:
         models = []
     return {"ts": r["ts"], "loaded_count": r["loaded_count"], "models": models,
-            "inflight": r["inflight"]}
+            "inflight": r["inflight"],
+            "slots": r["slots"] if "slots" in r.keys() else None}
 
 
 def model_names(store, days: float = 30.0) -> list[str]:

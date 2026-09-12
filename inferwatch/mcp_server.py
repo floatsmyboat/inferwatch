@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import time
@@ -29,6 +30,8 @@ from .config import (REDACTED, SOURCE_KINDS, is_secret_ref, redact_sources,
 from .store import Store
 
 from .main import default_db, env
+
+log = logging.getLogger("inferwatch.mcp")
 
 srv = MCPServer(
     name="inferwatch",
@@ -319,6 +322,57 @@ def gpu_status(window: str = "1h", step_seconds: int | None = None) -> dict:
             last[key] = vals[-1] if vals else None
         latest.append(last)
     return {"window": window, "latest": latest, "series": g}
+
+
+@srv.tool(
+    title="Get request concurrency",
+    description="How many Ollama requests were in flight at once over a window, "
+                "and how close that came to the runner's slot capacity. Derived "
+                "from request intervals, so it is exact and sees bursts the "
+                "5-second sample misses. Note it cannot report QUEUED requests: "
+                "ollama gives a queued request no slot, so it emits no runner "
+                "lines until it starts, and ollama publishes no queue depth. The "
+                "observable effect of queueing is queue_ms on the request that "
+                "waited.",
+)
+def concurrency(window: str = "1h", step_seconds: int | None = None,
+                model: str | None = None) -> dict:
+    """Report concurrent in-flight requests and slot utilisation.
+
+    Args:
+        window: Relative duration to search.
+        step_seconds: Bucket width for the series.
+        model: Optional model filter.
+    """
+    st = store()
+    start, end = _win(window)
+    c = metrics.concurrency(st, start, end, model)
+    out: dict[str, Any] = {
+        "window": window,
+        "concurrency": c,
+        "series": metrics.concurrency_series(st, start, end, step_seconds, model),
+        "notes": [
+            "peak and mean come from overlapping [started_ts, ts] intervals, so "
+            "they are exact rather than sampled.",
+            "sampled_peak is the 5-second gauge and counts something slightly "
+            "different -- tasks the collector is tracking, including ones whose "
+            "access line has not arrived -- so it can read higher than peak.",
+            "seconds_at_level distinguishes a brief spike from sustained "
+            "concurrency.",
+        ],
+    }
+    if c["slots"] is None:
+        out["warning"] = (
+            "slot capacity is unknown: it is read from the -np the runner was "
+            "started with, and no model load has been observed in this window. "
+            "Utilisation and saturation are therefore unavailable, which is not "
+            "the same as unsaturated.")
+    elif c.get("saturated_fraction"):
+        out["warning"] = (
+            f"every slot was busy for {c['saturated_s']:.0f}s of this window "
+            f"({c['saturated_fraction']:.1%}); further requests had to wait, "
+            f"which shows up as queue_ms rather than as a queue depth.")
+    return out
 
 
 @srv.tool(
@@ -811,18 +865,98 @@ def _humanise(rows: list[dict]) -> list[dict]:
     return rows
 
 
+HTTP_TRANSPORTS = ("sse", "streamable-http")
+
+
+def serve_http(transport: str, host: str, port: int, key: str | None) -> None:
+    """Run an HTTP transport behind API-key auth.
+
+    The SDK's own run() is bypassed so the ASGI app can be wrapped before it is
+    served; that is the only place a key check can sit for every request
+    regardless of which transport built the app.
+    """
+    import uvicorn
+
+    from .mcp_auth import BearerAuth
+
+    app = (srv.streamable_http_app() if transport == "streamable-http"
+           else srv.sse_app())
+    path = "/mcp" if transport == "streamable-http" else "/sse"
+    if key:
+        app = BearerAuth(app, key)
+    log.info("MCP %s on http://%s:%d%s (%s)", transport, host, port, path,
+             "API key required" if key else "UNAUTHENTICATED")
+    uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
+
+
 def main(argv=None) -> int:
     global _store
     p = argparse.ArgumentParser(prog="inferwatch-mcp")
     p.add_argument("--db", default=env("DB") or default_db())
     p.add_argument("--transport", default="stdio",
-                   choices=["stdio", "sse", "streamable-http"])
+                   choices=["stdio", *HTTP_TRANSPORTS])
+    # The SDK defaults to 127.0.0.1:8000, which collides with anything already
+    # on 8000 (a vLLM server, commonly) and could not be moved: run() was
+    # called with no kwargs and the SDK reads no environment override.
+    p.add_argument("--host", default=env("MCP_HOST", "127.0.0.1"),
+                   help="bind address for an HTTP transport (default 127.0.0.1; "
+                        "0.0.0.0 exposes it on the network)")
+    p.add_argument("--port", type=int, default=int(env("MCP_PORT", 7071) or 7071),
+                   help="port for an HTTP transport (default 7071)")
+    p.add_argument("--api-key-file", default=None,
+                   help="file holding the API key; defaults to "
+                        "$INFERWATCH_MCP_API_KEY, then "
+                        "$INFERWATCH_MCP_API_KEY_FILE, then "
+                        "/etc/inferwatch/mcp-api-key")
+    p.add_argument("--allow-unauthenticated", action="store_true",
+                   help="serve an HTTP transport with NO key. Everything this "
+                        "server answers comes from the metrics database, "
+                        "including client addresses and a general SQL tool, so "
+                        "only do this on a socket nothing else can reach")
     args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if not os.path.exists(args.db):
         raise SystemExit(f"no metrics database at {args.db}\n"
                          f"start the collector first: python -m inferwatch.main serve")
     _store = Store(args.db, read_only=True)
-    srv.run(args.transport)
+
+    if args.transport == "stdio":
+        # The client spawns this as a subprocess and owns both ends of the
+        # pipe, so there is nothing for a key to protect.
+        if args.api_key_file or args.allow_unauthenticated:
+            log.info("stdio transport: authentication options ignored")
+        srv.run("stdio")
+        return 0
+
+    from .mcp_auth import KeyError_, check_key_strength, load_api_key
+    try:
+        key, source = load_api_key(args.api_key_file)
+        if key:
+            check_key_strength(key)
+    except KeyError_ as e:
+        raise SystemExit(f"MCP API key unusable: {e}") from None
+
+    if not key:
+        if not args.allow_unauthenticated:
+            # Fail closed.  Starting unauthenticated by default would expose
+            # the whole metrics database to whatever finds the port.
+            raise SystemExit(
+                f"refusing to serve {args.transport} without an API key.\n"
+                f"  {source}\n\n"
+                f"create one:\n"
+                f"  sudo install -d -m 750 /etc/inferwatch\n"
+                f"  openssl rand -hex 32 | sudo tee /etc/inferwatch/mcp-api-key >/dev/null\n"
+                f"  sudo chmod 640 /etc/inferwatch/mcp-api-key\n\n"
+                f"or pass --allow-unauthenticated if the socket is genuinely "
+                f"unreachable by anything else.")
+        log.warning("serving %s with NO authentication on %s:%d -- every tool "
+                    "here reads the metrics database, client addresses "
+                    "included", args.transport, args.host, args.port)
+    else:
+        log.info("MCP API key loaded from %s", source)
+
+    serve_http(args.transport, args.host, args.port, key)
     return 0
 
 

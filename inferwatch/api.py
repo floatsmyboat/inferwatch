@@ -419,6 +419,9 @@ def create_app(state: AppState) -> FastAPI:
                 "now": time.time(),
                 "summary": metrics.summary(st, start, end, model),
                 "timeseries": metrics.timeseries(st, start, end, step, model),
+                "concurrency": metrics.concurrency(st, start, end, model),
+                "concurrency_series": metrics.concurrency_series(st, start, end,
+                                                                 step, model),
                 "models": metrics.by_model(st, start, end),
                 "endpoints": metrics.by_endpoint(st, start, end),
                 "clients": metrics.by_client(st, start, end),
@@ -509,6 +512,15 @@ def create_app(state: AppState) -> FastAPI:
         # not read as "few clients called".
         return {"window": window, "start": start, "end": end, "clients": rows,
                 **metrics.coverage(state.store, start)}
+
+    @app.get("/api/concurrency")
+    async def concurrency(window: str = "1h", step: int | None = None,
+                          model: str | None = None):
+        """How many requests were in flight at once, and how close to capacity."""
+        start, end = _window(window)
+        return {"summary": metrics.concurrency(state.store, start, end, model),
+                "series": metrics.concurrency_series(state.store, start, end,
+                                                     step, model)}
 
     @app.get("/api/cache")
     async def cache(window: str = "1h", step: int | None = None):

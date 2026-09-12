@@ -362,6 +362,14 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="tbl-wrap" id="t-queue" hidden></div>
     </div>
 
+    <div class="card" id="c-conc">
+      <header><h2>Requests in flight</h2><span class="note" id="n-conc"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-conc"></div><div class="plot" id="p-conc"></div>
+      <div class="tbl-wrap" id="t-conc" hidden></div>
+    </div>
+
+
     <div class="card" id="c-decode">
       <header><h2>Model decode speed</h2><span class="note">tokens/sec while generating</span>
         <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
@@ -1164,6 +1172,7 @@ function renderKpis() {
          `${fmtCompact(s.cached_tokens, 0)} tokens reused`),
     cacheTile(d.cache),
     liveKvTile(s.ctx_usage),
+    concurrencyTile(d.concurrency),
     tile("Tokens out", fmtCompact(s.output_tokens, 0), "",
          `in ${fmtCompact(s.input_tokens, 0)} · ${fmtCompact(s.out_tok_per_s_wall, 2)}/s`),
     gpuNow ? tile("GPU utilisation", fmtCompact(gpuNow.util, 0), "%", gv0.scope())
@@ -1218,6 +1227,38 @@ function liveKvTile(ctx) {
   return tile("Live KV peak", fmtPct(ctx.max), "",
               `mean ${fmtPct(ctx.mean)} over ${fmtCompact(ctx.n, 0)} requests`,
               (ctx.max || 0) > CTX_ALARM);
+}
+
+/* Requests in flight, against the slots available to serve them.
+   Peak rather than mean, because one moment at capacity is what made a request
+   wait; a comfortable average does not undo it. */
+function concurrencyTile(c) {
+  if (!c || !c.requests) {
+    return tile("Peak in flight", "\u2014", "", "no overlapping requests");
+  }
+  const sub = [];
+  if (c.slots) sub.push(`of ${c.slots} slot${c.slots === 1 ? "" : "s"}`);
+  else sub.push("slot capacity unknown");
+  if (c.saturated_s) sub.push(`${fmtMs(c.saturated_s * 1000)} at capacity`);
+  return tile("Peak in flight", fmtCompact(c.peak, 0), "", sub.join(" · "),
+              !!c.saturated_s);
+}
+
+/* Says what the panel can and cannot show: queued requests are invisible to
+   the collector, so silence here is not evidence nothing waited. */
+function concNote(c) {
+  if (!c || !c.requests) return "no overlapping requests in window";
+  const bits = [`peak ${c.peak}`, `mean ${fmtCompact(c.mean, 2)}`];
+  if (c.slots) {
+    bits.push(`${c.slots} slot${c.slots === 1 ? "" : "s"}`);
+    if (c.utilisation !== null && c.utilisation !== undefined) {
+      bits.push(`${fmtPct(c.utilisation)} utilised`);
+    }
+  } else {
+    bits.push("capacity unknown (no load seen)");
+  }
+  bits.push("queued requests are not observable \u2014 see queue wait");
+  return bits.join(" · ");
 }
 
 /* Consumer cards throttle in the mid-80s, so this is where a temperature stops
@@ -1427,6 +1468,23 @@ function renderCharts() {
     type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s", fmtTick,
     series: [{ name: "decode tok/s", values: S.decode_tps, color: sc(0) }],
   });
+
+  /* Requests in flight. Peak, mean and slot capacity are all counts of
+     requests, so they belong on one axis; the capacity line is what turns
+     "two at once" into "two of two, and the next one waited". */
+  const cs2 = d.concurrency_series || { t: [], series: {} };
+  const CC = cs2.series || {};
+  const conc = d.concurrency || {};
+  draw("conc", "p-conc", "l-conc", {
+    type: "line", t: cs2.t, fmt: (v) => fmtCompact(v, 1),
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [
+      { name: "peak", values: CC.peak, color: sc(0) },
+      { name: "mean", values: CC.mean, color: sc(1) },
+      { name: "slot capacity", values: CC.slots, color: css("--deemph") },
+    ],
+  });
+  text($("n-conc"), concNote(conc));
 
   /* Prompt cache. Its own t array: these samples arrive on ollama's schedule,
      not on the request timeline, so they are bucketed independently. */

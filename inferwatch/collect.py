@@ -96,6 +96,12 @@ class Correlator:
         self.awaiting_model: collections.deque = collections.deque()  # awaiting model name
         self.blob_to_model: dict[str, str] = {}
         self.loaded_models: set[str] = set()
+        # model -> how many parallel slots its runner was started with (-np).
+        # Ollama picks this per model rather than globally: OLLAMA_NUM_PARALLEL
+        # is an upper bound, and an architecture that cannot serve concurrently
+        # is loaded with one slot regardless.  Total capacity is therefore the
+        # sum across resident runners, not a single configured number.
+        self.runner_slots: dict[str, int] = {}
         self.loaded_count: int = 0
         self.recent_model: str | None = None
         self.pending_load: dict | None = None
@@ -151,6 +157,18 @@ class Correlator:
     @property
     def inflight(self) -> int:
         return len(self.tasks)
+
+    @property
+    def slots(self) -> int | None:
+        """Total concurrent slots across resident runners, or None if unknown.
+
+        None rather than 0 when no load has been observed: a collector that
+        started after the model did has not seen an -np line, and reporting
+        zero capacity would make utilisation look infinite.
+        """
+        if not self.runner_slots:
+            return None
+        return sum(self.runner_slots.values())
 
     # -- slot lines ----------------------------------------------------------
 
@@ -418,6 +436,9 @@ class Correlator:
                 name = self.model_index.resolve(blob_ref)
             if name:
                 self.loaded_models.add(name)
+                slots = detail.get("parallel")
+                if slots:
+                    self.runner_slots[name] = int(slots)
             # Ollama prints "llama-server started in Ns" once per llama-server
             # handle (main model and projector), so the same load surfaces
             # twice a few ms apart.  Keep the first.
@@ -449,6 +470,7 @@ class Correlator:
         elif event == "unload":
             if model:
                 self.loaded_models.discard(model)
+                self.runner_slots.pop(model, None)
             self.on_event({"ts": ts, "kind": "unload", "level": "INFO", "model": model,
                            "source": ev.get("source"), "msg": ev["msg"], "detail": None})
         elif event == "runner_count":
@@ -666,10 +688,12 @@ class PsPoller:
                 ts = time.time()
                 ps = await loop.run_in_executor(None, sample_ps, self.base_url)
                 inflight = self.corr.inflight if self.corr else 0
-                self.store.insert_ps_sample(ts, len(ps), ps, inflight)
+                slots = self.corr.slots if self.corr else None
+                self.store.insert_ps_sample(ts, len(ps), ps, inflight, slots)
                 self.store.commit()
                 await loop.run_in_executor(None, self.resolve_gpus, ts)
                 self.last = {"ts": ts, "models": ps, "inflight": inflight,
+                             "slots": slots,
                              "gpu_indices": self.gpu_indices,
                              "gpu_source": self.gpu_source}
                 self.on_live({"type": "sample", **self.last})
