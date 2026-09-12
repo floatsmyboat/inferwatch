@@ -1,0 +1,66 @@
+# inferwatch MCP server -- read-only metrics tools over HTTP
+#
+# This is a TEMPLATE.  Do not install it directly -- its placeholders are
+# filled in by:
+#
+#   ./scripts/install-systemd.sh --mcp            # system service, needs sudo
+#   ./scripts/install-systemd.sh --mcp --user     # per-user service, no sudo
+#
+# A SEPARATE unit from the collector on purpose.  This process opens the
+# metrics database read-only and serves queries; the collector writes to it.
+# Keeping them apart means restarting one to change a setting does not
+# interrupt the other, and a crash in either leaves the other running.
+
+[Unit]
+Description=inferwatch MCP server (read-only metrics tools over HTTP)
+Documentation=file://@@DIR@@/README.md
+After=network-online.target
+Wants=network-online.target
+# Ordered after the collector so the database exists on a first boot, but not
+# bound to it: this server only reads, so it can keep answering while the
+# collector is restarted, and its data simply stops advancing.
+After=inferwatch.service
+Wants=inferwatch.service
+
+[Service]
+Type=exec
+User=@@USER@@
+Group=@@GROUP@@
+WorkingDirectory=@@DIR@@
+
+Environment=INFERWATCH_DB=@@DATADIR@@/inferwatch.db
+Environment=PYTHONUNBUFFERED=1
+
+# The API key is NOT set here.  It is read from /etc/inferwatch/mcp-api-key,
+# which must be group-readable by @@GROUP@@:
+#   sudo ./scripts/install-mcp-key.sh --rotate --group @@GROUP@@
+# Set INFERWATCH_MCP_API_KEY via an EnvironmentFile instead if you prefer.
+#
+# The server REFUSES TO START without a key on an HTTP transport.  Every tool
+# it exposes reads the metrics database -- client addresses included -- and
+# run_sql is a general read-only query tool over all of it.
+ExecStart=@@PYTHON@@ \
+    -m inferwatch.mcp_server \
+    --transport streamable-http --host @@MCPHOST@@ --port @@MCPPORT@@
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening.  This process only needs to read two things: the metrics database
+# and the key file.  It writes nothing, so no path is granted for writing.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

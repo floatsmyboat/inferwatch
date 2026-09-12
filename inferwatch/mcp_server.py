@@ -868,6 +868,18 @@ def _humanise(rows: list[dict]) -> list[dict]:
 HTTP_TRANSPORTS = ("sse", "streamable-http")
 
 
+def _is_loopback(host: str) -> bool:
+    """Whether a bind address only reaches this machine."""
+    import ipaddress
+    text = (host or "").strip().strip("[]")
+    if text in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
 def serve_http(transport: str, host: str, port: int, key: str | None) -> None:
     """Run an HTTP transport behind API-key auth.
 
@@ -879,13 +891,31 @@ def serve_http(transport: str, host: str, port: int, key: str | None) -> None:
 
     from .mcp_auth import BearerAuth
 
-    app = (srv.streamable_http_app() if transport == "streamable-http"
-           else srv.sse_app())
-    path = "/mcp" if transport == "streamable-http" else "/sse"
+    # The SDK validates the Host header against an allow-list built from the
+    # host it was told about, defaulting to 127.0.0.1 -- so a server bound to
+    # 0.0.0.0 answers 421 Misdirected Request to every client that addresses it
+    # by its real address.  That check is DNS-rebinding protection, which
+    # exists for UNAUTHENTICATED services a browser could be tricked into
+    # calling; here every request must carry the API key, which a rebinding
+    # attacker cannot supply.  So when the operator has deliberately bound a
+    # non-loopback address, the key is the control and the host check is turned
+    # off; on loopback the SDK's default stays as it is.
+    security = None
+    if not _is_loopback(host):
+        from mcp.server.transport_security import TransportSecuritySettings
+        security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    if transport == "streamable-http":
+        app = srv.streamable_http_app(transport_security=security, host=host)
+        path = "/mcp"
+    else:
+        app = srv.sse_app(transport_security=security, host=host)
+        path = "/sse"
     if key:
         app = BearerAuth(app, key)
-    log.info("MCP %s on http://%s:%d%s (%s)", transport, host, port, path,
-             "API key required" if key else "UNAUTHENTICATED")
+    log.info("MCP %s on http://%s:%d%s (%s%s)", transport, host, port, path,
+             "API key required" if key else "UNAUTHENTICATED",
+             "" if security is None else ", host check off: the key is the control")
     uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
 
 

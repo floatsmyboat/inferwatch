@@ -590,10 +590,37 @@ allowed, which is how you hand it to a unit (`--group inferwatch`). A file
 containing `INFERWATCH_MCP_API_KEY=…` is accepted as well as a bare key, since
 a key file and an EnvironmentFile look alike at 2am.
 
-`--host` defaults to `127.0.0.1` and `--port` to `7071`. Both were previously
-unreachable: the SDK's own default is `127.0.0.1:8000`, which collides with a
-vLLM server on the same box, and there was no flag or environment variable to
-move it.
+`--host` defaults to `127.0.0.1` and `--port` to `7071`, and both can also be
+set with `INFERWATCH_MCP_HOST` / `INFERWATCH_MCP_PORT` (the flag wins). Neither
+was reachable before: the SDK's own default is `127.0.0.1:8000`, which collides
+with a vLLM server on the same box, and no flag or environment variable moved
+it.
+
+Binding a non-loopback address also turns **off** the SDK's Host-header
+allow-list. That check is DNS-rebinding protection, which exists for
+*unauthenticated* services a browser could be tricked into calling; here every
+request must carry the API key, which a rebinding attacker cannot supply. Left
+on, a server bound to `0.0.0.0` answers `421 Misdirected Request` to every
+client that addresses it by its real address. On loopback the SDK default is
+untouched.
+
+#### Running it on boot
+
+```bash
+sudo ./scripts/install-mcp-key.sh --rotate --group "$(id -gn)"
+MCPHOST=0.0.0.0 MCPPORT=7071 ./scripts/install-systemd.sh --mcp
+sudo systemctl enable --now inferwatch-mcp
+```
+
+A separate unit from the collector on purpose: this process only reads the
+database while the collector writes it, so restarting one does not interrupt
+the other. It is ordered `After=inferwatch.service` so the database exists on a
+first boot, but not bound to it — it keeps answering while the collector
+restarts, its data simply stops advancing.
+
+Bound beyond loopback the API key is required, but it crosses the wire in clear
+text. Restrict it at the firewall the same way as the dashboard, and put TLS in
+front if it ever leaves the machine.
 
 | Tool | Purpose |
 |---|---|
@@ -810,6 +837,7 @@ inferwatch/supervisor.py   builds and rebuilds collectors from the sources table
 inferwatch/api.py          FastAPI endpoints + SSE
 inferwatch/web/index.html  dashboard (single file, no CDN, no build step)
 inferwatch/mcp_server.py   MCP server (read-only)
+inferwatch/mcp_auth.py     API-key auth for the MCP HTTP transports
 inferwatch/main.py         serve / ingest / stats / sources
 ```
 

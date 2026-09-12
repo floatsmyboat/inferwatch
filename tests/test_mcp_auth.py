@@ -223,5 +223,51 @@ class TestBearerAuth(unittest.TestCase):
         self.assertEqual(app.calls, [])
 
 
+class TestBindAddress(unittest.TestCase):
+    """Which addresses count as loopback decides whether the SDK's Host
+    allow-list is left on."""
+
+    def test_loopback_forms(self):
+        from inferwatch.mcp_server import _is_loopback
+        for host in ("127.0.0.1", "127.0.0.53", "localhost", "::1", "[::1]", ""):
+            self.assertTrue(_is_loopback(host), host)
+
+    def test_non_loopback_forms(self):
+        from inferwatch.mcp_server import _is_loopback
+        for host in ("0.0.0.0", "10.0.0.5", "100.100.100.2", "::", "example.invalid"):
+            self.assertFalse(_is_loopback(host), host)
+
+    def test_a_hostname_is_not_assumed_loopback(self):
+        """Unresolvable or unknown names must fall to the safe side: treating
+        them as loopback would leave the Host check on and answer 421."""
+        from inferwatch.mcp_server import _is_loopback
+        self.assertFalse(_is_loopback("some-host.lan"))
+
+
+class TestRebindingGuard(unittest.TestCase):
+    def test_a_wide_bind_turns_the_host_check_off(self):
+        """Regression: binding 0.0.0.0 served 401 to an anonymous caller but
+        421 Misdirected Request to an authenticated one, because the SDK only
+        trusted a Host of 127.0.0.1. The check is DNS-rebinding protection for
+        UNAUTHENTICATED services; here the mandatory API key is the control, so
+        it is disabled only when the operator deliberately binds wide."""
+        import inspect
+
+        from inferwatch import mcp_server
+        src = inspect.getsource(mcp_server.serve_http)
+        self.assertIn("_is_loopback(host)", src)
+        self.assertIn("enable_dns_rebinding_protection=False", src)
+        # and the app must be told the host, not built with the default
+        self.assertIn("host=host", src)
+
+    def test_loopback_keeps_the_sdk_default(self):
+        import inspect
+
+        from inferwatch import mcp_server
+        src = inspect.getsource(mcp_server.serve_http)
+        # security stays None unless the bind is non-loopback
+        self.assertIn("security = None", src)
+
+
 if __name__ == "__main__":
     unittest.main()
