@@ -43,14 +43,32 @@ class KeyError_(Exception):
     """A key was configured but cannot be used."""
 
 
+class KeyAbsent(KeyError_):
+    """Nothing is there -- as opposed to something unusable being there."""
+
+
 def read_key_file(path: str) -> str:
     """Read a key from a file, refusing an unsafe one.
 
     The file is allowed to be group-readable (a service group is the normal way
     to share it with the unit) but never world-readable.
+
+    "Not there" and "there but unreadable" raise different exceptions, because
+    they need opposite advice: create one, versus fix who can read the one you
+    have.  Conflating them told an operator to create a file that already
+    existed -- which is what happens by default, since a 0750 /etc/inferwatch
+    means an unprivileged process cannot even stat the file inside it.
     """
     try:
         st = os.stat(path)
+    except FileNotFoundError:
+        raise KeyAbsent(f"{path} does not exist") from None
+    except PermissionError:
+        raise KeyError_(
+            f"cannot stat {path}: permission denied. The file or its directory "
+            f"is not readable by this user -- make the key group-readable by a "
+            f"group this user is in: "
+            f"sudo ./scripts/install-mcp-key.sh --rotate --group <group>") from None
     except OSError as e:
         raise KeyError_(f"cannot read {path}: {e}") from None
     if st.st_mode & stat.S_IROTH:
@@ -60,6 +78,12 @@ def read_key_file(path: str) -> str:
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
+    except PermissionError:
+        raise KeyError_(
+            f"cannot read {path}: permission denied (mode "
+            f"{stat.S_IMODE(st.st_mode):o}). Make it group-readable by a group "
+            f"this user is in: sudo ./scripts/install-mcp-key.sh --rotate "
+            f"--group <group>") from None
     except OSError as e:
         raise KeyError_(f"cannot read {path}: {e}") from None
     # Tolerate a trailing newline and an accidental KEY=value line, since an
@@ -89,9 +113,13 @@ def load_api_key(explicit_file: str | None = None, environ=None) -> tuple[str | 
     if env.get(ENV_KEY_FILE):
         path = env[ENV_KEY_FILE]
         return read_key_file(path), f"${ENV_KEY_FILE} ({path})"
-    if os.path.exists(DEFAULT_KEY_FILE):
+    # Attempted rather than existence-checked: os.path.exists() is False for an
+    # unreadable directory, so probing first would report a present-but-locked
+    # key as absent and advise creating it again.
+    try:
         return read_key_file(DEFAULT_KEY_FILE), DEFAULT_KEY_FILE
-    return None, f"no key: set ${ENV_KEY} or create {DEFAULT_KEY_FILE}"
+    except KeyAbsent:
+        return None, f"no key: set ${ENV_KEY} or create {DEFAULT_KEY_FILE}"
 
 
 def check_key_strength(key: str) -> None:

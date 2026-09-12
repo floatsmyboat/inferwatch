@@ -12,8 +12,9 @@ import tempfile
 import unittest
 
 from inferwatch.mcp_auth import (DEFAULT_KEY_FILE, ENV_KEY, ENV_KEY_FILE,
-                                 BearerAuth, KeyError_, check_key_strength,
-                                 load_api_key, presented_key, read_key_file)
+                                 BearerAuth, KeyAbsent, KeyError_,
+                                 check_key_strength, load_api_key,
+                                 presented_key, read_key_file)
 
 KEY = "0123456789abcdef0123456789abcdef"
 
@@ -56,9 +57,35 @@ class TestKeyFile(KeyFileCase):
         with self.assertRaises(KeyError_):
             read_key_file(self.write("   \n"))
 
-    def test_a_missing_file_is_refused(self):
-        with self.assertRaises(KeyError_):
+    def test_a_missing_file_raises_absent_specifically(self):
+        """Absent and present-but-unreadable need opposite advice -- create
+        one, versus fix who can read the one you have."""
+        with self.assertRaises(KeyAbsent):
             read_key_file(os.path.join(self.dir, "nope"))
+
+    def test_an_unreadable_file_is_not_reported_as_absent(self):
+        """Regression: /etc/inferwatch is 0750, so an unprivileged process
+        cannot even stat the key inside it. Probing with os.path.exists first
+        reported the key as missing and told the operator to create a file that
+        already existed."""
+        path = self.write(KEY, mode=0o600)
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything")
+        os.chmod(path, 0o000)
+        with self.assertRaises(KeyError_) as cm:
+            read_key_file(path)
+        self.assertNotIsInstance(cm.exception, KeyAbsent)
+        self.assertIn("permission denied", str(cm.exception))
+        # and it says how to fix it, not just what failed
+        self.assertIn("--group", str(cm.exception))
+
+    def test_load_reports_an_unreadable_default_as_an_error_not_absence(self):
+        path = self.write(KEY, mode=0o000)
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything")
+        with self.assertRaises(KeyError_) as cm:
+            load_api_key(path, {})
+        self.assertNotIsInstance(cm.exception, KeyAbsent)
 
     def test_a_short_key_is_refused(self):
         with self.assertRaises(KeyError_):

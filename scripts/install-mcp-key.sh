@@ -41,6 +41,12 @@ fi
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 
 install -d -m 750 "$DIR"
+# The group needs to traverse the directory as well as read the file; a
+# group-readable key inside a root-only directory is still unreachable.
+if [ -n "$GROUP" ]; then
+    chgrp "$GROUP" "$DIR"
+    chmod 750 "$DIR"
+fi
 KEY="$(openssl rand -hex 32)"
 # Written via a temp file in the same directory so the real one is never
 # briefly readable with the wrong mode.
@@ -54,6 +60,7 @@ fi
 mv -f "$TMP" "$FILE"
 
 echo "wrote $FILE ($(stat -c '%a %U:%G' "$FILE"))"
+echo "       in $DIR ($(stat -c '%a %U:%G' "$DIR"))"
 echo
 echo "key: $KEY"
 echo
