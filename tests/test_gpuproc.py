@@ -161,6 +161,12 @@ class TestUnitAttribution(unittest.TestCase):
             self.assertIsNone(gpuproc.gpus_for_unit("ollama"))
 
     def test_normalise_leaves_scopes_and_slices_alone(self):
+        self.assertEqual(gpuproc.parse_units("a, b.service  c"),
+                         ["a.service", "b.service", "c.service"])
+        self.assertEqual(gpuproc.parse_units("a,,a"), ["a.service"])
+        self.assertEqual(gpuproc.parse_units(""), [])
+        self.assertEqual(gpuproc.parse_units(None), [])
+        self.assertEqual(gpuproc.parse_units(["a", "b"]), ["a.service", "b.service"])
         self.assertEqual(gpuproc.normalise_unit("a.scope"), "a.scope")
         self.assertEqual(gpuproc.normalise_unit("a.slice"), "a.slice")
         self.assertEqual(gpuproc.normalise_unit("a"), "a.service")
@@ -210,6 +216,36 @@ class TestResolveOrder(unittest.TestCase):
             got, how = gpuproc.resolve(unit="cpu-only", port=8000)
         self.assertEqual(got, [])
         self.assertTrue(how.startswith("cgroup:"))
+
+    def test_several_candidate_units_follow_whichever_is_running(self):
+        """A switcher rotates flavours of one engine, so pinning a single unit
+        name turns attribution off at the next switch -- and the pane then
+        plots every card on the host as that engine's."""
+        live = {"vllm-qwen38-dflash2.service": [2, 3]}
+        with mock.patch.object(gpuproc, "gpus_for_unit",
+                               side_effect=lambda u: live.get(u)):
+            got, how = gpuproc.resolve(
+                unit="vllm-qwen38, vllm-qwen38-w4a16, vllm-qwen38-dflash2")
+        self.assertEqual(got, [2, 3])
+        self.assertEqual(how, "cgroup:vllm-qwen38-dflash2.service")
+
+    def test_overlapping_units_are_unioned_not_raced(self):
+        """Both flavours are briefly up during a handover, and both really do
+        hold cards then, so order of the list must not decide the answer."""
+        live = {"a.service": [0], "b.service": [1]}
+        with mock.patch.object(gpuproc, "gpus_for_unit",
+                               side_effect=lambda u: live.get(u)):
+            self.assertEqual(gpuproc.resolve(unit="a,b"),
+                             ([0, 1], "cgroup:a.service,b.service"))
+            self.assertEqual(gpuproc.resolve(unit="b,a"),
+                             ([0, 1], "cgroup:b.service,a.service"))
+
+    def test_no_candidate_running_is_unknown_not_empty(self):
+        """None of the names matching a cgroup cannot be told apart from all of
+        them being wrong, so it must not assert "holds no GPU"."""
+        with mock.patch.object(gpuproc, "gpus_for_unit", return_value=None), \
+             mock.patch.object(gpuproc, "gpus_for_pids", return_value=[7]):
+            self.assertEqual(gpuproc.resolve(unit="a,b", pids=[7]), ([7], "pids"))
 
     def test_falls_back_to_pids_then_port(self):
         with mock.patch.object(gpuproc, "gpus_for_unit", return_value=None), \

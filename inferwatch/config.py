@@ -232,15 +232,19 @@ SOURCE_KINDS = {
             {"key": "url", "label": "Base URL", "type": "str",
              "default": "http://127.0.0.1:8000",
              "help": "The OpenAI-compatible server root. /metrics is read from here."},
-            {"key": "unit", "label": "systemd unit (optional)", "type": "str", "default": "",
+            {"key": "unit", "label": "systemd unit(s) (optional)", "type": "str", "default": "",
              "help": "The unit running the ENGINE, which is what its GPUs are "
                      "attributed by -- every process in that unit's cgroup is "
                      "matched against nvidia-smi. Set it to the engine's unit, "
                      "not a proxy in front of it: with a proxy on the URL there "
                      "are no GPUs behind that port and attribution reports "
-                     "'could not attribute'. The journal is also read from it "
-                     "for HTTP status codes, client addresses and engine errors, "
-                     "which /metrics does not expose."},
+                     "'could not attribute'. If a switcher rotates flavours of "
+                     "the same engine, list every candidate separated by "
+                     "commas -- whichever is running is the one attributed, so "
+                     "a switch does not silently turn attribution off. The "
+                     "journal is also read from it for HTTP status codes, "
+                     "client addresses and engine errors, which /metrics does "
+                     "not expose."},
             {"key": "api_key", "label": "API key (optional)", "type": "str",
              "default": "", "secret": True,
              "help": "Sent as a bearer token if the server requires one. "

@@ -483,11 +483,12 @@ class TestGpuView(unittest.TestCase):
         cls.ctx = quickjs.Context()
         cls.ctx.eval(src)
 
-    def view(self, indices, n=4):
+    def view(self, indices, n=4, idle=None):
         gpus = ", ".join('{"index":%d,"name":"NVIDIA RTX","mem_total":16311}' % i
                          for i in range(n))
         owned = "null" if indices is None else str(list(indices))
-        return f"gpuView([{gpus}], {owned})"
+        extra = "" if idle is None else f", {idle!r}"
+        return f"gpuView([{gpus}], {owned}{extra})"
 
     def js(self, expr):
         return self.ctx.eval(expr)
@@ -519,6 +520,26 @@ class TestGpuView(unittest.TestCase):
         self.assertIn("(other engine)", self.js(v + ".label({index:0,name:'NVIDIA RTX'})"))
         self.assertEqual(self.js(v + ".colour({index:0})"), "--deemph")
         self.assertNotIn("(other engine)", self.js(v + ".label({index:2,name:'NVIDIA RTX'})"))
+
+    def test_an_idle_engine_does_not_claim_the_cards_were_taken(self):
+        """Holding nothing is not evidence that anyone else holds them. The
+        pane used to label all four "(other engine)" when ollama was simply
+        between runners, which reads as "these cards were taken from you"."""
+        v = self.view([], idle="no runner resident")
+        self.assertFalse(self.js(v + ".held"))
+        for i in range(4):
+            self.assertNotIn("(other engine)",
+                             self.js(v + ".label({index:%d,name:'NVIDIA RTX'})" % i))
+
+    def test_the_idle_reason_is_named_in_scope_and_note(self):
+        v = self.view([], idle="no runner resident")
+        self.assertEqual(self.js(v + ".scope()"), "no runner resident")
+        self.assertEqual(self.js(v + '.note("cgroup:ollama.service")'),
+                         "no runner resident \u2014 holds none of the 4 devices "
+                         "\u00b7 via cgroup:ollama.service")
+
+    def test_a_pane_that_gives_no_reason_keeps_the_plain_wording(self):
+        self.assertEqual(self.js(self.view([]) + ".scope()"), "holds no GPU")
 
     def test_a_card_keeps_one_colour_however_often_it_is_asked(self):
         """Colours used to come from a counter incremented during rendering and

@@ -424,7 +424,7 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | Field | Default | Required when | Notes |
 |---|---|---|---|
 | `url` | `http://127.0.0.1:8000` | — | The OpenAI-compatible server root. /metrics is read from here. |
-| `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. The journal is also read from it for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
+| `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. If a switcher rotates flavours of the same engine, list every candidate separated by commas -- whichever is running is the one attributed, so a switch does not silently turn attribution off. The journal is also read from it for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
 | `api_key` | — | — | Sent as a bearer token if the server requires one. Prefer an indirection like ${VLLM_API_KEY} over pasting the value: what is stored here goes into the database in plain text, and a reference keeps the secret in the environment or an EnvironmentFile instead. |
 
 #### Command-line flags
@@ -480,6 +480,7 @@ GPUs are resolved by three methods, in descending order of trust:
 | Method | How | When it applies |
 |---|---|---|
 | **cgroup** | every pid in a unit's cgroup, intersected with `nvidia-smi`'s compute processes | a `unit` is configured on the source — the reliable one |
+| ↳ several units | each candidate resolved, whichever are running unioned | a switcher rotates flavours of one engine |
 | **pids** | ollama's own `runner.pid` log lines | Ollama, for the `llama-server` it spawned |
 | **port** | the listening pid → its descendants | last resort, no unit configured |
 
@@ -492,12 +493,35 @@ what survives reparenting. On the development host the URL's listener is in
 cgroup method finds them — set `unit` to the unit running the **engine**, never
 the proxy.
 
+A single unit name is not always correct for long. Here a switcher starts
+exactly one of `vllm-qwen38{,-w4a16,-dflash2}.service`, so the name pinned in
+the config went stale at the first switch and attribution fell to *unknown* —
+which, on the vLLM pane, plots every card on the host as vLLM's own and sums
+another engine's VRAM and watts into its tiles. So `unit` takes a comma-separated
+list, and whichever candidates are running are the ones attributed:
+
+```
+unit = vllm-qwen38, vllm-qwen38-w4a16, vllm-qwen38-dflash2
+```
+
+A candidate that is not running contributes nothing and is not an error — with a
+switcher the inactive flavours are *expected* to be absent. Only when none of
+them is running is the answer unknown, since names matching no cgroup cannot be
+told apart from wrong names. Two units up at once during a handover are unioned
+rather than raced, so the list's order never decides the answer.
+
 Three outcomes, rendered differently, because collapsing them is how a wrong
 answer gets presented as a right one:
 
 - **specific cards** — "holds GPU 2, 3 of 4 · via cgroup:vllm-qwen38.service",
   with the method named so a surprising answer is diagnosable
-- **none** — attributed, and the engine is on no card (a CPU-only instance)
+- **none** — attributed, and the engine is on no card: a CPU-only instance, or
+  simply an idle one. Holding nothing is *not* evidence that anything else
+  holds those cards, so no device is labelled "(other engine)" in this state —
+  that suffix is used only once the engine demonstrably holds something. The
+  pane names the reason instead: ollama's runner exits on keep-alive expiry, so
+  its pane reads "no runner resident — holds none of the 4 devices". Before,
+  every card was marked "(other engine)" and an idle ollama looked dispossessed.
 - **unknown** — no nvidia-smi, no cgroup visibility, a remote engine, or an
   empty result from the weakest method (far likelier to be the wrong process
   tree than a genuinely idle engine). Every card is shown without emphasis and

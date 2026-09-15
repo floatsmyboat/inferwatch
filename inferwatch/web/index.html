@@ -1155,7 +1155,8 @@ function tile(label, value, unit, sub, alarm, swatch) {
 function renderKpis() {
   const d = state.data, s = d.summary;
   const k = $("kpis"); k.innerHTML = "";
-  const gv0 = gpuView((d.gpu || {}).gpus, (d.gpu_owned || {}).indices);
+  const gv0 = gpuView((d.gpu || {}).gpus, (d.gpu_owned || {}).indices,
+                      "no runner resident");
   const gpuNow = latestFrom(gv0.cards);
   k.append(
     tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
@@ -1352,9 +1353,18 @@ function fmtAgo(seconds) {
    Colours come from a map built once, not a counter incremented while
    rendering, so a card keeps the same colour on every chart however many times
    a spec happens to ask for it. */
-function gpuView(gpus, owned) {
+/* `owned` is null for "could not attribute" and [] for "attributed, and it
+   holds nothing right now".  That third state needs its own words: an engine
+   that has gone idle holds no card, which is NOT the same as another engine
+   having taken its cards.  Labelling every device "(other engine)" asserted
+   exactly that, so an ollama pane between runners read as one that had been
+   dispossessed of all four.  `idle` is the pane's own word for why it holds
+   nothing; the "(other engine)" suffix is now only used once this engine
+   demonstrably holds something, which is the only time the contrast is real. */
+function gpuView(gpus, owned, idle) {
   gpus = gpus || [];
   const known = Array.isArray(owned);
+  const held = known && owned.length > 0;
   const isMine = (i) => !known || owned.includes(i);
   const colours = new Map();
   let slot = 0;
@@ -1362,26 +1372,27 @@ function gpuView(gpus, owned) {
     colours.set(gpu.index, isMine(gpu.index) ? sc(slot++) : css("--deemph"));
   }
   return {
-    known, owned, isMine,
+    known, held, owned, isMine,
     all: gpus,
     /* The cards this engine holds. Every aggregate -- tiles, hottest card,
        total watts, total VRAM -- is computed over these, never the host. */
     cards: known ? gpus.filter((x) => isMine(x.index)) : gpus,
     label: (gpu) => `GPU ${gpu.index}`
       + (gpu.name ? " · " + gpu.name.replace(/^NVIDIA\s+/, "") : "")
-      + (known && !isMine(gpu.index) ? " (other engine)" : ""),
+      + (held && !isMine(gpu.index) ? " (other engine)" : ""),
     colour: (gpu) => colours.get(gpu.index) || css("--deemph"),
     /* Tile sub-line: names the cards, or says plainly that it cannot. */
     scope: () => !known ? "all devices (unattributed)"
-      : owned.length ? `GPU ${owned.join(", ")}` : "holds no GPU",
+      : held ? `GPU ${owned.join(", ")}` : (idle || "holds no GPU"),
     /* Panel note: adds the denominator and how the answer was reached. */
     note: (how) => {
       if (!gpus.length) return "no samples yet";
       const via = how && how !== "unavailable" ? ` · via ${how}` : "";
       if (!known) return `${gpus.length} device${gpus.length === 1 ? "" : "s"}; could not attribute`;
-      return (owned.length
-        ? `holds GPU ${owned.join(", ")} of ${gpus.length}`
-        : `holds none of the ${gpus.length} devices`) + via;
+      if (held) return `holds GPU ${owned.join(", ")} of ${gpus.length}` + via;
+      /* Naming the reason keeps "idle" from reading as "lost its cards". */
+      return (idle ? `${idle} — ` : "")
+        + `holds none of the ${gpus.length} devices` + via;
     },
   };
 }
@@ -1531,7 +1542,7 @@ function renderCharts() {
      whole host, and this pane used to plot and total all of it. */
   const g = d.gpu || { t: [], gpus: [] };
   const owned = d.gpu_owned || {};
-  const gv = gpuView(g.gpus, owned.indices);
+  const gv = gpuView(g.gpus, owned.indices, "no runner resident");
 
   draw("gpu", "p-gpu", "l-gpu", {
     type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",

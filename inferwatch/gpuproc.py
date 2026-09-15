@@ -7,7 +7,10 @@ card on one engine's pane would imply it uses them all.
 
 THREE WAYS TO ASK, IN DESCENDING ORDER OF TRUST
 -----------------------------------------------
-1. `gpus_for_unit(unit)`  -- every pid in a systemd unit's cgroup.
+1. `gpus_for_unit(unit)`  -- every pid in a systemd unit's cgroup.  Callers
+   pass a spec through `gpus_for_units`, which takes several comma-separated
+   names and unions whichever are running, so an engine whose active unit
+   rotates does not lose attribution at the next switch.
 2. `gpus_for_pids(pids)`  -- an exact pid set the caller already knows, e.g.
    ollama logs `runner.pid` for the llama-server it spawned.
 3. `gpus_for_port(port)`  -- the listening pid, then its descendants.
@@ -228,6 +231,52 @@ def gpus_for_unit(unit: str) -> list[int] | None:
     return _gpus_of(pids)
 
 
+def parse_units(spec) -> list[str]:
+    """Unit names from a field that may name more than one, comma separated.
+
+    A host can rotate flavours of one engine: here a switcher starts exactly
+    one of `vllm-qwen38{,-w4a16,-dflash2}.service`, so no single name is
+    correct for long.  Pinning one meant attribution went to "could not
+    attribute" -- and the pane then plotted every card on the host as that
+    engine's -- from the next switch onward.  Accepting a list lets the answer
+    follow whichever is actually up.
+    """
+    if spec is None:
+        return []
+    parts = re.split(r"[,\s]+", spec) if isinstance(spec, str) else list(spec)
+    out = []
+    for part in parts:
+        name = normalise_unit(str(part).strip())
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def gpus_for_units(spec) -> tuple[list[int] | None, list[str]]:
+    """GPUs held by whichever of the named units are running, and which those are.
+
+    A unit that is not running contributes nothing and is not an error: with a
+    switcher the inactive flavours are *expected* to be absent.  Only when none
+    of them is running is the answer None, because a set of names matching no
+    cgroup at all cannot be told apart from a set of wrong names.
+
+    Two units can be up at once during a handover, and both genuinely hold
+    cards then, so the answer is their union rather than whichever was listed
+    first -- which also keeps the result from flapping with the list's order.
+    """
+    found: list[str] = []
+    gpus: set[int] = set()
+    for unit in parse_units(spec):
+        got = gpus_for_unit(unit)
+        if got is None:
+            continue
+        found.append(unit)
+        gpus.update(got)
+    if not found:
+        return None, []
+    return sorted(gpus), found
+
+
 def gpus_for_pids(pids) -> list[int] | None:
     """GPU indices held by an exact pid set the caller already knows."""
     pids = {int(p) for p in (pids or []) if p}
@@ -267,10 +316,11 @@ def resolve(unit: str | None = None, pids=None,
     The method name travels with the answer so the UI can say how it knows, and
     so a surprising attribution is diagnosable without re-running this.
     """
+    # `unit` may name several candidates; see gpus_for_units.
     if unit:
-        got = gpus_for_unit(unit)
+        got, found = gpus_for_units(unit)
         if got is not None:
-            return got, f"cgroup:{normalise_unit(unit)}"
+            return got, "cgroup:" + ",".join(found)
     if pids:
         got = gpus_for_pids(pids)
         if got is not None:
