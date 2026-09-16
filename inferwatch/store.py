@@ -22,6 +22,37 @@ import time
 
 SCHEMA_VERSION = 8
 
+# Where each engine kind's rows live, as (table, time column), so deleting a
+# source can say what it would destroy and then destroy exactly that.
+#
+# "registry" is derived live state -- what is reachable, which model is loaded,
+# which GPUs are held -- and is always cleared with the source, because every
+# row in it is an assertion about an engine that is being declared gone.  The
+# vLLM instance picker is built from `vllm_instances` rather than from the
+# `sources` table, so a row left behind there stayed in the dropdown for good;
+# nothing prunes that table.
+#
+# "history" is what the user actually collected, and is only removed on an
+# explicit purge.
+#
+# Ollama is deliberately absent.  Its tables (requests, rollups, ps_samples,
+# ollama_cache_samples) carry NO source column -- one Ollama source runs at a
+# time, see Supervisor.desired -- so "this source's rows" is not a thing that
+# can be counted or deleted there.  Treating its whole tables as one source's
+# data would turn removing a config entry into wiping every request ever
+# recorded, so the answer is "not partitioned" instead.
+SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
+    "vllm": {
+        "registry": [("vllm_instances", None)],
+        "history": [("vllm_samples", "ts"), ("vllm_hist", "ts")],
+    },
+    "swarmui": {
+        "registry": [],
+        "history": [("image_generations", "ts"), ("image_samples", "ts"),
+                    ("image_events", "ts")],
+    },
+}
+
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
 # (0.1s-30s), coarse in the tail.  Last bucket is the overflow (inf).
 HIST_BOUNDS_MS = [10, 25, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000,
@@ -623,10 +654,74 @@ class Store:
             self.db.execute(f"UPDATE sources SET {','.join(sets)} WHERE id=?", tuple(params))
             self.db.commit()
 
-    def delete_source(self, source_id: int) -> None:
+    def get_source(self, source_id: int) -> dict | None:
+        return next((s for s in self.list_sources() if s["id"] == source_id), None)
+
+    def source_data_stats(self, kind: str, name: str) -> dict:
+        """Rows a source has collected, per table, with the span they cover.
+
+        Shown before a purge so the confirmation names what would actually be
+        destroyed rather than asking in the abstract.  `partitioned` is false
+        for Ollama, whose tables carry no source column at all -- see
+        SOURCE_DATA_TABLES -- so there is nothing there that can be counted or
+        deleted per source, and saying so is the honest answer.
+        """
+        tables = SOURCE_DATA_TABLES.get(kind)
+        if tables is None:
+            return {"partitioned": False, "tables": {}, "rows": 0,
+                    "first_ts": None, "last_ts": None}
+        out, total, first, last = {}, 0, None, None
+        for table, ts_col in tables["registry"] + tables["history"]:
+            span = f", MIN({ts_col}) a, MAX({ts_col}) b" if ts_col else ", NULL a, NULL b"
+            row = self.query(f"SELECT COUNT(*) n{span} FROM {table}"  # noqa: S608
+                             " WHERE source=?", (name,))[0]
+            n = row["n"] or 0
+            if not n:
+                continue
+            out[table] = n
+            total += n
+            if row["a"] is not None:
+                first = row["a"] if first is None else min(first, row["a"])
+                last = row["b"] if last is None else max(last, row["b"])
+        return {"partitioned": True, "tables": out, "rows": total,
+                "first_ts": first, "last_ts": last}
+
+    def delete_source(self, source_id: int, purge: bool = False) -> dict:
+        """Remove a source, always clearing its derived registry rows.
+
+        The registry (`vllm_instances`) is live state -- reachability, resident
+        model, attributed GPUs -- about an engine that this call is declaring
+        gone, and the vLLM instance picker is built from it rather than from
+        the `sources` table.  Leaving it behind kept a deleted source in the
+        dropdown permanently (nothing prunes that table), and because the
+        picker defaults to the first name in sort order, a deleted source could
+        capture the tab's default and show its last scrape as `reachable`
+        forever.  So clearing it is not optional and not a purge: it is part of
+        what deleting a source means.
+
+        Collected history is different -- it is data the user gathered, and
+        destroying months of it as a side effect of removing a config entry is
+        not something to do silently.  That is what `purge` is for, and the UI
+        asks first, naming the row counts from source_data_stats().
+        """
+        src = self.get_source(source_id)
+        removed: dict[str, int] = {}
         with self.lock:
             self.db.execute("DELETE FROM sources WHERE id=?", (source_id,))
+            if src:
+                tables = SOURCE_DATA_TABLES.get(src["kind"])
+                if tables:
+                    wanted = list(tables["registry"])
+                    if purge:
+                        wanted += tables["history"]
+                    for table, _ts in wanted:
+                        n = self.db.execute(  # noqa: S608
+                            f"DELETE FROM {table} WHERE source=?",
+                            (src["name"],)).rowcount
+                        if n:
+                            removed[table] = n
             self.db.commit()
+        return removed
 
     # -- vllm ----------------------------------------------------------------
 

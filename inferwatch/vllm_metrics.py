@@ -196,11 +196,25 @@ def finish_reasons(store, source: str, start: float, end: float) -> list[dict]:
 
 
 def instances(store) -> list[dict]:
+    """Known vLLM instances, restricted to the ones still configured.
+
+    The registry is derived state, so a row for a source that no longer exists
+    is stale by definition -- and this list is what the instance picker and the
+    tab's default source are built from.  A deleted source therefore stayed in
+    the dropdown permanently (nothing prunes `vllm_instances`), and since the
+    default is the first entry in sort order it could also capture the tab,
+    opening it on an engine that is gone with its last scrape frozen at
+    `reachable`.  delete_source() now clears the row, and filtering here also
+    heals rows orphaned before that existed.
+    """
+    configured = {s["name"] for s in store.list_sources() if s["kind"] == "vllm"}
     rows = store.query(
         "SELECT source,last_seen,engine_start,model,reachable,error,info_json,"
         "gpu_indices,gpu_source,gpu_ts FROM vllm_instances ORDER BY source")
     out = []
     for r in rows:
+        if r["source"] not in configured:
+            continue
         d = dict(r)
         d["info"] = _loads(d.pop("info_json", None), None)
         # None means "could not attribute", which the UI shows differently from

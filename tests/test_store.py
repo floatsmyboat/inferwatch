@@ -661,3 +661,73 @@ class TestMetricsSources(StoreCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceRemoval(StoreCase):
+    """Deleting a source used to leave its derived rows behind, so the vLLM
+    instance picker kept offering a source that no longer existed -- and, since
+    the picker defaults to the first name in sort order, could open the tab on
+    it with `reachable` frozen at true."""
+
+    def seed(self, name="ghost"):
+        sid = self.st.add_source("vllm", name, {"url": "http://x:8000"})
+        self.st.upsert_vllm_instance(name, last_seen=100.0, reachable=1,
+                                     model="m", gpu_known=True)
+        self.st.insert_vllm_samples([(100.0, name, "vllm:m", "", None, 1.0, None),
+                                     (200.0, name, "vllm:m", "", None, 2.0, None)])
+        self.st.commit()
+        return sid
+
+    def test_the_registry_row_always_goes_with_the_source(self):
+        sid = self.seed()
+        self.st.delete_source(sid)
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM vllm_instances")[0]["n"], 0,
+            "a deleted source must not stay in the instance registry")
+
+    def test_history_survives_a_plain_delete(self):
+        """Removing a config entry must not silently destroy collected data."""
+        sid = self.seed()
+        self.st.delete_source(sid)
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM vllm_samples")[0]["n"], 2)
+
+    def test_purge_removes_history_too(self):
+        sid = self.seed()
+        removed = self.st.delete_source(sid, purge=True)
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM vllm_samples")[0]["n"], 0)
+        self.assertEqual(removed["vllm_samples"], 2)
+        self.assertEqual(removed["vllm_instances"], 1)
+
+    def test_only_the_named_source_is_touched(self):
+        keep = self.seed("keeper")
+        self.seed("goner")
+        self.st.delete_source(
+            next(s["id"] for s in self.st.list_sources() if s["name"] == "goner"),
+            purge=True)
+        self.assertEqual(
+            self.st.query("SELECT COUNT(*) n FROM vllm_samples"
+                          " WHERE source='keeper'")[0]["n"], 2)
+        self.assertTrue(any(s["id"] == keep for s in self.st.list_sources()))
+
+    def test_stats_report_rows_and_span(self):
+        self.seed()
+        got = self.st.source_data_stats("vllm", "ghost")
+        self.assertTrue(got["partitioned"])
+        self.assertEqual(got["rows"], 3)          # 2 samples + 1 registry row
+        self.assertEqual(got["tables"]["vllm_samples"], 2)
+        self.assertEqual((got["first_ts"], got["last_ts"]), (100.0, 200.0))
+
+    def test_ollama_is_reported_unpartitioned_rather_than_purgeable(self):
+        """Its tables carry no source column, so treating them as one source's
+        data would turn removing a config entry into wiping every request."""
+        sid = self.st.add_source("ollama", "oll", {"reader": "journald"})
+        self.add(1000.0)
+        self.st.commit()
+        got = self.st.source_data_stats("ollama", "oll")
+        self.assertFalse(got["partitioned"])
+        self.assertEqual(got["rows"], 0)
+        self.st.delete_source(sid, purge=True)
+        self.assertEqual(self.st.query("SELECT COUNT(*) n FROM requests")[0]["n"], 1,
+                         "purging an ollama source must not delete the requests table")

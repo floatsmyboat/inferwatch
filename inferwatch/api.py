@@ -238,11 +238,24 @@ def create_app(state: AppState) -> FastAPI:
         _reload()
         return {"ok": True}
 
+    @app.get("/api/sources/{source_id}/data")
+    async def source_data(source_id: int):
+        """What a source has collected, so a purge can be confirmed against
+        real numbers rather than asked in the abstract."""
+        src = state.store.get_source(source_id)
+        if src is None:
+            raise HTTPException(status_code=404, detail="no such source")
+        stats = state.store.source_data_stats(src["kind"], src["name"])
+        return {"source": src["name"], "kind": src["kind"], **stats}
+
     @app.delete("/api/sources/{source_id}")
-    async def remove_source(source_id: int):
-        state.store.delete_source(source_id)
+    async def remove_source(source_id: int, purge: bool = False):
+        """Remove a source.  Its derived registry rows always go with it; its
+        collected history only when `purge` is set, which the UI confirms
+        first.  See Store.delete_source for why those differ."""
+        removed = state.store.delete_source(source_id, purge=purge)
         _reload()
-        return {"ok": True}
+        return {"ok": True, "removed": removed}
 
     @app.post("/api/sources/probe")
     async def probe_source(body: dict = Body(...)):

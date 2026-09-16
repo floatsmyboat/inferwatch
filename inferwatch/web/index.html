@@ -2537,6 +2537,46 @@ function renderVllm() {
   text($("n-vinst"), `${(d.instances || []).length} configured`);
 }
 
+/* Removing a source destroys what it collected, so the confirmation names the
+   amount and the span rather than asking in the abstract -- "449 rows" and
+   "13m of data" are answerable, "metrics will be deleted" is not.  The counts
+   come from the server, because only it knows which tables a kind occupies.
+   Ollama reports itself unpartitioned (its tables carry no source column at
+   all), so there the dialog says plainly that history is kept. */
+async function confirmRemoval(s) {
+  let d = null;
+  try {
+    const r = await fetch("/api/sources/" + s.id + "/data");
+    if (r.ok) d = await r.json();
+  } catch (e) { /* handled below: no counts means no purge */ }
+  const head = `Remove source "${s.name}"?`;
+  /* Returns null for "cancelled", else whether to purge the history as well.
+     Purging is only ever authorised by a dialog that NAMED what it would
+     destroy, so a failed preview deletes nothing: it removes the source and
+     leaves the data to expire at retention, which is recoverable, where an
+     unannounced purge is not. */
+  if (!d) {
+    return confirm(head + "\n\nIts collected metrics could not be counted "
+      + "just now, so they are kept.") ? { purge: false } : null;
+  }
+  if (!d.partitioned) {
+    return confirm(head + `\n\n${d.kind} data is not stored per source, `
+      + "so the metrics already collected are kept.") ? { purge: false } : null;
+  }
+  if (!d.rows) {
+    return confirm(head + "\n\nIt has collected no metrics.")
+      ? { purge: true } : null;
+  }
+  const span = (d.first_ts && d.last_ts)
+    ? ` spanning ${fmtAgo(d.last_ts - d.first_ts)}, `
+      + `${fmtClock(d.first_ts, true)} to ${fmtClock(d.last_ts, true)}`
+    : "";
+  return confirm(head
+    + `\n\nThis permanently deletes the ${fmtCompact(d.rows, 0)} rows it `
+    + `collected${span}.\n\nThis cannot be undone.`)
+    ? { purge: true } : null;
+}
+
 $("vsource").addEventListener("change", (e) => { state.vsource = e.target.value; refreshVllm(); });
 $("isource").addEventListener("change", (e) => { state.isource = e.target.value; refreshImages(); });
 
@@ -2698,8 +2738,11 @@ function renderSources() {
       del.className = "btn danger"; del.style.fontSize = "11px"; del.style.padding = "1px 8px";
       text(del, "remove");
       del.onclick = async () => {
-        if (!confirm(`Remove source "${s.name}"? Metrics already collected are kept.`)) return;
-        await fetch("/api/sources/" + s.id, { method: "DELETE" });
+        const choice = await confirmRemoval(s);
+        if (!choice) return;
+        /* Only purge when the dialog actually named what would be destroyed. */
+        await fetch("/api/sources/" + s.id + "?purge=" + choice.purge,
+                    { method: "DELETE" });
         refreshSettings();
       };
       acts.append(toggle, del);

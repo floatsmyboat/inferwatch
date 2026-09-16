@@ -50,12 +50,21 @@ def coverage(store, start: float) -> dict:
 
 
 def sources(store) -> list[dict]:
-    """Configured image sources that have ever reported, newest sample first."""
+    """Configured image sources that have ever reported, newest sample first.
+
+    Filtered to sources that still exist, for the same reason the vLLM instance
+    list is: this drives the picker, and samples outlive a deleted source until
+    retention catches up with them, so a removed source would otherwise keep
+    being offered for days.
+    """
+    configured = {s["name"] for s in store.list_sources() if s["kind"] == "swarmui"}
     rows = store.query(
         "SELECT source, MAX(ts) last_seen, COUNT(*) samples"
         " FROM image_samples GROUP BY source ORDER BY source")
     out = []
     for r in rows:
+        if r["source"] not in configured:
+            continue
         out.append({"source": r["source"], "last_seen": r["last_seen"],
                     "samples": r["samples"],
                     "stale_s": (time.time() - r["last_seen"]) if r["last_seen"] else None})

@@ -279,3 +279,44 @@ class TestQueries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInstancePicker(unittest.TestCase):
+    """The picker is built from the registry, not from the sources table, so a
+    row outliving its source kept a deleted engine in the dropdown forever --
+    nothing prunes vllm_instances -- and could capture the tab's default."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.st = Store(os.path.join(self.dir, "t.db"))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def register(self, name):
+        self.st.upsert_vllm_instance(name, last_seen=1.0, reachable=1,
+                                     model="m", gpu_known=True)
+        self.st.commit()
+
+    def test_an_orphaned_registry_row_is_not_offered(self):
+        self.st.add_source("vllm", "live", {"url": "http://x:8000"})
+        self.register("live")
+        self.register("ghost")            # no matching source row
+        got = [i["source"] for i in vllm_metrics.instances(self.st)]
+        self.assertEqual(got, ["live"])
+
+    def test_an_orphan_sorting_first_cannot_capture_the_default(self):
+        """'-' sorts before '3', so qwen-vision led qwen38 and became inst[0],
+        which is what the dashboard falls back to when no source is given."""
+        self.st.add_source("vllm", "qwen38", {"url": "http://x:8000"})
+        self.register("qwen38")
+        self.register("qwen-vision")
+        got = [i["source"] for i in vllm_metrics.instances(self.st)]
+        self.assertEqual(got[0], "qwen38")
+
+    def test_a_disabled_source_is_still_listed(self):
+        """Disabled is configured-but-paused, not gone."""
+        self.st.add_source("vllm", "paused", {"url": "http://x:8000"}, enabled=False)
+        self.register("paused")
+        self.assertEqual([i["source"] for i in vllm_metrics.instances(self.st)],
+                         ["paused"])

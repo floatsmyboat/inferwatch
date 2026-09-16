@@ -261,7 +261,7 @@ prompt or response text — only counts, timings, model names and client address
 | Endpoint | What an unauthenticated caller can do |
 |---|---|
 | `PUT /api/config`, `POST /api/config/reset` | change any setting not pinned by env or flag |
-| `POST /api/sources`, `PUT`/`DELETE /api/sources/{id}` | add, edit or remove a monitored engine |
+| `POST /api/sources`, `PUT`/`DELETE /api/sources/{id}` | add, edit or remove a monitored engine — and with `?purge=true`, permanently delete everything that engine ever collected |
 | `POST /api/sources/probe` | make the server fetch an arbitrary URL, with an arbitrary bearer token |
 
 That last one is a server-side request forgery primitive: the probe exists so a
