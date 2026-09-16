@@ -451,7 +451,11 @@ def create_app(state: AppState) -> FastAPI:
                 "include_health": include_health,
                 "events": metrics.events(st, start, end, None, 40),
                 "gpu": metrics.gpu_series(st, start, end, step),
+                # Live attribution drives the tiles ("what does it hold NOW");
+                # the window union drives the charts, which span time that the
+                # instant cannot describe.  See metrics.gpu_window.
                 "gpu_owned": gpu_owned,
+                "gpu_owned_window": metrics.gpu_window(st, start, end),
                 "cache": metrics.cache_summary(st, start, end),
                 "cache_series": metrics.cache_series(st, start, end, step),
                 "live": metrics.loaded_models(st),

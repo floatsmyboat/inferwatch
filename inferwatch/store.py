@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -519,6 +519,15 @@ class Store:
         if cols and "slots" not in cols:
             self.db.execute("ALTER TABLE ps_samples ADD COLUMN slots INTEGER")
 
+        # schema 9: which GPUs ollama held at each sample.  Attribution is a
+        # point-in-time fact, but the GPU charts cover a window, so without a
+        # record over time the pane could only colour history by what happened
+        # to be true at render.  Rows written before this keep NULL, which
+        # reads as "not known for that sample" rather than "held nothing".
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(ps_samples)")}
+        if cols and "gpu_indices" not in cols:
+            self.db.execute("ALTER TABLE ps_samples ADD COLUMN gpu_indices TEXT")
+
         # schema 6: how and when GPU attribution was resolved.
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(vllm_instances)")}
         if cols:
@@ -905,13 +914,22 @@ class Store:
                   g.get("mem_total"), g.get("temp_c"), g.get("power_w")) for g in gpus])
 
     def insert_ps_sample(self, ts: float, loaded_count: int, models: list,
-                         inflight: int, slots: int | None = None) -> None:
+                         inflight: int, slots: int | None = None,
+                         gpu_indices: list[int] | None = None) -> None:
+        """One /api/ps sample.
+
+        `gpu_indices` is the attribution at that moment: a list (possibly
+        empty, meaning "resolved, and it held nothing") or None for "could not
+        resolve".  Stored per sample because the GPU charts span a window and
+        ollama's runner comes and goes within one -- see gpu_window().
+        """
         with self.lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO ps_samples"
-                " (ts,loaded_count,models_json,inflight,slots)"
-                " VALUES (?,?,?,?,?)",
-                (ts, loaded_count, json.dumps(models), inflight, slots))
+                " (ts,loaded_count,models_json,inflight,slots,gpu_indices)"
+                " VALUES (?,?,?,?,?,?)",
+                (ts, loaded_count, json.dumps(models), inflight, slots,
+                 None if gpu_indices is None else json.dumps(gpu_indices)))
 
     def commit(self) -> None:
         with self.lock:

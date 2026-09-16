@@ -527,8 +527,23 @@ answer gets presented as a right one:
   tree than a genuinely idle engine). Every card is shown without emphasis and
   the pane says it could not attribute.
 
+A chart is not an instant. Attribution answers "which cards does this engine
+hold *now*", but the GPU charts cover a window, and ollama's runner exits on
+keep-alive expiry — on this host 87% of samples in a typical hour have no model
+resident. Colouring history by the instant therefore greyed every card and
+blanked the tiles while the window still contained real load: 15.5 GiB and 100%
+utilisation on two of them. So the charts are scoped by what the engine held at
+**any point within the window**, recorded per `/api/ps` sample, while the KPI
+tiles stay on the live answer — which is the right one for "in use now". A
+window reaching back before that record began is covered in part, and the pane
+says which part rather than implying all of it.
+
 Attribution is re-resolved on an interval rather than cached once, and the
-stored answer records **when and how** it was learned. An earlier version cached
+stored answer records **when and how** it was learned. A change in the number
+of resident models also forces a re-resolve, because the interval alone is too
+coarse to record faithfully: a model can load and be evicted well inside one
+recheck, and the samples written meanwhile would claim the engine held nothing
+while it was busy on two cards. An earlier version cached
 the first success and let a failure be merged away, so a topology change never
 propagated and the pane kept presenting weeks-old indices as current fact.
 

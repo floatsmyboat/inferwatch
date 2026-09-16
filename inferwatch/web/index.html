@@ -1361,7 +1361,7 @@ function fmtAgo(seconds) {
    dispossessed of all four.  `idle` is the pane's own word for why it holds
    nothing; the "(other engine)" suffix is now only used once this engine
    demonstrably holds something, which is the only time the contrast is real. */
-function gpuView(gpus, owned, idle) {
+function gpuView(gpus, owned, idle, verb) {
   gpus = gpus || [];
   const known = Array.isArray(owned);
   const held = known && owned.length > 0;
@@ -1384,15 +1384,17 @@ function gpuView(gpus, owned, idle) {
     /* Tile sub-line: names the cards, or says plainly that it cannot. */
     scope: () => !known ? "all devices (unattributed)"
       : held ? `GPU ${owned.join(", ")}` : (idle || "holds no GPU"),
+    verb: verb || "holds",
     /* Panel note: adds the denominator and how the answer was reached. */
     note: (how) => {
       if (!gpus.length) return "no samples yet";
       const via = how && how !== "unavailable" ? ` · via ${how}` : "";
       if (!known) return `${gpus.length} device${gpus.length === 1 ? "" : "s"}; could not attribute`;
-      if (held) return `holds GPU ${owned.join(", ")} of ${gpus.length}` + via;
+      const v = verb || "holds";
+      if (held) return `${v} GPU ${owned.join(", ")} of ${gpus.length}` + via;
       /* Naming the reason keeps "idle" from reading as "lost its cards". */
       return (idle ? `${idle} — ` : "")
-        + `holds none of the ${gpus.length} devices` + via;
+        + `${v} none of the ${gpus.length} devices` + via;
     },
   };
 }
@@ -1538,11 +1540,24 @@ function renderCharts() {
   text($("n-err"), st.length ? st.map((x) => `${x.status}×${x.count}`).join("  ") : "none in window");
   text($("n-errtbl"), `${(d.errors || []).length} shown`);
 
-  /* GPU. Scoped to the cards ollama actually holds -- nvidia-smi reports the
-     whole host, and this pane used to plot and total all of it. */
+  /* GPU.  Scoped to the cards ollama actually holds -- nvidia-smi reports the
+     whole host, and this pane used to plot and total all of it.
+
+     These charts span a window, so they are scoped by what ollama held at any
+     point WITHIN it, not by what it holds at this instant.  Ollama's runner
+     exits on keep-alive expiry, so the instant is usually "nothing": colouring
+     history by it greyed every card and blanked the tiles while the window
+     still contained real load on two of them.  The KPI tiles above stay on the
+     live answer, which is the right one for "in use now". */
   const g = d.gpu || { t: [], gpus: [] };
   const owned = d.gpu_owned || {};
-  const gv = gpuView(g.gpus, owned.indices, "no runner resident");
+  const win = d.gpu_owned_window || {};
+  const gv = gpuView(g.gpus, win.indices, "no runner resident in this window",
+                     "held");
+  /* Attribution is only recorded from the version that added it, so a window
+     reaching further back than that is covered in part.  Say which part. */
+  const coverage = (win.samples && win.known < win.samples)
+    ? ` · from ${fmtPct(win.known / win.samples)} of the window` : "";
 
   draw("gpu", "p-gpu", "l-gpu", {
     type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
@@ -1550,7 +1565,7 @@ function renderCharts() {
     series: g.gpus.map((gpu) => ({ name: gv.label(gpu), values: gpu.util_pct,
                                    color: gv.colour(gpu) })),
   });
-  text($("n-gpu"), gv.note(owned.source));
+  text($("n-gpu"), gv.note(owned.source) + coverage);
 
   draw("gtemp", "p-gtemp", "l-gtemp",
        tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
@@ -1565,7 +1580,7 @@ function renderCharts() {
   {
     const w = totalPower(gv.cards);
     text($("n-gpower"), w === null ? "no samples yet"
-      : `${fmtWatts(w)} across ${gv.known ? "this engine's cards" : "all devices"}`);
+      : `${fmtWatts(w)} across ${gv.known ? "the cards it held" : "all devices"}`);
   }
 
   draw("vram", "p-vram", "l-vram", {
@@ -1583,7 +1598,7 @@ function renderCharts() {
   });
   const vtotal = gv.cards.reduce((a, x) => a + (x.mem_total || 0), 0) / 1024;
   text($("n-vram"), vtotal
-    ? `${fmtCompact(vtotal, 0)} GiB across ${gv.known ? "this engine's devices" : "all devices"}`
+    ? `${fmtCompact(vtotal, 0)} GiB across ${gv.known ? "the devices it held" : "all devices"}`
     : "");
 
   /* hero sparkline: the same output-tok/s series, de-emphasised */

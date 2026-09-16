@@ -731,3 +731,53 @@ class TestSourceRemoval(StoreCase):
         self.st.delete_source(sid, purge=True)
         self.assertEqual(self.st.query("SELECT COUNT(*) n FROM requests")[0]["n"], 1,
                          "purging an ollama source must not delete the requests table")
+
+
+class TestPsAttributionHistory(StoreCase):
+    """The GPU charts span a window, so attribution has to be recorded per
+    sample; colouring history by the instant erased real load whenever ollama
+    happened to be between runners at render time."""
+
+    def test_a_sample_keeps_the_attribution_it_was_taken_with(self):
+        self.st.insert_ps_sample(100.0, 1, [], 0, None, [0, 1])
+        self.st.commit()
+        got = metrics.gpu_window(self.st, 0, 1000)
+        self.assertEqual(got["indices"], [0, 1])
+        self.assertEqual((got["known"], got["samples"]), (1, 1))
+
+    def test_a_card_held_at_any_point_counts_for_the_window(self):
+        self.st.insert_ps_sample(100.0, 0, [], 0, None, [])
+        self.st.insert_ps_sample(200.0, 1, [], 0, None, [0, 1])
+        self.st.insert_ps_sample(300.0, 0, [], 0, None, [])
+        self.st.commit()
+        self.assertEqual(metrics.gpu_window(self.st, 0, 1000)["indices"], [0, 1])
+
+    def test_resolved_but_empty_is_not_unknown(self):
+        """Held nothing all window is a real answer, and must stay distinct
+        from having no record of what it held."""
+        self.st.insert_ps_sample(100.0, 0, [], 0, None, [])
+        self.st.commit()
+        self.assertEqual(metrics.gpu_window(self.st, 0, 1000)["indices"], [])
+
+    def test_rows_without_a_record_are_unknown_not_empty(self):
+        self.st.insert_ps_sample(100.0, 0, [], 0, None, None)
+        self.st.commit()
+        got = metrics.gpu_window(self.st, 0, 1000)
+        self.assertIsNone(got["indices"])
+        self.assertEqual((got["known"], got["samples"]), (0, 1))
+
+    def test_partial_coverage_is_reported(self):
+        """A window reaching back past the column's introduction is covered in
+        part, and the pane says which part rather than implying all of it."""
+        self.st.insert_ps_sample(100.0, 0, [], 0, None, None)
+        self.st.insert_ps_sample(200.0, 1, [], 0, None, [1])
+        self.st.commit()
+        got = metrics.gpu_window(self.st, 0, 1000)
+        self.assertEqual(got["indices"], [1])
+        self.assertEqual((got["known"], got["samples"]), (1, 2))
+
+    def test_only_the_window_is_considered(self):
+        self.st.insert_ps_sample(100.0, 1, [], 0, None, [3])
+        self.st.insert_ps_sample(500.0, 1, [], 0, None, [0])
+        self.st.commit()
+        self.assertEqual(metrics.gpu_window(self.st, 400, 1000)["indices"], [0])

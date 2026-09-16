@@ -656,15 +656,25 @@ class PsPoller:
         self.gpu_source: str = "unavailable"
         self.gpu_ts: float | None = None
         self._gpu_checked = 0.0
+        self._gpu_for_loaded: int | None = None
 
-    def resolve_gpus(self, now: float) -> list[int] | None:
+    def resolve_gpus(self, now: float, loaded: int | None = None) -> list[int] | None:
         """Attribute ollama's GPUs, re-checked on an interval.
 
         Re-resolved rather than cached once, because ollama's runners come and
         go with keep-alive: a model unloading genuinely changes the answer to
         "holds nothing", and that has to be able to propagate.
+
+        The interval alone is too coarse to record faithfully, though.  A model
+        can load and be evicted well inside one recheck -- keep-alive here is
+        seconds -- and the sample written meanwhile would claim ollama held
+        nothing while it was in fact busy on two cards.  So a change in the
+        number of resident models forces a resolve: that transition is exactly
+        when the answer changes, which makes it the cheap and precise trigger.
         """
-        if now - self._gpu_checked < self.GPU_RECHECK_S:
+        changed = loaded is not None and loaded != self._gpu_for_loaded
+        self._gpu_for_loaded = loaded if loaded is not None else self._gpu_for_loaded
+        if not changed and now - self._gpu_checked < self.GPU_RECHECK_S:
             return self.gpu_indices
         self._gpu_checked = now
         self.gpu_ts = now
@@ -689,9 +699,13 @@ class PsPoller:
                 ps = await loop.run_in_executor(None, sample_ps, self.base_url)
                 inflight = self.corr.inflight if self.corr else 0
                 slots = self.corr.slots if self.corr else None
-                self.store.insert_ps_sample(ts, len(ps), ps, inflight, slots)
+                # Resolve first, so the sample is stored with the attribution
+                # that was true when it was taken rather than the previous
+                # tick's -- the runner can appear or exit between the two.
+                await loop.run_in_executor(None, self.resolve_gpus, ts, len(ps))
+                self.store.insert_ps_sample(ts, len(ps), ps, inflight, slots,
+                                            self.gpu_indices)
                 self.store.commit()
-                await loop.run_in_executor(None, self.resolve_gpus, ts)
                 self.last = {"ts": ts, "models": ps, "inflight": inflight,
                              "slots": slots,
                              "gpu_indices": self.gpu_indices,

@@ -12,6 +12,7 @@ interpolations.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 
@@ -504,6 +505,44 @@ def events(store, start: float, end: float, kind: str | None = None,
         "SELECT ts,kind,level,model,source,msg,duration_ms,detail_json FROM events"
         f" WHERE ts >= ? AND ts < ?{clause} ORDER BY ts DESC LIMIT ?", tuple(params))
     return [dict(r) for r in rows]
+
+
+def gpu_window(store, start: float, end: float) -> dict:
+    """Which GPUs ollama held at any point in a window, from the ps samples.
+
+    The GPU charts cover a window; attribution is a fact about an instant.
+    Colouring history by the instant produced the worst reading of all: with no
+    runner resident at render time, every card went grey and the tiles blanked,
+    erasing the very load the window was there to show -- and on this host 87%
+    of samples in a typical hour have no model resident, so that was the usual
+    case rather than an edge one.
+
+    A card counts as this engine's if it was held in ANY sample of the window,
+    which is what "ollama's usage appears on these cards" means over a span.
+    None is returned when no sample in the window recorded an attribution at
+    all (every row predates the column, or resolution kept failing), so the
+    pane can say it does not know rather than claim the engine held nothing.
+    """
+    if not store.has_column("ps_samples", "gpu_indices"):
+        return {"indices": None, "samples": 0, "known": 0}
+    rows = store.query(
+        "SELECT gpu_indices FROM ps_samples WHERE ts >= ? AND ts < ?", (start, end))
+    held: set[int] = set()
+    known = 0
+    for r in rows:
+        raw = r["gpu_indices"]
+        if raw is None:
+            continue
+        try:
+            got = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(got, list):
+            continue
+        known += 1
+        held.update(int(i) for i in got)
+    return {"indices": sorted(held) if known else None,
+            "samples": len(rows), "known": known}
 
 
 def gpu_series(store, start: float, end: float, step: int | None = None) -> dict:
