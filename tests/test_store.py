@@ -781,3 +781,51 @@ class TestPsAttributionHistory(StoreCase):
         self.st.insert_ps_sample(500.0, 1, [], 0, None, [0])
         self.st.commit()
         self.assertEqual(metrics.gpu_window(self.st, 400, 1000)["indices"], [0])
+
+
+class TestRollupRetention(StoreCase):
+    """The rollups were the only tables with no ceiling: a minute rollup is one
+    row per model per class that saw traffic, so its cost follows traffic
+    rather than the calendar."""
+
+    def seed(self):
+        now = time.time()
+        old = now - 60 * 86400
+        for bucket, table in ((old, "rollup_1m"), (now, "rollup_1m"),
+                              (old, "rollup_1h"), (now, "rollup_1h")):
+            self.st.db.execute(
+                f"INSERT INTO {table} (bucket,model,class,req_count,err_count,"
+                "in_tokens,out_tokens,cached_tokens,decode_ms_sum,ttft_sum,ttft_n,"
+                "lat_sum,lat_n,queue_sum,queue_n,ttft_hist,lat_hist)"
+                " VALUES (?,'m','inference',1,0,0,0,0,0,0,0,0,0,0,0,'[]','[]')",
+                (int(bucket),))
+        self.st.commit()
+
+    def counts(self):
+        return (self.st.query("SELECT COUNT(*) n FROM rollup_1m")[0]["n"],
+                self.st.query("SELECT COUNT(*) n FROM rollup_1h")[0]["n"])
+
+    def test_zero_keeps_rollups_forever(self):
+        """The long-standing behaviour, and the default: these exist so a chart
+        outlives the raw rows it was built from."""
+        self.seed()
+        self.st.prune(7.0, 30.0)
+        self.assertEqual(self.counts(), (2, 2))
+
+    def test_a_limit_drops_only_what_is_past_it(self):
+        self.seed()
+        dropped = self.st.prune(7.0, 30.0, rollup_1m_days=30.0)
+        self.assertEqual(self.counts(), (1, 2), "1h must be untouched by the 1m limit")
+        self.assertEqual(dropped["rollup_1m"], 1)
+
+    def test_the_two_limits_are_independent(self):
+        self.seed()
+        self.st.prune(7.0, 30.0, rollup_1m_days=30.0, rollup_1h_days=30.0)
+        self.assertEqual(self.counts(), (1, 1))
+
+    def test_zero_is_not_a_cutoff_of_now(self):
+        """Guard against 0 being read as "older than this instant", which would
+        delete every rollup rather than keeping them all."""
+        self.seed()
+        self.st.prune(7.0, 30.0, rollup_1m_days=0.0, rollup_1h_days=0.0)
+        self.assertEqual(self.counts(), (2, 2))

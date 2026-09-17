@@ -726,11 +726,16 @@ class Maintainer:
     """
 
     def __init__(self, store, raw_retention_getter, sample_retention_getter,
-                 interval_getter):
+                 interval_getter, rollup_1m_retention_getter=None,
+                 rollup_1h_retention_getter=None):
         self.store = store
         self.raw_retention_getter = raw_retention_getter
         self.sample_retention_getter = sample_retention_getter
         self.interval_getter = interval_getter
+        # Absent getters mean "keep forever", which is what the rollups did
+        # before these limits existed.
+        self.rollup_1m_retention_getter = rollup_1m_retention_getter or (lambda: 0.0)
+        self.rollup_1h_retention_getter = rollup_1h_retention_getter or (lambda: 0.0)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -746,8 +751,11 @@ class Maintainer:
                 await loop.run_in_executor(
                     None, self.store.rebuild_rollups, now - 900, now)
                 if now - last_prune > 3600:
-                    dropped = self.store.prune(float(self.raw_retention_getter()),
-                                               float(self.sample_retention_getter()))
+                    dropped = self.store.prune(
+                        float(self.raw_retention_getter()),
+                        float(self.sample_retention_getter()),
+                        float(self.rollup_1m_retention_getter() or 0.0),
+                        float(self.rollup_1h_retention_getter() or 0.0))
                     if any(dropped.values()):
                         log.info("pruned %s", dropped)
                     last_prune = now

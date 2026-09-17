@@ -1015,8 +1015,21 @@ class Store:
             written += len(agg)
         return written
 
-    def prune(self, raw_retention_days: float, sample_retention_days: float = 30.0) -> dict:
-        """Drop raw rows past retention.  Rollups are never pruned."""
+    def prune(self, raw_retention_days: float, sample_retention_days: float = 30.0,
+              rollup_1m_days: float = 0.0, rollup_1h_days: float = 0.0) -> dict:
+        """Drop rows past retention.
+
+        The rollups default to 0, meaning keep forever, which is the behaviour
+        they have always had: they exist so that a chart outlives the raw rows
+        it was built from, and a default that silently deleted history on
+        upgrade would be a poor trade for the space it saves.
+
+        They are also the only tables here with no natural ceiling.  A minute
+        rollup is one row per model per class that saw traffic, so its cost
+        follows traffic rather than the calendar -- which is why it is worth
+        being able to bound, and why the hour rollup, 36x coarser, is usually
+        worth keeping forever even when the minute one is capped.
+        """
         now = time.time()
         raw_cut = now - raw_retention_days * 86400
         samp_cut = now - sample_retention_days * 86400
@@ -1038,12 +1051,21 @@ class Store:
             n_ev = self.db.execute("DELETE FROM events WHERE ts < ?", (samp_cut,)).rowcount
             n_vs = self.db.execute("DELETE FROM vllm_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_vh = self.db.execute("DELETE FROM vllm_hist WHERE ts < ?", (samp_cut,)).rowcount
+            # 0 means keep forever, so no cutoff is computed at all -- distinct
+            # from a cutoff of now, which would delete everything.
+            n_r1m = n_r1h = 0
+            if rollup_1m_days > 0:
+                n_r1m = self.db.execute("DELETE FROM rollup_1m WHERE bucket < ?",
+                                        (now - rollup_1m_days * 86400,)).rowcount
+            if rollup_1h_days > 0:
+                n_r1h = self.db.execute("DELETE FROM rollup_1h WHERE bucket < ?",
+                                        (now - rollup_1h_days * 86400,)).rowcount
             self.db.commit()
         return {"requests": n_req, "gpu_samples": n_gpu, "ps_samples": n_ps,
                 "ollama_cache_samples": n_cache, "events": n_ev,
                 "vllm_samples": n_vs, "vllm_hist": n_vh,
                 "image_generations": n_ig, "image_samples": n_is,
-                "image_events": n_ie}
+                "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h}
 
     # -- reads ---------------------------------------------------------------
 

@@ -151,7 +151,9 @@ class Supervisor:
             self.store,
             raw_retention_getter=lambda: self.config.get("retention.raw_days"),
             sample_retention_getter=lambda: self.config.get("retention.sample_days"),
-            interval_getter=lambda: self.config.get("collection.rollup_interval_s"))
+            interval_getter=lambda: self.config.get("collection.rollup_interval_s"),
+            rollup_1m_retention_getter=lambda: self.config.get("retention.rollup_1m_days"),
+            rollup_1h_retention_getter=lambda: self.config.get("retention.rollup_1h_days"))
         self._shared = [
             asyncio.create_task(self.gpu.run(), name="gpu-poller"),
             asyncio.create_task(self.maintainer.run(), name="maintainer"),

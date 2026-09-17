@@ -123,11 +123,26 @@ SPEC: list[Setting] = [
 
     Setting("retention.raw_days", "Keep raw request rows", "float", 7.0,
             "Retention", minimum=0.5, maximum=3650.0,
-            help="Per-request detail older than this is deleted. Rollups are kept "
-                 "indefinitely regardless, so long-range charts survive."),
+            help="Per-request detail older than this is deleted. The rollups below "
+                 "outlive it, so long-range charts survive the cutoff."),
     Setting("retention.sample_days", "Keep GPU / engine samples", "float", 30.0,
             "Retention", minimum=0.5, maximum=3650.0,
-            help="GPU samples, engine samples and the event log are trimmed to this."),
+            help="GPU samples, engine samples and the event log are trimmed to this. "
+                 "This is where the bulk of the database is: these tables are the "
+                 "largest by a wide margin, so this setting moves the total size "
+                 "far more than the rollup limits do."),
+    Setting("retention.rollup_1m_days", "Keep 1-minute rollups", "float", 0.0,
+            "Retention", minimum=0.0, maximum=3650.0,
+            help="0 keeps them forever. One row per minute per model per class "
+                 "that saw traffic, so the cost scales with traffic and with how "
+                 "many models are in use, not with the calendar. This is the only "
+                 "table with no natural ceiling; bounding it is what stops the "
+                 "database growing without limit."),
+    Setting("retention.rollup_1h_days", "Keep 1-hour rollups", "float", 0.0,
+            "Retention", minimum=0.0, maximum=3650.0,
+            help="0 keeps them forever, which is usually right: they are 36x "
+                 "coarser than the 1-minute rollups and cost very little, and "
+                 "they are what lets a chart reach past every other cutoff here."),
 
     Setting("dashboard.default_window", "Default time range", "enum", "1h",
             "Dashboard", choices=["15m", "1h", "6h", "24h", "7d", "30d"],
