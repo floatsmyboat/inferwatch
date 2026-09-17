@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -44,7 +44,8 @@ SCHEMA_VERSION = 9
 SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
     "vllm": {
         "registry": [("vllm_instances", None)],
-        "history": [("vllm_samples", "ts"), ("vllm_hist", "ts")],
+        "history": [("vllm_samples", "ts"), ("vllm_hist", "ts"),
+                    ("vllm_client_requests", "ts")],
     },
     "swarmui": {
         "registry": [],
@@ -339,6 +340,33 @@ CREATE TABLE IF NOT EXISTS vllm_hist (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_vllm_h_metric ON vllm_hist(source, metric, ts);
 
+-- Client-facing requests, read from the proxy in front of vLLM rather than from
+-- vLLM itself.  vLLM's /metrics is pre-aggregated and carries no request
+-- identity, and its own access log sees only the proxy, so this is the only
+-- place a client address exists.  Status and duration are deliberately absent:
+-- the proxy logs them on separate lines with no request id, and this workload
+-- runs them concurrently, so attributing either to a client would be a guess.
+-- See parse_proxy for the measurements behind that.
+CREATE TABLE IF NOT EXISTS vllm_client_requests (
+    id                    INTEGER PRIMARY KEY,
+    ts                    REAL NOT NULL,
+    source                TEXT NOT NULL,
+    client                TEXT NOT NULL,
+    endpoint              TEXT NOT NULL,
+    model                 TEXT,
+    messages              INTEGER,
+    -- Exact, not estimated: the proxy tokenises upstream before forwarding.
+    prompt_tokens         INTEGER,
+    context_limit         INTEGER,
+    max_tokens            INTEGER,
+    max_completion_tokens INTEGER,
+    stream                INTEGER,
+    dedupe_key            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vcr_ts ON vllm_client_requests(source, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vcr_dedupe
+    ON vllm_client_requests(dedupe_key);
+
 -- One row per instance: what it is, and when its engine last started (used to
 -- detect a restart, after which counters begin again from zero).
 CREATE TABLE IF NOT EXISTS vllm_instances (
@@ -419,6 +447,20 @@ def image_event_key(e: dict) -> str:
     """
     return "|".join(_f(e.get(k)) for k in
                     ("ts", "source", "kind", "backend_index", "msg", "route"))
+
+
+def client_request_key(r: dict) -> str:
+    """Identity of a proxy REQ line, for replay-safe inserts.
+
+    The proxy logs no request id, so identity is the line's own content: the
+    same client asking for the same thing at the same logged second IS the same
+    line seen twice, which is what a journal replay produces.  Two genuinely
+    distinct requests that collide on all of this are indistinguishable in the
+    log as well, so collapsing them is the honest outcome rather than a loss.
+    """
+    return "|".join(_f(r.get(k)) for k in
+                    ("ts", "source", "client", "endpoint", "model",
+                     "messages", "prompt_tokens"))
 
 
 def event_key(e: dict) -> str:
@@ -931,6 +973,19 @@ class Store:
                 (ts, loaded_count, json.dumps(models), inflight, slots,
                  None if gpu_indices is None else json.dumps(gpu_indices)))
 
+    def insert_client_request(self, row: dict) -> None:
+        """One proxy-observed client request, ignored if already stored."""
+        row = dict(row)
+        row["dedupe_key"] = client_request_key(row)
+        cols = ("ts", "source", "client", "endpoint", "model", "messages",
+                "prompt_tokens", "context_limit", "max_tokens",
+                "max_completion_tokens", "stream", "dedupe_key")
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO vllm_client_requests"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+
     def commit(self) -> None:
         with self.lock:
             self.db.commit()
@@ -1051,6 +1106,9 @@ class Store:
             n_ev = self.db.execute("DELETE FROM events WHERE ts < ?", (samp_cut,)).rowcount
             n_vs = self.db.execute("DELETE FROM vllm_samples WHERE ts < ?", (samp_cut,)).rowcount
             n_vh = self.db.execute("DELETE FROM vllm_hist WHERE ts < ?", (samp_cut,)).rowcount
+            # Per-request rows, so they follow the raw window, not the sample one.
+            n_vcr = self.db.execute("DELETE FROM vllm_client_requests WHERE ts < ?",
+                                    (raw_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
             n_r1m = n_r1h = 0
@@ -1065,7 +1123,8 @@ class Store:
                 "ollama_cache_samples": n_cache, "events": n_ev,
                 "vllm_samples": n_vs, "vllm_hist": n_vh,
                 "image_generations": n_ig, "image_samples": n_is,
-                "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h}
+                "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h,
+                "vllm_client_requests": n_vcr}
 
     # -- reads ---------------------------------------------------------------
 

@@ -230,6 +230,61 @@ def instances(store) -> list[dict]:
     return out
 
 
+def clients(store, source: str, start: float, end: float,
+            limit: int = 50) -> list[dict]:
+    """Per-client request activity, from the proxy in front of vLLM.
+
+    Only fields the proxy states on the REQ line itself appear here.  There is
+    deliberately no status, latency or output-token column: those live on
+    separate lines carrying no request id, and requests here overlap almost
+    always (729 of 731 in a measured day), so pinning one to a client would be
+    a guess.  `prompt_tokens` is exact -- the proxy tokenises upstream.
+    """
+    rows = store.query(
+        "SELECT client,"
+        "       COUNT(*)                 requests,"
+        "       SUM(prompt_tokens)       prompt_tokens,"
+        "       AVG(prompt_tokens)       prompt_mean,"
+        "       MAX(prompt_tokens)       prompt_max,"
+        "       AVG(messages)            messages_mean,"
+        "       MAX(ts)                  last_seen,"
+        "       COUNT(DISTINCT model)    models,"
+        "       SUM(CASE WHEN stream=1 THEN 1 ELSE 0 END) streamed,"
+        "       SUM(CASE WHEN prompt_tokens IS NULL THEN 1 ELSE 0 END) unsized,"
+        "       MAX(context_limit)       context_limit"
+        "  FROM vllm_client_requests"
+        " WHERE source=? AND ts >= ? AND ts < ?"
+        " GROUP BY client ORDER BY requests DESC LIMIT ?",
+        (source, start, end, limit))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["stale_s"] = (time.time() - d["last_seen"]) if d["last_seen"] else None
+        # Share of this client's largest prompt against the window it must fit.
+        d["context_peak_pct"] = ((d["prompt_max"] / d["context_limit"])
+                                 if d.get("prompt_max") and d.get("context_limit")
+                                 else None)
+        top = store.query(
+            "SELECT model, COUNT(*) n FROM vllm_client_requests"
+            " WHERE source=? AND ts >= ? AND ts < ? AND client=? AND model IS NOT NULL"
+            " GROUP BY model ORDER BY n DESC LIMIT 1",
+            (source, start, end, d["client"]))
+        d["top_model"] = top[0]["model"] if top else None
+        out.append(d)
+    return out
+
+
+def clients_available(store, source: str) -> bool:
+    """Whether any proxy-derived row exists for this source at all.
+
+    Lets the pane tell "no proxy configured" apart from "a proxy is configured
+    and nobody has called it", which are different things to show.
+    """
+    row = store.query("SELECT 1 FROM vllm_client_requests WHERE source=? LIMIT 1",
+                      (source,))
+    return bool(row)
+
+
 def summary(store, source: str, start: float, end: float) -> dict:
     span = max(1e-9, end - start)
     success = finish_reasons(store, source, start, end)

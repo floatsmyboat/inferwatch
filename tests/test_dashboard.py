@@ -154,11 +154,12 @@ class TestMarkup(unittest.TestCase):
         self.assertIn('<section id="tab-settings" hidden>', self.html)
 
     def test_vllm_panels_do_not_promise_per_request_detail(self):
-        """vLLM publishes no per-request rows, so offering a request table or a
-        client breakdown there would be a lie."""
+        """vLLM publishes no per-request rows, so a request table or a latency
+        ranking there would be a lie. The client panel is the one exception and
+        it earns it by naming its source -- see the test below."""
         vllm = self.html[self.html.index('id="tab-vllm"'):
                          self.html.index('id="tab-settings"')]
-        for forbidden in ("Recent requests", "Slowest by TTFT", "client"):
+        for forbidden in ("Recent requests", "Slowest by TTFT"):
             self.assertNotIn(forbidden, vllm)
 
     def test_vllm_tab_has_gpu_and_vram_panels(self):
@@ -457,12 +458,30 @@ class TestClientMarkup(unittest.TestCase):
         self.assertIn('id="t-clients"', html)
         self.assertIn('table("t-clients"', script(html))
 
-    def test_the_vllm_tab_grows_no_client_table(self):
-        """vLLM publishes no client addresses; offering the panel would imply
-        data that does not exist."""
+    def test_a_vllm_client_table_must_name_the_proxy_as_its_source(self):
+        """vLLM itself publishes no client addresses, so this panel is only
+        honest while it says where the rows actually come from. Without that
+        label it reads as per-request detail from /metrics, which does not
+        exist -- which is why the panel was forbidden outright before a real
+        source for it existed."""
         html = read()
-        vllm = html[html.index('id="tab-vllm"'):]
-        self.assertNotIn('id="t-vclients"', vllm)
+        vllm = html[html.index('id="tab-vllm"'):html.index('id="tab-settings"')]
+        if 'id="t-vclients"' not in vllm:
+            return                      # no panel is still a valid answer
+        note = vllm[vllm.index('id="vclient-note"'):]
+        note = note[:note.index("</div>")]
+        self.assertIn("proxy in front of vLLM", note)
+        self.assertIn("/metrics", note)
+
+    def test_the_client_table_offers_no_status_or_latency_column(self):
+        """The proxy logs those on separate lines with no request id, and this
+        workload runs requests concurrently, so a per-client latency or status
+        would be a guess presented as a measurement."""
+        js = script(read())
+        block = js[js.index('table("t-vclients"'):]
+        block = block[:block.index('text($("n-vclients")')]
+        for forbidden in ("Latency", "TTFT", "Status", "Errors", "Duration"):
+            self.assertNotIn(forbidden, block)
 
 
 class TestGpuView(unittest.TestCase):

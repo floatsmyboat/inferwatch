@@ -665,6 +665,24 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="card"><header><h2>Instances</h2><span class="note" id="n-vinst"></span></header>
         <div class="tbl-wrap" id="t-vinst"></div></div>
     </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Clients</h2><span class="note" id="n-vclients"></span></header>
+        <div class="banner show" id="vclient-note"
+             style="border-left-color:var(--series-3)">
+          <span class="ico" aria-hidden="true">i</span>
+          <span>These rows come from the <strong>proxy in front of vLLM</strong>,
+          not from <code>/metrics</code> — vLLM publishes no request identity, and
+          its own access log sees only the proxy. Prompt sizes here are
+          <strong>exact</strong> (the proxy tokenises upstream). There is no
+          status or latency column on purpose: the proxy logs those on separate
+          lines with no request id, and requests overlap almost always, so
+          pinning either to a client would be a guess.</span>
+        </div>
+        <div class="tbl-wrap" id="t-vclients"></div>
+      </div>
+    </div>
   </section>
 
   <!-- ================================================================
@@ -2550,6 +2568,43 @@ function renderVllm() {
       if (!i.reachable && i.error) tr.title = i.error;
     }, "No instances yet.");
   text($("n-vinst"), `${(d.instances || []).length} configured`);
+
+  /* Clients, from the proxy.  Every column here is something the proxy states
+     on the request line itself; nothing is joined across lines, so nothing in
+     this table is inferred. */
+  const cl = d.clients || [];
+  table("t-vclients",
+    [{ label: "Client" }, { label: "Requests", num: true }, { label: "Model" },
+     { label: "Prompt tokens", num: true }, { label: "Mean prompt", num: true },
+     { label: "Largest", num: true }, { label: "Context peak", num: true },
+     { label: "Streamed", num: true }, { label: "Last seen" }],
+    cl,
+    (tr, c) => {
+      tr.appendChild(td(c.client, false, true));
+      tr.appendChild(td(fmtCompact(c.requests, 0), true));
+      tr.appendChild(td(c.top_model || "—"));
+      tr.appendChild(td(fmtCompact(c.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.prompt_mean, 0), true));
+      tr.appendChild(td(fmtCompact(c.prompt_max, 0), true));
+      /* Against the model's own context window, so a client that is about to
+         start truncating is visible before it does. */
+      tr.appendChild(tdNode(c.context_peak_pct === null ? document.createTextNode("—")
+        : pill(fmtPct(c.context_peak_pct),
+               c.context_peak_pct > 0.9 ? "err"
+                 : c.context_peak_pct > 0.7 ? "warn" : "ok")));
+      tr.appendChild(td(c.streamed === c.requests ? "all"
+        : `${fmtCompact(c.streamed, 0)}/${fmtCompact(c.requests, 0)}`, true));
+      tr.appendChild(td(c.last_seen ? fmtClock(c.last_seen) : "—"));
+      if (c.unsized) tr.title = `${c.unsized} request(s) the proxy could not size`;
+    },
+    d.clients_configured
+      ? "No client requests in this window."
+      : "No proxy configured — set the vLLM source's proxy unit in Settings to "
+        + "see who is calling this instance.");
+  const unsized = cl.reduce((a, c) => a + (c.unsized || 0), 0);
+  text($("n-vclients"), !d.clients_configured ? "needs a proxy unit"
+    : `${cl.length} client${cl.length === 1 ? "" : "s"} · via the proxy journal`
+      + (unsized ? ` · ${unsized} request(s) not sized` : ""));
 }
 
 /* Removing a source destroys what it collected, so the confirmation names the

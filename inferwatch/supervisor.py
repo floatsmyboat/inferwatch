@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from . import parse_proxy
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
 from .images import ImagesPoller, SwarmLogCollector
 from .models import ModelIndex
@@ -44,6 +45,8 @@ class SourceRuntime:
         self.ps: PsPoller | None = None
         self.images: ImagesPoller | None = None
         self.swarm_log: SwarmLogCollector | None = None
+        # A vLLM source can have a second reader on the proxy in front of it.
+        self.proxy_reader = None
 
     @property
     def name(self) -> str:
@@ -58,6 +61,9 @@ class SourceRuntime:
         if self.reader is not None:
             d["reader"] = self.reader.describe()
             d["lines_read"] = self.reader.lines
+        if self.proxy_reader is not None:
+            d["proxy_reader"] = self.proxy_reader.describe()
+            d["proxy_lines_read"] = self.proxy_reader.lines
         if self.corr is not None:
             d["inflight"] = self.corr.inflight
             d["stats"] = dict(self.corr.stats)
@@ -284,7 +290,36 @@ class Supervisor:
                 interval_getter=lambda: self.config.get("collection.scrape_interval_s"),
                 on_live=self.hub.publish)
             rt.tasks = [asyncio.create_task(rt.vllm.run(), name=f"vllm:{spec['name']}")]
-            log.info("source %r started (vllm %s)", spec["name"], rt.vllm.url)
+            proxy_unit = (cfg.get("proxy_unit") or "").strip()
+            if proxy_unit:
+                # A second reader on the same source: the proxy's journal is the
+                # only place a client address exists.  It resumes from its own
+                # newest row rather than the vLLM tables, which are sampled on a
+                # different clock entirely.
+                name, store = spec["name"], self.store
+
+                def resume_ts(store=store, name=name):
+                    row = store.query("SELECT MAX(ts) t FROM vllm_client_requests"
+                                      " WHERE source = ?", (name,))
+                    return row[0]["t"] if row and row[0]["t"] else None
+
+                rt.proxy_reader = build_reader(
+                    self.store, name, {"reader": "journald", "unit": proxy_unit},
+                    backfill=self.config.get("collection.backfill"),
+                    resume_ts=resume_ts)
+
+                def on_line(ts, msg, store=store, name=name):
+                    got = parse_proxy.parse_req(msg)
+                    if got:
+                        store.insert_client_request({"ts": ts, "source": name, **got})
+
+                def on_flush(now, store=store):
+                    store.commit()
+
+                rt.tasks.append(asyncio.create_task(
+                    rt.proxy_reader.run(on_line, on_flush), name=f"proxy:{name}"))
+            log.info("source %r started (vllm %s%s)", spec["name"], rt.vllm.url,
+                     f", proxy journal {proxy_unit}" if proxy_unit else "")
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
         return rt

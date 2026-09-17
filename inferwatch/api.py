@@ -305,9 +305,21 @@ def create_app(state: AppState) -> FastAPI:
                 "summary": vllm_metrics.summary(st, source, start, end),
                 "timeseries": vllm_metrics.timeseries(st, source, start, end, step),
                 "gpu": metrics.gpu_series(st, start, end, step),
+                # From the proxy in front of vLLM, not from /metrics -- the
+                # pane labels them as such.  `configured` separates "no proxy
+                # set up" from "a proxy is set up and nobody called it".
+                "clients": vllm_metrics.clients(st, source, start, end),
+                "clients_configured": vllm_metrics.clients_available(st, source),
             }
 
         return await loop.run_in_executor(None, build)
+
+    @app.get("/api/vllm/clients")
+    async def vllm_clients(source: str, window: str = "1h"):
+        """Per-client activity for one vLLM instance, read from its proxy."""
+        start, end = _window(window)
+        return {"clients": vllm_metrics.clients(state.store, source, start, end),
+                "configured": vllm_metrics.clients_available(state.store, source)}
 
     @app.get("/api/vllm/summary")
     async def vllm_summary(source: str, window: str = "1h"):

@@ -39,7 +39,7 @@ This is the central design fact, so it is worth stating plainly.
 | TTFT / latency | exact, per request | histograms only |
 | Tokens | per request | cumulative counters |
 | Errors | HTTP status per request | `request_success_total{finished_reason}` |
-| Client address | yes | no |
+| Client address | yes | not from vLLM — only from a proxy in front of it |
 | Percentiles | exact within retention | bucket upper bounds; **means are exact** |
 | KV / prompt cache | occupancy + eviction counts, sampled from the log | occupancy gauge, scraped |
 | Unique extras | prompt cache reuse, draft accept, cold-load time, KV VRAM/RAM split | preemptions, batch occupancy, waiting-by-reason |
@@ -50,6 +50,37 @@ get separate charts rather than sharing an axis, and each is aggregated the way
 its unit demands: utilisation averages across cards, VRAM and watts sum,
 temperature reports the hottest card. Temperature is the one series not plotted
 from zero — a 33–68 °C range starting at 0 wastes most of the plot.
+
+### Who is calling vLLM
+
+vLLM cannot answer this. `/metrics` is pre-aggregated and carries no request
+identity, and its own access log sees only whatever is in front of it — on the
+development host that is 3,879 lines in six hours, every one of them
+`127.0.0.1`, because a proxy holds the front door.
+
+A proxy, though, knows exactly who called it. Point `proxy_unit` at its systemd
+unit and the Clients panel fills in from lines like:
+
+```
+REQ v1/chat/completions from=10.0.0.96 model=qwen3.8 msgs=29
+    prompt=19,172 limit=131072 max_tokens=16384 stream=True
+```
+
+`prompt` is **exact** — the proxy tokenises upstream before forwarding — which
+makes it the one token figure on the vLLM side that is neither a bucket bound
+nor a rate.
+
+**There is no status or latency column, deliberately.** Those are logged on
+separate lines with no request id, and joining them would mean assuming the
+order requests finish in. That assumption does not survive real load: of 731
+chat requests measured over 24 hours, **729 began while another was still in
+flight**, peaking at 72 concurrent. A latency pinned to a client would be a
+guess wearing the clothes of a measurement, so the panel reports what the
+request line states and says plainly that the rest is not attributable. Giving
+the proxy a request id would close the gap.
+
+The panel names its own source, because a client table on the vLLM tab would
+otherwise read as per-request detail from `/metrics`, which does not exist.
 
 ### And a third family: image generation
 
@@ -426,7 +457,8 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | Field | Default | Required when | Notes |
 |---|---|---|---|
 | `url` | `http://127.0.0.1:8000` | — | The OpenAI-compatible server root. /metrics is read from here. |
-| `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. If a switcher rotates flavours of the same engine, list every candidate separated by commas -- whichever is running is the one attributed, so a switch does not silently turn attribution off. The journal is also read from it for HTTP status codes, client addresses and engine errors, which /metrics does not expose. |
+| `unit` | — | — | The unit running the ENGINE, which is what its GPUs are attributed by -- every process in that unit's cgroup is matched against nvidia-smi. Set it to the engine's unit, not a proxy in front of it: with a proxy on the URL there are no GPUs behind that port and attribution reports 'could not attribute'. If a switcher rotates flavours of the same engine, list every candidate separated by commas -- whichever is running is the one attributed, so a switch does not silently turn attribution off. |
+| `proxy_unit` | — | — | The systemd unit of a proxy sitting IN FRONT of vLLM, if there is one. Its journal is the only place a client address exists: /metrics is pre-aggregated and carries no request identity, and vLLM's own access log sees the proxy rather than whoever called it. Set this to get the per-client table; leave it empty and that panel simply says it has no source. Only requests and prompt sizes are read from it -- status and latency are logged on separate lines with no request id, so they cannot be tied to a client without guessing. |
 | `api_key` | — | — | Sent as a bearer token if the server requires one. Prefer an indirection like ${VLLM_API_KEY} over pasting the value: what is stored here goes into the database in plain text, and a reference keeps the secret in the environment or an EnvironmentFile instead. |
 
 #### Command-line flags

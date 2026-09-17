@@ -256,10 +256,19 @@ SOURCE_KINDS = {
                      "'could not attribute'. If a switcher rotates flavours of "
                      "the same engine, list every candidate separated by "
                      "commas -- whichever is running is the one attributed, so "
-                     "a switch does not silently turn attribution off. The "
-                     "journal is also read from it for HTTP status codes, "
-                     "client addresses and engine errors, which /metrics does "
-                     "not expose."},
+                     "a switch does not silently turn attribution off."},
+            {"key": "proxy_unit", "label": "Client proxy unit (optional)", "type": "str",
+             "default": "",
+             "help": "The systemd unit of a proxy sitting IN FRONT of vLLM, if "
+                     "there is one. Its journal is the only place a client "
+                     "address exists: /metrics is pre-aggregated and carries no "
+                     "request identity, and vLLM's own access log sees the "
+                     "proxy rather than whoever called it. Set this to get the "
+                     "per-client table; leave it empty and that panel simply "
+                     "says it has no source. Only requests and prompt sizes are "
+                     "read from it -- status and latency are logged on separate "
+                     "lines with no request id, so they cannot be tied to a "
+                     "client without guessing."},
             {"key": "api_key", "label": "API key (optional)", "type": "str",
              "default": "", "secret": True,
              "help": "Sent as a bearer token if the server requires one. "
