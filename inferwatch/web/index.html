@@ -571,6 +571,25 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
 
     <div class="grid" style="margin-top:14px">
       <div class="card" style="grid-column:1/-1">
+        <header><h2>Clients</h2><span class="note" id="n-nclients"></span></header>
+        <div class="banner show" id="nclient-note"
+             style="border-left-color:var(--series-3)">
+          <span class="ico" aria-hidden="true">i</span>
+          <span>NInfer records <strong>no client address</strong>, and unlike
+          vLLM it has no proxy in front to ask — so these come from the
+          <strong>socket table</strong>. They are connections, not requests: a
+          keep-alive socket shows here while idle, and a client that connects,
+          asks and disconnects between samples never shows at all. Requests are
+          pinned on a client only where every sample taken while they ran showed
+          <strong>exactly one</strong> connected — otherwise they are counted as
+          ambiguous and attributed to nobody.</span>
+        </div>
+        <div class="tbl-wrap" id="t-nclients"></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
         <header><h2>Recent requests</h2><span class="note" id="n-nreq"></span></header>
         <div class="tbl-wrap" id="t-nreq"></div>
       </div>
@@ -2358,6 +2377,33 @@ function renderNinferTables(d) {
       tr.appendChild(td(r.draft_accept === null ? "\u2014" : fmtPct(r.draft_accept), true));
       if (r.error) tr.title = r.error;
     }, "No requests in this window.");
+  /* Connection columns and request columns answer different questions, so the
+     table keeps them apart rather than blending them into one activity score. */
+  const cl = d.clients || { clients: [] };
+  table("t-nclients",
+    [{ label: "Client" }, { label: "Connected", num: true }, { label: "Peak conns", num: true },
+     { label: "Requests", num: true }, { label: "Prompt tok", num: true },
+     { label: "Generated", num: true }, { label: "TTFT p50", num: true },
+     { label: "Errors", num: true }, { label: "Last seen" }],
+    cl.clients,
+    (tr, c) => {
+      tr.appendChild(td(c.client, false, true));
+      tr.appendChild(td(c.presence === null ? "\u2014" : fmtPct(c.presence), true));
+      tr.appendChild(td(fmtCompact(c.peak_conns, 0), true));
+      tr.appendChild(td(fmtCompact(c.requests, 0), true));
+      tr.appendChild(td(fmtCompact(c.input_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(c.ttft_p50), true));
+      tr.appendChild(td(fmtCompact(c.errors, 0), true));
+      tr.appendChild(td(c.last_seen ? fmtClock(c.last_seen) : "\u2014"));
+    },
+    cl.samples ? "Nobody connected in this window."
+               : "No connection samples yet.");
+  text($("n-nclients"), cl.samples
+    ? `${cl.clients.length} seen \u00b7 ${fmtCompact(cl.attributed, 0)} requests attributed`
+      + (cl.ambiguous ? `, ${fmtCompact(cl.ambiguous, 0)} not attributable` : "")
+    : "no connection samples yet");
+
   const unpaired = (d.requests || []).filter((r) => !r.paired).length;
   text($("n-nreq"), `${(d.requests || []).length} shown`
     + (unpaired ? ` \u00b7 ${unpaired} whose submission was not read` : ""));

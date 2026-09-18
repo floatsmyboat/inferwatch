@@ -211,3 +211,110 @@ class TestMetrics(unittest.TestCase):
         self.st.add_source("ninfer", "ghost", {"unit": "x"})
         self.assertEqual([i["source"] for i in ninfer_metrics.instances(self.st)],
                          ["ghost"])
+
+
+class TestClients(unittest.TestCase):
+    """NInfer logs no client address, so identity comes from the socket table.
+    Those are connections, not requests, and the two are kept apart."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.st = Store(os.path.join(self.dir, "t.db"))
+        self.c = NinferCorrelator("n", on_request=self.st.insert_ninfer_request)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def conns(self, ts, counts):
+        self.st.insert_ninfer_client_samples(ts, "n", counts)
+        self.st.commit()
+
+    def request(self, ts, ttft=1000, wall=2.0):
+        """A completion at `ts` whose wall time places its start before it."""
+        self.c.feed(ts, DONE.replace("ttft=19893ms", f"ttft={ttft}ms")
+                            .replace("wall=50.67s", f"wall={wall}s")
+                            .replace("[req 2]", f"[req {int(ts)}]"))
+        self.st.commit()
+
+    def test_a_lone_connected_client_gets_the_request(self):
+        """Not a guess: with one client connected for the whole request, it was
+        that client's by elimination."""
+        self.conns(98.0, {"10.0.0.96": 1})
+        self.conns(100.0, {"10.0.0.96": 1})
+        self.request(101.0, wall=3.0)
+        got = ninfer_metrics.clients(self.st, "n", 0, 1000)
+        self.assertEqual(got["attributed"], 1)
+        self.assertEqual(got["ambiguous"], 0)
+        self.assertEqual(got["clients"][0]["client"], "10.0.0.96")
+        self.assertEqual(got["clients"][0]["requests"], 1)
+
+    def test_two_connected_clients_make_it_unattributable(self):
+        """Nothing in the log says which of them asked, so neither is charged."""
+        self.conns(100.0, {"10.0.0.96": 1, "10.0.0.122": 1})
+        self.request(101.0, wall=3.0)
+        got = ninfer_metrics.clients(self.st, "n", 0, 1000)
+        self.assertEqual((got["attributed"], got["ambiguous"]), (0, 1))
+        self.assertTrue(all(c["requests"] == 0 for c in got["clients"]))
+
+    def test_a_second_client_appearing_mid_request_spoils_it(self):
+        """Attribution needs EVERY sample while it ran to show one client; a
+        request that began alone and finished alongside another did not."""
+        self.conns(99.0, {"a": 1})
+        self.conns(100.0, {"a": 1, "b": 1})
+        self.request(101.0, wall=3.0)
+        self.assertEqual(ninfer_metrics.clients(self.st, "n", 0, 1000)["ambiguous"], 1)
+
+    def test_a_request_no_sample_covers_is_not_attributed(self):
+        self.conns(10.0, {"a": 1})
+        self.request(500.0, wall=1.0)
+        got = ninfer_metrics.clients(self.st, "n", 0, 1000)
+        self.assertEqual((got["attributed"], got["ambiguous"]), (0, 1))
+        self.assertEqual(got["clients"][0]["requests"], 0)
+
+    def test_a_connected_client_that_never_asked_still_appears(self):
+        """Being connected is worth showing on its own -- it is how an idle
+        keep-alive holder is told apart from nobody being there."""
+        self.conns(100.0, {"idle": 2})
+        got = ninfer_metrics.clients(self.st, "n", 0, 1000)
+        self.assertEqual(got["clients"][0]["client"], "idle")
+        self.assertEqual(got["clients"][0]["requests"], 0)
+        self.assertEqual(got["clients"][0]["peak_conns"], 2)
+
+    def test_presence_is_the_share_of_samples_it_was_seen_in(self):
+        self.conns(100.0, {"a": 1})
+        self.conns(200.0, {"a": 1, "b": 1})
+        got = {c["client"]: c for c in
+               ninfer_metrics.clients(self.st, "n", 0, 1000)["clients"]}
+        self.assertEqual(got["a"]["presence"], 1.0)
+        self.assertEqual(got["b"]["presence"], 0.5)
+
+    def test_connections_are_counted_per_address_not_per_socket(self):
+        from inferwatch.ninfer import sample_connections
+        self.assertIsInstance(sample_connections(9999), dict)
+
+
+class TestConnectionParsing(unittest.TestCase):
+    def test_peer_addresses_are_counted_by_host(self):
+        from unittest import mock
+
+        import inferwatch.ninfer as n
+        out = ("0 0 10.0.0.98:8011 10.0.0.96:52311\n"
+               "0 0 10.0.0.98:8011 10.0.0.96:52468\n"
+               "0 0 10.0.0.98:8011 10.0.0.122:41000\n"
+               "0 0 [::1]:8011 [2001:db8::5]:4000\n")
+        with mock.patch.object(n.shutil, "which", return_value="/usr/bin/ss"), \
+             mock.patch.object(n.subprocess, "run",
+                               return_value=mock.Mock(stdout=out)):
+            got = n.sample_connections(8011)
+        # Two sockets from one machine are one client holding two connections.
+        self.assertEqual(got["10.0.0.96"], 2)
+        self.assertEqual(got["10.0.0.122"], 1)
+        # An IPv6 peer is bracketed; splitting on ":" would cut the address.
+        self.assertEqual(got["2001:db8::5"], 1)
+
+    def test_no_ss_is_unknown_not_empty(self):
+        from unittest import mock
+
+        import inferwatch.ninfer as n
+        with mock.patch.object(n.shutil, "which", return_value=None):
+            self.assertIsNone(n.sample_connections(8011))

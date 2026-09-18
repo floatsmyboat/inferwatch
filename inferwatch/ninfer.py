@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -140,7 +142,13 @@ class NinferCorrelator:
                   "prefill_tps", "decode_tps", "latency_ms", "decode_ms",
                   "speculator", "draft_mean_len", "draft_accept", "error"):
             row[k] = rec.get(k)
-        if row.get("latency_ms") and sub.get("started_ts"):
+        # The completion states its own wall time, so when the request began
+        # is known whether or not its submission was ever read.  Deriving this
+        # only for paired requests left an unpaired one spanning zero seconds,
+        # which no connection sample can cover -- so it could never be
+        # attributed to a client, for want of a line that says nothing about
+        # when it started.
+        if row.get("latency_ms"):
             row["started_ts"] = ts - row["latency_ms"] / 1000.0
         else:
             row["started_ts"] = sub.get("started_ts")
@@ -166,6 +174,38 @@ class NinferCorrelator:
     def tick(self, now: float) -> None:
         """Periodic flush hook, kept for symmetry with the ollama correlator."""
         return None
+
+
+def sample_connections(port: int) -> dict[str, int] | None:
+    """Peers holding an established connection to `port`, counted per address.
+
+    The only source of client identity NInfer has: it logs none, and unlike
+    vLLM there is no proxy in front to ask.  None means the socket table could
+    not be read at all, which is different from {} meaning nobody is connected.
+
+    Ports are dropped and addresses counted, so two keep-alive sockets from one
+    machine read as one client holding two connections rather than as two.
+    """
+    exe = shutil.which("ss")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "-Htn", "state", "established", f"( sport = :{port} )"],
+            capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        peer = parts[3]
+        # IPv6 peers are bracketed, so splitting on ":" would cut the address.
+        host = peer[1:peer.index("]")] if peer.startswith("[") else peer.rsplit(":", 1)[0]
+        if host:
+            counts[host] = counts.get(host, 0) + 1
+    return counts
 
 
 def fetch_json(url: str, api_key: str = "", timeout: float = 5.0):
@@ -202,6 +242,7 @@ class NinferPoller:
         self.gpu_source = "unavailable"
         self.gpu_ts: float | None = None
         self._gpu_checked = 0.0
+        self.connections: dict | None = None
         self.last: dict = {}
 
     def probe(self) -> dict:
@@ -255,8 +296,17 @@ class NinferPoller:
                     gpu_indices=(json.dumps(self.gpu_indices)
                                  if self.gpu_indices is not None else None),
                     gpu_source=self.gpu_source, gpu_ts=self.gpu_ts)
+                port = gpuproc.port_of(self.url)
+                if port is not None and gpuproc.is_local(self.url):
+                    conns = await loop.run_in_executor(
+                        None, sample_connections, port)
+                    if conns:
+                        self.store.insert_ninfer_client_samples(
+                            ts, self.source, conns)
+                    self.connections = conns
                 self.store.commit()
                 self.last = {"ts": ts, "reachable": self.reachable,
+                             "connections": self.connections,
                              "model": model, "error": self.error,
                              "gpu_indices": self.gpu_indices,
                              "gpu_source": self.gpu_source}

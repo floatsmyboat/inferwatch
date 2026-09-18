@@ -187,6 +187,110 @@ def slowest(store, source: str, start: float, end: float, column: str = "ttft_ms
         (source, start, end, limit))]
 
 
+def clients(store, source: str, start: float, end: float) -> dict:
+    """Who was connected, and the requests that can honestly be pinned on them.
+
+    NInfer logs no client address, so identity comes from the socket table (see
+    the ninfer_client_samples DDL).  Those are CONNECTIONS: a client holding a
+    keep-alive socket appears while doing nothing, and one that connects, asks
+    and disconnects between two samples never appears at all.  So the
+    connection columns and the request columns answer different questions and
+    are kept apart rather than blended into one "client activity" number.
+
+    A request is attributed only where the sampling makes it unambiguous: every
+    connection sample taken while it was in flight showed exactly ONE client.
+    Then it was that client's, by elimination rather than by guessing.  If two
+    were connected, or no sample covers the request, it is counted as ambiguous
+    or unknown and pinned on nobody -- the same exact/ambiguous split the
+    ollama correlator uses, for the same reason.
+    """
+    samples = store.query(
+        "SELECT ts, client, conns FROM ninfer_client_samples"
+        " WHERE source=? AND ts >= ? AND ts < ? ORDER BY ts",
+        (source, start, end))
+    by_ts: dict[float, set] = {}
+    seen: dict[str, dict] = {}
+    for r in samples:
+        by_ts.setdefault(r["ts"], set()).add(r["client"])
+        d = seen.setdefault(r["client"], {"client": r["client"], "samples": 0,
+                                          "peak_conns": 0, "first_seen": r["ts"],
+                                          "last_seen": r["ts"]})
+        d["samples"] += 1
+        d["peak_conns"] = max(d["peak_conns"], r["conns"] or 0)
+        d["first_seen"] = min(d["first_seen"], r["ts"])
+        d["last_seen"] = max(d["last_seen"], r["ts"])
+
+    stamps = sorted(by_ts)
+    total_samples = len(stamps)
+
+    def sole_client(a: float, b: float):
+        """The one client connected throughout [a, b], if there was exactly one.
+
+        None when no sample covers the span (nothing observed) or when any
+        sample in it showed more than one connected client (not decidable).
+        """
+        covering = [t for t in stamps if a <= t <= b]
+        if not covering:
+            return None
+        who = set()
+        for t in covering:
+            names = by_ts[t]
+            if len(names) != 1:
+                return None
+            who |= names
+        return next(iter(who)) if len(who) == 1 else None
+
+    stats: dict[str, dict] = {}
+    attributed = ambiguous = 0
+    for r in store.query(
+            "SELECT ts, started_ts, prompt_tokens, cached_tokens, output_tokens,"
+            "       ttft_ms, latency_ms, finish"
+            "  FROM ninfer_requests WHERE source=? AND ts >= ? AND ts < ?",
+            (source, start, end)):
+        began = r["started_ts"] if r["started_ts"] is not None else r["ts"]
+        who = sole_client(began, r["ts"])
+        if who is None:
+            ambiguous += 1
+            continue
+        attributed += 1
+        d = stats.setdefault(who, {"requests": 0, "input_tokens": 0,
+                                   "output_tokens": 0, "cached_tokens": 0,
+                                   "errors": 0, "ttft": [], "latency": []})
+        d["requests"] += 1
+        d["input_tokens"] += r["prompt_tokens"] or 0
+        d["output_tokens"] += r["output_tokens"] or 0
+        d["cached_tokens"] += r["cached_tokens"] or 0
+        if (r["finish"] or "") == "error":
+            d["errors"] += 1
+        if r["ttft_ms"] is not None:
+            d["ttft"].append(r["ttft_ms"])
+        if r["latency_ms"] is not None:
+            d["latency"].append(r["latency_ms"])
+
+    out = []
+    for name, d in seen.items():
+        s = stats.get(name) or {}
+        out.append({
+            **d,
+            # Share of the window this client was observed connected at all.
+            "presence": (d["samples"] / total_samples) if total_samples else None,
+            "requests": s.get("requests", 0),
+            "input_tokens": s.get("input_tokens", 0),
+            "output_tokens": s.get("output_tokens", 0),
+            "cached_tokens": s.get("cached_tokens", 0),
+            "errors": s.get("errors", 0),
+            "ttft_p50": _pct(s.get("ttft") or [], 0.5),
+            "latency_p50": _pct(s.get("latency") or [], 0.5),
+        })
+    out.sort(key=lambda x: (-x["requests"], -x["samples"]))
+    return {"clients": out, "attributed": attributed, "ambiguous": ambiguous,
+            "samples": total_samples,
+            "notes": "Connections are sampled from the socket table; NInfer logs "
+                     "no client address. A request is attributed only when every "
+                     "sample taken while it ran showed exactly one connected "
+                     "client."}
+
+
 def instances(store) -> list[dict]:
     """Configured NInfer instances, filtered to sources that still exist.
 

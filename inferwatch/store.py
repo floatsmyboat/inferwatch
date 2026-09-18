@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -49,7 +49,8 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
     },
     "ninfer": {
         "registry": [("ninfer_instances", None)],
-        "history": [("ninfer_requests", "ts"), ("ninfer_samples", "ts")],
+        "history": [("ninfer_requests", "ts"), ("ninfer_samples", "ts"),
+                    ("ninfer_client_samples", "ts")],
     },
     "swarmui": {
         "registry": [],
@@ -404,6 +405,27 @@ CREATE TABLE IF NOT EXISTS ninfer_samples (
     avg_decode_batch REAL,
     PRIMARY KEY (ts, source)
 ) WITHOUT ROWID;
+
+-- Who is connected to NInfer, sampled from the socket table.
+--
+-- NInfer logs no client address anywhere (24h of log: the only IPs are the
+-- 0.0.0.0 it listens on), and unlike vLLM it has no proxy in front to ask --
+-- it is reached directly.  So the only honest source of client identity is the
+-- kernel's list of established connections to its port.
+--
+-- These are CONNECTIONS, not requests.  A client holding a keep-alive socket
+-- open appears here while doing nothing at all, and one that connects, asks
+-- and disconnects between two samples never appears.  Requests are tied to a
+-- client only where the sampling makes it unambiguous -- see
+-- ninfer_metrics.clients.
+CREATE TABLE IF NOT EXISTS ninfer_client_samples (
+    ts     REAL NOT NULL,
+    source TEXT NOT NULL,
+    client TEXT NOT NULL,
+    conns  INTEGER NOT NULL,
+    PRIMARY KEY (ts, source, client)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_ncs_src_ts ON ninfer_client_samples(source, ts);
 
 CREATE TABLE IF NOT EXISTS ninfer_instances (
     source      TEXT PRIMARY KEY,
@@ -1105,6 +1127,17 @@ class Store:
                 f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                 tuple(row.get(c) for c in cols))
 
+    def insert_ninfer_client_samples(self, ts: float, source: str,
+                                     counts: dict) -> None:
+        """One socket-table reading: how many connections each peer holds."""
+        if not counts:
+            return
+        with self.lock:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO ninfer_client_samples"
+                " (ts,source,client,conns) VALUES (?,?,?,?)",
+                [(ts, source, c, n) for c, n in counts.items()])
+
     def upsert_ninfer_instance(self, source: str, **fields) -> None:
         cols = ("last_seen", "model", "reachable", "error", "kv_tokens",
                 "load_ms", "gpu_indices", "gpu_source", "gpu_ts")
@@ -1243,6 +1276,8 @@ class Store:
                                    (raw_cut,)).rowcount
             n_ns = self.db.execute("DELETE FROM ninfer_samples WHERE ts < ?",
                                    (samp_cut,)).rowcount
+            n_ncs = self.db.execute("DELETE FROM ninfer_client_samples WHERE ts < ?",
+                                    (samp_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
             n_r1m = n_r1h = 0
@@ -1259,7 +1294,8 @@ class Store:
                 "image_generations": n_ig, "image_samples": n_is,
                 "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h,
                 "vllm_client_requests": n_vcr,
-                "ninfer_requests": n_nr, "ninfer_samples": n_ns}
+                "ninfer_requests": n_nr, "ninfer_samples": n_ns,
+                "ninfer_client_samples": n_ncs}
 
     # -- reads ---------------------------------------------------------------
 

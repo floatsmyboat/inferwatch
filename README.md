@@ -87,6 +87,22 @@ the submission line marks where `max_tokens` came from, not who called. Finish
 reasons stand in for status, and are more informative than one — `output_limit`
 and `tool_calls` are both 200s that mean very different things.
 
+**Clients come from the socket table**, because nothing else has them: 24 hours
+of log contains no address but the `0.0.0.0` it listens on, and unlike vLLM
+there is no proxy in front to ask — NInfer is reached directly. So established
+connections to its port are sampled on the poll interval.
+
+Those are *connections*, not requests, and the pane keeps the two apart. A
+client holding a keep-alive socket appears while doing nothing; one that
+connects, asks and disconnects between two samples never appears at all.
+
+A request is pinned on a client only where the sampling settles it: every
+sample taken while that request was in flight showed **exactly one** connected
+client. Then it was that client's by elimination, not by guessing. Two
+connected, or no sample covering the request, and it is counted as not
+attributable and charged to nobody — the same exact/ambiguous split the ollama
+correlator makes, for the same reason.
+
 One parsing note worth keeping: the `tok/s` unit is printed only when there *is*
 a rate. A request too short to have one logs a bare `decode=n/a`, and requiring
 the suffix silently dropped 7 of 16 completions in a day's log — every

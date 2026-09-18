@@ -370,6 +370,9 @@ def create_app(state: AppState) -> FastAPI:
                 "requests": ninfer_metrics.recent_requests(st, source, start, end, 100),
                 "slowest": ninfer_metrics.slowest(st, source, start, end, "ttft_ms", 10),
                 "gpu": metrics.gpu_series(st, start, end, step),
+                # Sampled from the socket table, not from the log: NInfer
+                # records no client address.  See ninfer_metrics.clients.
+                "clients": ninfer_metrics.clients(st, source, start, end),
                 "raw_complete": metrics.coverage(st, start)["complete"],
                 "raw_from": metrics.coverage(st, start)["covers_from"],
             }
@@ -386,6 +389,11 @@ def create_app(state: AppState) -> FastAPI:
                                 step: int | None = None):
         start, end = _window(window)
         return ninfer_metrics.timeseries(state.store, source, start, end, step)
+
+    @app.get("/api/ninfer/clients")
+    async def ninfer_clients(source: str, window: str = "1h"):
+        start, end = _window(window)
+        return ninfer_metrics.clients(state.store, source, start, end)
 
     @app.get("/api/ninfer/requests")
     async def ninfer_requests(source: str, window: str = "1h", limit: int = 100):
