@@ -725,3 +725,184 @@ class TestImagesHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# Undefined-identifier analysis, used by TestUndefinedIdentifiers below.
+# --------------------------------------------------------------------------
+
+BROWSER = {
+    "window","document","console","Math","JSON","Date","Object","Array","String",
+    "Number","Boolean","Set","Map","WeakMap","Promise","fetch","URLSearchParams",
+    "setTimeout","clearTimeout","setInterval","clearInterval","requestAnimationFrame",
+    "history","location","navigator","performance","Error","TypeError","RangeError",
+    "isNaN","parseFloat","parseInt","undefined","NaN","Infinity","EventSource",
+    "WebSocket","localStorage","sessionStorage","CustomEvent","Event","Intl",
+    "SVGElement","HTMLElement","Node","NodeList","DOMParser","ResizeObserver",
+    "IntersectionObserver","AbortController","structuredClone","globalThis","matchMedia",
+    "getComputedStyle","alert","confirm","prompt","encodeURIComponent","decodeURIComponent",
+    "Symbol","Proxy","Reflect","BigInt","queueMicrotask","btoa","atob","crypto","self",
+}
+
+def walk(node, fn):
+    if isinstance(node, list):
+        for n in node: walk(n, fn)
+        return
+    if not hasattr(node, "type"): return
+    fn(node)
+    for key in dir(node):
+        if key.startswith("_") or key == "type": continue
+        try: val = getattr(node, key)
+        except Exception: continue
+        if isinstance(val, list) or hasattr(val, "type"): walk(val, fn)
+
+def pattern_names(node, out):
+    if node is None or not hasattr(node, "type"): return
+    t = node.type
+    if t == "Identifier": out.add(node.name)
+    elif t == "ObjectPattern":
+        for p in node.properties or []:
+            pattern_names(getattr(p, "value", None) or getattr(p, "argument", None), out)
+    elif t == "ArrayPattern":
+        for e in node.elements or []: pattern_names(e, out)
+    elif t == "AssignmentPattern": pattern_names(node.left, out)
+    elif t == "RestElement": pattern_names(node.argument, out)
+
+def declared_in(node):
+    out = set()
+    def visit(n):
+        t = n.type
+        if t == "VariableDeclarator": pattern_names(n.id, out)
+        if t in ("FunctionDeclaration","ClassDeclaration") and getattr(n,"id",None):
+            out.add(n.id.name)
+        # Independent of the branch above: a named function declaration has
+        # BOTH an id and params, and an elif here silently dropped every
+        # parameter in the file.
+        if t in ("FunctionDeclaration","FunctionExpression","ArrowFunctionExpression"):
+            for p in n.params or []: pattern_names(p, out)
+        if t == "CatchClause" and getattr(n,"param",None): pattern_names(n.param, out)
+    walk(node, visit)
+    return out
+
+def referenced_in(node):
+    out = set()
+    skip = set()
+    def visit(n):
+        t = n.type
+        if t == "MemberExpression" and not n.computed and getattr(n.property,"type","")=="Identifier":
+            skip.add(id(n.property))
+        elif t == "Property" and not getattr(n,"computed",False) and getattr(n.key,"type","")=="Identifier":
+            skip.add(id(n.key))
+        elif t in ("BreakStatement","ContinueStatement","LabeledStatement") and getattr(n,"label",None):
+            skip.add(id(n.label))
+        elif t == "MethodDefinition" and not getattr(n,"computed",False):
+            skip.add(id(n.key))
+    walk(node, visit)
+    def collect(n):
+        if n.type == "Identifier" and id(n) not in skip: out.add(n.name)
+    walk(node, collect)
+    return out
+
+def walk_shallow(node, fn, _root=True):
+    """Like walk, but does not descend into function bodies.
+
+    The top-level scope must be collected this way: descending meant a `const`
+    inside one render function counted as a global for every other, which is
+    exactly the bug this check exists to catch and is why the first version of
+    it reported a clean file.
+    """
+    if isinstance(node, list):
+        for n in node: walk_shallow(n, fn, False)
+        return
+    if not hasattr(node, "type"): return
+    if not _root and node.type in ("FunctionDeclaration", "FunctionExpression",
+                                   "ArrowFunctionExpression"):
+        fn(node)                      # its own name is declared out here
+        return
+    fn(node)
+    for key in dir(node):
+        if key.startswith("_") or key == "type": continue
+        try: val = getattr(node, key)
+        except Exception: continue
+        if isinstance(val, list) or hasattr(val, "type"):
+            walk_shallow(val, fn, False)
+
+
+def declared_top(tree):
+    out = set()
+    def visit(n):
+        t = n.type
+        if t == "VariableDeclarator": pattern_names(n.id, out)
+        if t in ("FunctionDeclaration", "ClassDeclaration") and getattr(n, "id", None):
+            out.add(n.id.name)
+    walk_shallow(tree, visit)
+    return out
+
+
+class TestUndefinedIdentifiers(unittest.TestCase):
+    """A third silent failure, alongside the two in this file's docstring.
+
+    A reference to a variable that does not exist is valid JavaScript: it
+    parses, so the syntax test passes, and it names no element id, so that test
+    passes too.  It throws only when the line runs -- and every render function
+    here is called inside a try/catch that logs to the console, so the tab
+    renders whatever came before the throw and nothing after it.
+
+    That shipped.  renderNinfer used `fmtTick`, which every OTHER render
+    function declares as its own local, and the NInfer tab showed its hero and
+    the static notes in its markup with not one chart under them.
+
+    Locals are over-approximated on purpose -- every declaration anywhere in a
+    function counts as visible throughout it -- so this cannot flag a real
+    binding.  The top-level scope is collected without descending into function
+    bodies, which is the part that matters: descending is what made the first
+    version of this check report a clean file, since a `const` inside one
+    render function then counted as a global for every other.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import esprima
+        except ImportError:
+            raise unittest.SkipTest("esprima not installed")
+        cls.esprima = esprima
+
+    def flagged(self, js):
+        tree = self.esprima.parseScript(js, {"tolerant": True})
+        top = declared_top(tree)
+        out = {}
+        for node in tree.body:
+            if node.type != "FunctionDeclaration" or not node.id:
+                continue
+            local = declared_in(node) | {node.id.name}
+            unknown = sorted(referenced_in(node) - local - top - BROWSER)
+            if unknown:
+                out[node.id.name] = unknown
+        return out
+
+    def test_no_function_references_an_undefined_name(self):
+        self.assertEqual(
+            self.flagged(script(read())), {},
+            "these functions reference names declared nowhere they can see; "
+            "each throws at runtime and the panel below it silently stops")
+
+    def test_the_check_catches_a_local_borrowed_from_another_function(self):
+        """The shape of the real bug: a name that exists, but only as someone
+        else's local.  Without this the check could pass by being vacuous."""
+        js = ("function a() { const helper = 1; return helper; }\n"
+              "function b() { return helper; }\n")
+        self.assertEqual(self.flagged(js), {"b": ["helper"]})
+
+    def test_parameters_and_nested_declarations_are_not_flagged(self):
+        js = ("function a(x, {y}, [z], w = 2) {\n"
+              "  const q = 1; let r = 2; var s = 3;\n"
+              "  function inner(p) { return p + q; }\n"
+              "  try { inner(x); } catch (e) { console.log(e); }\n"
+              "  return [y, z, w, r, s, inner];\n"
+              "}\n")
+        self.assertEqual(self.flagged(js), {})
+
+    def test_property_names_are_not_mistaken_for_variables(self):
+        js = ("function a(o) { return o.fmtTick + o['x'] + {fmtTick: 1}.fmtTick; }\n")
+        self.assertEqual(self.flagged(js), {})

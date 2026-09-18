@@ -2183,6 +2183,7 @@ function renderNinfer() {
   if (!d.summary) { text($("n-hero"), "\u2014"); return; }
 
   const s = d.summary, ts = d.timeseries;
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
   renderNinferKpis(d, s);
 
   text($("n-hero"), fmtCompact(s.decode_tps_mean, 1));
