@@ -517,6 +517,14 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `backends` | — | — | Optional, comma separated. Leave empty and the backend ports are discovered from the log, which is the only place SwarmUI publishes them. Required when the reader is 'none'. |
 | `history_limit` | `64` | — | How many /history entries to read each tick. ComfyUI keeps this in memory only, so a larger number costs little and survives a burst between polls. |
 
+**Exllama (tabbyAPI)** (`--kind exllama`)
+
+| Field | Default | Required when | Notes |
+|---|---|---|---|
+| `log_dir` | — | — | Directory containing tabbyAPI's per-startup log files. The reader follows the newest .log file and switches automatically when the server restarts and writes a new one. |
+| `url` | `http://127.0.0.1:8003` | — | Polled for /health and /v1/model. The log goes quiet when the engine is merely idle, which is indistinguishable from it being gone unless something asks. |
+| `api_key` | — | — | Sent as a bearer token if the server requires one. |
+
 **vLLM** (`--kind vllm`)
 
 | Field | Default | Required when | Notes |
