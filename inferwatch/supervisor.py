@@ -25,6 +25,7 @@ import logging
 
 from . import parse_proxy
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
+from .exllama import ExllamaCorrelator, ExllamaPoller
 from .images import ImagesPoller, SwarmLogCollector
 from .ninfer import NinferCorrelator, NinferPoller
 from .models import ModelIndex
@@ -50,6 +51,8 @@ class SourceRuntime:
         self.proxy_reader = None
         self.ninfer: NinferPoller | None = None
         self.ninfer_corr: NinferCorrelator | None = None
+        self.exllama: ExllamaPoller | None = None
+        self.exllama_corr: ExllamaCorrelator | None = None
 
     @property
     def name(self) -> str:
@@ -74,6 +77,13 @@ class SourceRuntime:
         if self.ninfer is not None:
             d["reachable"] = self.ninfer.reachable
             d["gpu_indices"] = self.ninfer.gpu_indices
+        if self.exllama_corr is not None:
+            d["inflight"] = self.exllama_corr.inflight
+            d["stats"] = dict(self.exllama_corr.stats)
+            d["model"] = self.exllama_corr.model
+        if self.exllama is not None:
+            d["reachable"] = self.exllama.reachable
+            d["gpu_indices"] = self.exllama.gpu_indices
         if self.corr is not None:
             d["inflight"] = self.corr.inflight
             d["stats"] = dict(self.corr.stats)
@@ -370,6 +380,45 @@ class Supervisor:
                 asyncio.create_task(rt.ninfer.run(), name=f"ninfer:{name}"),
             ]
             log.info("source %r started (ninfer %s, %s)", name, rt.ninfer.url,
+                      rt.reader.describe())
+        elif spec["kind"] == "exllama":
+            name, store = spec["name"], self.store
+            rt.exllama_corr = ExllamaCorrelator(
+                name,
+                on_request=self.store.insert_exllama_request,
+                on_event=self.store.insert_event,
+                on_live=self.hub.publish)
+            corr = rt.exllama_corr
+
+            def resume_ts(store=store, name=name):
+                row = store.query("SELECT MAX(ts) t FROM exllama_requests"
+                                  " WHERE source = ?", (name,))
+                return row[0]["t"] if row and row[0]["t"] else None
+
+            cfg = {**cfg, "reader": "file_dir"}
+            rt.reader = build_reader(
+                self.store, name, cfg,
+                backfill=self.config.get("collection.backfill"),
+                resume_ts=resume_ts)
+
+            def on_line(ts, msg, corr=corr):
+                corr.feed(ts, msg)
+
+            def on_flush(now, corr=corr, store=store):
+                corr.tick(now)
+                store.commit()
+
+            rt.exllama = ExllamaPoller(
+                self.store, name, cfg, corr,
+                interval_getter=lambda: self.config.get(
+                    "collection.poll_interval_s"),
+                on_live=self.hub.publish)
+            rt.tasks = [
+                asyncio.create_task(rt.reader.run(on_line, on_flush),
+                                    name=f"reader:{name}"),
+                asyncio.create_task(rt.exllama.run(), name=f"exllama:{name}"),
+            ]
+            log.info("source %r started (exllama %s, %s)", name, rt.exllama.url,
                      rt.reader.describe())
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
@@ -393,8 +442,10 @@ class Supervisor:
                                    if rt.kind == "ollama"), None),
             "vllm_sources": [rt.name for rt in self.runtimes.values()
                              if rt.kind == "vllm"],
-            "image_sources": [rt.name for rt in self.runtimes.values()
-                              if rt.kind == "swarmui"],
+"image_sources": [rt.name for rt in self.runtimes.values()
+                               if rt.kind == "swarmui"],
+            "exllama_sources": [rt.name for rt in self.runtimes.values()
+                                if rt.kind == "exllama"],
         }
 
     def image_runtimes(self) -> list[SourceRuntime]:

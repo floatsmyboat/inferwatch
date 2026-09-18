@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -56,6 +56,11 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
         "registry": [],
         "history": [("image_generations", "ts"), ("image_samples", "ts"),
                     ("image_events", "ts")],
+    },
+    "exllama": {
+        "registry": [("exllama_instances", None)],
+        "history": [("exllama_requests", "ts"),
+                    ("exllama_client_samples", "ts")],
     },
 }
 
@@ -440,6 +445,68 @@ CREATE TABLE IF NOT EXISTS ninfer_instances (
     gpu_ts      REAL
 );
 
+-- ----------------------------------------------------------------------
+-- Exllama (tabbyAPI / exllamav3): per-request rows from its log, plus
+-- connection samples from the socket table.  Like NInfer it publishes no
+-- /metrics, so everything measured comes from the log.  The log carries
+-- per-request timings (TTFT, prefill/decode speed, cache, draft acceptance)
+-- but no periodic throughput gauge, so there is no exllama_samples table.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS exllama_requests (
+    id                  INTEGER PRIMARY KEY,
+    ts                  REAL NOT NULL,      -- completion time
+    started_ts          REAL,
+    source              TEXT NOT NULL,
+    epoch               INTEGER,
+    req_id              INTEGER,
+    model               TEXT,
+    endpoint            TEXT,
+    stream              INTEGER,
+    max_tokens          INTEGER,
+    tool_calls          INTEGER,
+    finish              TEXT,               -- completed | error | disconnected
+    error               TEXT,
+    prompt_tokens       INTEGER,            -- actually evaluated (uncached)
+    cached_tokens       INTEGER,
+    prompt_tokens_total INTEGER,
+    output_tokens       INTEGER,
+    ttft_ms             REAL,
+    latency_ms          REAL,
+    prefill_ms          REAL,
+    decode_ms           REAL,
+    prefill_tps         REAL,
+    decode_tps          REAL,
+    draft_accept        REAL,
+    draft_mean_len      REAL,
+    paired              INTEGER,
+    dedupe_key          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exreq_ts ON exllama_requests(source, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exreq_dedupe ON exllama_requests(dedupe_key);
+
+CREATE TABLE IF NOT EXISTS exllama_client_samples (
+    ts     REAL NOT NULL,
+    source TEXT NOT NULL,
+    client TEXT NOT NULL,
+    conns  INTEGER NOT NULL,
+    PRIMARY KEY (ts, source, client)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_ecs_src_ts ON exllama_client_samples(source, ts);
+
+CREATE TABLE IF NOT EXISTS exllama_instances (
+    source       TEXT PRIMARY KEY,
+    last_seen    REAL,
+    model        TEXT,
+    reachable    INTEGER,
+    error        TEXT,
+    max_seq_len  INTEGER,
+    cache_size   INTEGER,
+    load_ms      REAL,
+    gpu_indices  TEXT,
+    gpu_source   TEXT,
+    gpu_ts       REAL
+);
+
 -- Client-facing requests, read from the proxy in front of vLLM rather than from
 -- vLLM itself.  vLLM's /metrics is pre-aggregated and carries no request
 -- identity, and its own access log sees only the proxy, so this is the only
@@ -571,6 +638,13 @@ def ninfer_request_key(r: dict) -> str:
     counted per reader rather than stamped by the server.  So identity is the
     completion's own content, which a replay reproduces exactly.
     """
+    return "|".join(_f(r.get(k)) for k in
+                    ("ts", "source", "req_id", "finish", "prompt_tokens",
+                     "output_tokens", "ttft_ms", "latency_ms"))
+
+
+def exllama_request_key(r: dict) -> str:
+    """Identity of an exllama completion, for replay-safe inserts."""
     return "|".join(_f(r.get(k)) for k in
                     ("ts", "source", "req_id", "finish", "prompt_tokens",
                      "output_tokens", "ttft_ms", "latency_ms"))
@@ -1149,6 +1223,47 @@ class Store:
                 f" ON CONFLICT(source) DO UPDATE SET {sets}",
                 (source, *(fields.get(c) for c in cols)))
 
+    # -- exllama -----------------------------------------------------------
+
+    EXLLAMA_REQUEST_COLS = (
+        "ts", "started_ts", "source", "epoch", "req_id", "model", "endpoint",
+        "stream", "max_tokens", "tool_calls", "finish", "error",
+        "prompt_tokens", "cached_tokens", "prompt_tokens_total",
+        "output_tokens", "ttft_ms", "latency_ms", "prefill_ms", "decode_ms",
+        "prefill_tps", "decode_tps", "draft_accept", "draft_mean_len",
+        "paired", "dedupe_key")
+
+    def insert_exllama_request(self, row: dict) -> None:
+        row = dict(row)
+        row["dedupe_key"] = exllama_request_key(row)
+        cols = self.EXLLAMA_REQUEST_COLS
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO exllama_requests"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+
+    def insert_exllama_client_samples(self, ts: float, source: str,
+                                      counts: dict) -> None:
+        if not counts:
+            return
+        with self.lock:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO exllama_client_samples"
+                " (ts,source,client,conns) VALUES (?,?,?,?)",
+                [(ts, source, c, n) for c, n in counts.items()])
+
+    def upsert_exllama_instance(self, source: str, **fields) -> None:
+        cols = ("last_seen", "model", "reachable", "error", "max_seq_len",
+                "cache_size", "load_ms", "gpu_indices", "gpu_source", "gpu_ts")
+        sets = ",".join(f"{c}=excluded.{c}" for c in cols)
+        with self.lock:
+            self.db.execute(
+                f"INSERT INTO exllama_instances (source,{','.join(cols)})"
+                f" VALUES ({','.join('?' * (len(cols) + 1))})"
+                f" ON CONFLICT(source) DO UPDATE SET {sets}",
+                (source, *(fields.get(c) for c in cols)))
+
     def commit(self) -> None:
         with self.lock:
             self.db.commit()
@@ -1277,6 +1392,10 @@ class Store:
             n_ns = self.db.execute("DELETE FROM ninfer_samples WHERE ts < ?",
                                    (samp_cut,)).rowcount
             n_ncs = self.db.execute("DELETE FROM ninfer_client_samples WHERE ts < ?",
+                                   (samp_cut,)).rowcount
+            n_er = self.db.execute("DELETE FROM exllama_requests WHERE ts < ?",
+                                   (raw_cut,)).rowcount
+            n_ecs = self.db.execute("DELETE FROM exllama_client_samples WHERE ts < ?",
                                     (samp_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
@@ -1295,7 +1414,8 @@ class Store:
                 "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h,
                 "vllm_client_requests": n_vcr,
                 "ninfer_requests": n_nr, "ninfer_samples": n_ns,
-                "ninfer_client_samples": n_ncs}
+                "ninfer_client_samples": n_ncs,
+                "exllama_requests": n_er, "exllama_client_samples": n_ecs}
 
     # -- reads ---------------------------------------------------------------
 

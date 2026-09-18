@@ -267,6 +267,26 @@ SOURCE_KINDS = {
                      "little and survives a burst between polls."},
         ],
     },
+    "exllama": {
+        "label": "Exllama (tabbyAPI)",
+        "fields": [
+            {"key": "log_dir", "label": "Log directory", "type": "str",
+             "default": "",
+             "help": "Directory containing tabbyAPI's per-startup log files. "
+                     "The reader follows the newest .log file and switches "
+                     "automatically when the server restarts and writes a new "
+                     "one."},
+            {"key": "url", "label": "Base URL", "type": "str",
+             "default": "http://127.0.0.1:8003",
+             "help": "Polled for /health and /v1/model. The log goes quiet "
+                     "when the engine is merely idle, which is "
+                     "indistinguishable from it being gone unless something "
+                     "asks."},
+            {"key": "api_key", "label": "API key (optional)", "type": "str",
+             "default": "", "secret": True,
+             "help": "Sent as a bearer token if the server requires one."},
+        ],
+    },
     "vllm": {
         "label": "vLLM",
         "fields": [
@@ -426,6 +446,11 @@ def validate_source(kind: str, name: str, cfg: dict) -> dict:
         required = {"journald": "unit", "file": "path", "docker": "container"}[reader]
         if not out.get(required):
             raise ValueError(f"reader '{reader}' requires '{required}' to be set")
+    if kind == "exllama":
+        if not out.get("log_dir"):
+            raise ValueError("an exllama source needs a log directory")
+        if not out.get("url"):
+            raise ValueError("an exllama source needs a base URL")
     if kind == "vllm" and not out.get("url"):
         raise ValueError("a vLLM source needs a base URL")
     if kind == "swarmui":

@@ -23,7 +23,7 @@ import urllib.request
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import image_metrics, metrics, ninfer_metrics, vllm_metrics
+from . import exllama_metrics, image_metrics, metrics, ninfer_metrics, vllm_metrics
 from .config import (SOURCE_KINDS, ConfigError, merge_secrets, redact_sources,
                      resolve_secret, validate_source)
 
@@ -401,6 +401,66 @@ def create_app(state: AppState) -> FastAPI:
         return {"requests": ninfer_metrics.recent_requests(
             state.store, source, start, end, limit)}
 
+    # ------------------------------------------------------------- exllama
+
+    @app.get("/api/exllama/instances")
+    async def exllama_instances():
+        return {"instances": exllama_metrics.instances(state.store)}
+
+    @app.get("/api/exllama/dashboard")
+    async def exllama_dashboard(source: str | None = None, window: str = Query("1h"),
+                                step: int | None = None):
+        start, end = _window(window)
+        st = state.store
+        loop = asyncio.get_running_loop()
+        inst = exllama_metrics.instances(st)
+        if source is None:
+            source = inst[0]["source"] if inst else None
+        if source is None:
+            return {"window": window, "start": start, "end": end, "instances": [],
+                    "source": None, "summary": None, "timeseries": None,
+                    "hint": "No exllama source configured. Add one in Settings."}
+
+        def build():
+            return {
+                "window": window, "start": start, "end": end, "now": time.time(),
+                "source": source, "instances": inst,
+                "summary": exllama_metrics.summary(st, source, start, end),
+                "timeseries": exllama_metrics.timeseries(st, source, start, end, step),
+                "finish": exllama_metrics.finish_reasons(st, source, start, end),
+                "models": exllama_metrics.by_model(st, source, start, end),
+                "requests": exllama_metrics.recent_requests(st, source, start, end, 100),
+                "slowest": exllama_metrics.slowest(st, source, start, end, "ttft_ms", 10),
+                "gpu": metrics.gpu_series(st, start, end, step),
+                "clients": exllama_metrics.clients(st, source, start, end),
+                "raw_complete": metrics.coverage(st, start)["complete"],
+                "raw_from": metrics.coverage(st, start)["covers_from"],
+            }
+
+        return await loop.run_in_executor(None, build)
+
+    @app.get("/api/exllama/summary")
+    async def exllama_summary(source: str, window: str = "1h"):
+        start, end = _window(window)
+        return exllama_metrics.summary(state.store, source, start, end)
+
+    @app.get("/api/exllama/timeseries")
+    async def exllama_timeseries(source: str, window: str = "1h",
+                                 step: int | None = None):
+        start, end = _window(window)
+        return exllama_metrics.timeseries(state.store, source, start, end, step)
+
+    @app.get("/api/exllama/clients")
+    async def exllama_clients(source: str, window: str = "1h"):
+        start, end = _window(window)
+        return exllama_metrics.clients(state.store, source, start, end)
+
+    @app.get("/api/exllama/requests")
+    async def exllama_requests(source: str, window: str = "1h", limit: int = 100):
+        start, end = _window(window)
+        return {"requests": exllama_metrics.recent_requests(
+            state.store, source, start, end, limit)}
+
     @app.get("/api/images/sources")
     async def image_sources():
         return {"sources": image_metrics.sources(state.store),
@@ -760,6 +820,26 @@ def _probe(kind: str, cfg: dict) -> dict:
             except Exception:
                 notes.append(f"log source OK, but {url} did not answer /api/version")
         return {"ok": True, "detail": "; ".join(notes) or f"{reader} source looks readable"}
+    if kind == "exllama":
+        from .exllama import fetch_json
+        url = (cfg.get("url") or "").rstrip("/")
+        api_key = cfg.get("api_key") or ""
+        notes = []
+        try:
+            fetch_json(f"{url}/health", api_key)
+            notes.append(f"reachable at {url}")
+        except Exception as e:
+            return {"ok": False, "detail": f"could not reach {url}/health: {e}"}
+        try:
+            got = fetch_json(f"{url}/v1/model", api_key)
+            if isinstance(got, dict):
+                notes.append(f"model {got.get('id') or got.get('model')}")
+        except Exception:
+            pass
+        log_dir = cfg.get("log_dir") or ""
+        if log_dir and not os.path.isdir(log_dir):
+            return {"ok": False, "detail": f"log_dir does not exist: {log_dir}"}
+        return {"ok": True, "detail": "; ".join(notes)}
     return {"ok": False, "detail": f"unknown source kind {kind!r}"}
 
 

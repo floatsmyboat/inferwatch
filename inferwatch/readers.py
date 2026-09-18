@@ -39,6 +39,8 @@ log = logging.getLogger("inferwatch.readers")
 _GO_TS = re.compile(r"^time=(\S+)")
 _GIN_TS = re.compile(r"^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})")
 _DOCKER_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\s+(.*)$")
+_LOGURU_TS = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s*\|")
 
 
 def parse_iso_dt(text: str):
@@ -121,6 +123,14 @@ def derive_timestamp(message: str, previous: float | None, tz=None) -> float:
         m = _GIN_TS.match(message)
         if m:
             dt = parse_iso_dt(f"{m.group(1).replace('/', '-')}T{m.group(2)}")
+            if dt is not None:
+                if dt.tzinfo is None and tz is not None:
+                    dt = dt.replace(tzinfo=tz)
+                ts = dt.timestamp()
+    if ts is None:
+        m = _LOGURU_TS.match(message)
+        if m:
+            dt = parse_iso_dt(m.group(1).replace(" ", "T"))
             if dt is not None:
                 if dt.tzinfo is None and tz is not None:
                     dt = dt.replace(tzinfo=tz)
@@ -591,6 +601,149 @@ class DockerReader(Reader):
             await asyncio.sleep(5)
 
 
+class DirReader(Reader):
+    """Follows the newest .log file in a directory.
+
+    tabbyAPI writes a new log file on every startup (named
+    YYYY-MM-DD_HH-MM-SS_ffffff.log) rather than rotating in place, so a
+    fixed path goes stale the moment the server restarts.  This reader
+    polls the directory for the newest .log file and re-targets when it
+    changes, reusing the same inode/offset tracking as FileReader.
+    """
+
+    kind = "file_dir"
+
+    def __init__(self, store, source: str, cfg: dict, poll: float = 0.5,
+                 resume_ts=None):
+        super().__init__(store, source, cfg, resume_ts)
+        self.dir = os.path.expanduser(cfg.get("log_dir") or "")
+        self.poll = poll
+        self.clock = TimestampTracker()
+        self._current_path: str | None = None
+
+    def describe(self) -> str:
+        return f"dir {self.dir}"
+
+    def _newest_log(self) -> str | None:
+        try:
+            entries = [e for e in os.listdir(self.dir) if e.endswith(".log")]
+            if not entries:
+                return None
+            entries.sort()
+            return os.path.join(self.dir, entries[-1])
+        except OSError:
+            return None
+
+    async def run(self, on_line, on_flush) -> None:
+        if not self.dir:
+            log.error("[%s] dir reader needs a log_dir", self.source)
+            return
+        state = self.load_state()
+        offset = int(state.get("offset") or 0)
+        inode = state.get("inode")
+        current = state.get("path") or None
+        fh = None
+        last_commit = time.time()
+        last_dir_check = 0.0
+        try:
+            while True:
+                # Check for a newer file every few seconds.
+                now = time.time()
+                if now - last_dir_check > 3.0:
+                    last_dir_check = now
+                    newest = self._newest_log()
+                    if newest and newest != current:
+                        if fh:
+                            self._drain(fh, on_line)
+                            fh.close()
+                        current = newest
+                        offset = 0
+                        inode = None
+                        log.info("[%s] switching to new log file %s",
+                                 self.source, current)
+
+                if not current:
+                    await asyncio.sleep(self.poll)
+                    continue
+
+                try:
+                    st = os.stat(current)
+                except OSError:
+                    if fh:
+                        fh.close(); fh = None
+                    await asyncio.sleep(2.0)
+                    continue
+
+                if fh is None or inode != st.st_ino:
+                    if fh:
+                        self._drain(fh, on_line)
+                        fh.close()
+                    fh = open(current, "r", encoding="utf-8", errors="replace")
+                    if inode == st.st_ino and offset <= st.st_size:
+                        fh.seek(offset)
+                    else:
+                        inode = st.st_ino
+                        offset = 0
+                        fh.seek(0)
+                    log.info("[%s] following file %s (inode %s, offset %s)",
+                             self.source, current, inode, offset)
+                elif st.st_size < offset:
+                    log.info("[%s] %s was truncated; restarting from the top",
+                             self.source, current)
+                    offset = 0
+                    fh.seek(0)
+
+                read_any = self._consume(fh, on_line)
+                offset = fh.tell()
+                inode = st.st_ino
+
+                now = time.time()
+                if read_any or now - last_commit > 1.0:
+                    self.save_state({"path": current, "inode": inode,
+                                     "offset": offset})
+                    on_flush(now)
+                    last_commit = now
+                if not read_any:
+                    await asyncio.sleep(self.poll)
+        except asyncio.CancelledError:
+            if fh:
+                self.save_state({"path": current, "inode": inode,
+                                 "offset": offset})
+            raise
+        finally:
+            if fh:
+                fh.close()
+
+    def _emit(self, line: str, on_line) -> None:
+        line = line.rstrip("\n")
+        if not line:
+            return
+        ts = self.clock.feed(line)
+        self.lines += 1
+        on_line(ts, line)
+
+    def _consume(self, fh, on_line) -> bool:
+        emitted = False
+        while True:
+            pos = fh.tell()
+            line = fh.readline()
+            if not line:
+                return emitted
+            if not line.endswith("\n"):
+                fh.seek(pos)
+                return emitted
+            self._emit(line, on_line)
+            emitted = True
+
+    def _drain(self, fh, on_line) -> None:
+        try:
+            rest = fh.read()
+        except OSError:
+            return
+        for line in rest.split("\n"):
+            self._emit(line, on_line)
+
+
 class NullReader(Reader):
     """Reads nothing, for a source monitored over HTTP alone.
 
@@ -609,7 +762,7 @@ class NullReader(Reader):
 
 
 READERS = {"journald": JournaldReader, "file": FileReader,
-           "docker": DockerReader, "none": NullReader}
+           "docker": DockerReader, "file_dir": DirReader, "none": NullReader}
 
 
 def build_reader(store, source: str, cfg: dict, backfill: str = "-2 days",
@@ -618,6 +771,6 @@ def build_reader(store, source: str, cfg: dict, backfill: str = "-2 days",
     cls = READERS.get(kind)
     if cls is None:
         raise ValueError(f"unknown reader {kind!r}; expected one of {sorted(READERS)}")
-    if cls in (FileReader, NullReader):
+    if cls in (FileReader, DirReader, NullReader):
         return cls(store, source, cfg, resume_ts=resume_ts)
     return cls(store, source, cfg, backfill=backfill, resume_ts=resume_ts)

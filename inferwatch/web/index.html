@@ -292,6 +292,7 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     <button role="tab" data-tab="ollama" aria-selected="true">Ollama</button>
     <button role="tab" data-tab="vllm" aria-selected="false">vLLM</button>
     <button role="tab" data-tab="ninfer" aria-selected="false">NInfer</button>
+    <button role="tab" data-tab="exllama" aria-selected="false">Exllama</button>
     <button role="tab" data-tab="images" aria-selected="false">Images</button>
     <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
   </nav>
@@ -313,6 +314,9 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     </label>
     <label class="inline" id="nsource-wrap" hidden>Instance
       <select id="nsource"></select>
+    </label>
+    <label class="inline" id="esource-wrap" hidden>Instance
+      <select id="esource"></select>
     </label>
     <label class="inline" id="vsource-wrap" hidden>Instance
       <select id="vsource"></select>
@@ -592,6 +596,107 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="card" style="grid-column:1/-1">
         <header><h2>Recent requests</h2><span class="note" id="n-nreq"></span></header>
         <div class="tbl-wrap" id="t-nreq"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-exllama" hidden>
+    <div class="banner show" id="exllama-note" style="border-left-color:var(--series-2)">
+      <span class="ico" aria-hidden="true">i</span>
+      <span>tabbyAPI (exllamav3) publishes no <code>/metrics</code>, so everything here is read
+      from its log. Unlike NInfer there is no periodic throughput gauge, so the timeseries is
+      built entirely from per-request rows. It logs no client address; <strong>finish reasons</strong>
+      stand in for HTTP status.</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="flabel">Decode throughput</div>
+        <div class="figure"><span id="e-hero">—</span><span class="unit">tok/s</span></div>
+      </div>
+      <div class="spark plot" id="e-hero-spark"></div>
+    </div>
+
+    <div class="kpis" id="e-kpis"></div>
+
+    <div class="grid">
+      <div class="card" id="c-ettft">
+        <header><h2>Time to first token</h2><span class="note" id="n-ettft">mean per bucket</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-ettft"></div><div class="plot" id="p-ettft"></div>
+        <div class="tbl-wrap" id="t-ettft" hidden></div>
+      </div>
+      <div class="card" id="c-erate">
+        <header><h2>Request rate</h2><span class="note" id="n-erate">completions per second</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-erate"></div><div class="plot" id="p-erate"></div>
+        <div class="tbl-wrap" id="t-erate" hidden></div>
+      </div>
+      <div class="card" id="c-etok">
+        <header><h2>Token throughput</h2><span class="note" id="n-etok">prompt evaluated vs generated</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-etok"></div><div class="plot" id="p-etok"></div>
+        <div class="tbl-wrap" id="t-etok" hidden></div>
+      </div>
+      <div class="card" id="c-egpu">
+        <header><h2>GPU utilisation</h2><span class="note" id="n-egpu"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-egpu"></div><div class="plot" id="p-egpu"></div>
+        <div class="tbl-wrap" id="t-egpu" hidden></div>
+      </div>
+      <div class="card" id="c-evram">
+        <header><h2>VRAM in use</h2><span class="note" id="n-evram"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-evram"></div><div class="plot" id="p-evram"></div>
+        <div class="tbl-wrap" id="t-evram" hidden></div>
+      </div>
+      <div class="card" id="c-etemp">
+        <header><h2>GPU temperature</h2><span class="note" id="n-etemp"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-etemp"></div><div class="plot" id="p-etemp"></div>
+        <div class="tbl-wrap" id="t-etemp" hidden></div>
+      </div>
+      <div class="card" id="c-epower">
+        <header><h2>GPU power draw</h2><span class="note" id="n-epower"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-epower"></div><div class="plot" id="p-epower"></div>
+        <div class="tbl-wrap" id="t-epower" hidden></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Finish reasons</h2><span class="note" id="n-efinish"></span></header>
+        <div class="tbl-wrap" id="t-efinish"></div></div>
+      <div class="card"><header><h2>Models</h2><span class="note" id="n-emodels"></span></header>
+        <div class="tbl-wrap" id="t-emodels"></div></div>
+      <div class="card"><header><h2>Slowest by TTFT</h2><span class="note" id="n-eslow"></span></header>
+        <div class="tbl-wrap" id="t-eslow"></div></div>
+      <div class="card"><header><h2>Instances</h2><span class="note" id="n-einst"></span></header>
+        <div class="tbl-wrap" id="t-einst"></div></div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Clients</h2><span class="note" id="n-eclients"></span></header>
+        <div class="banner show" id="eclient-note"
+             style="border-left-color:var(--series-3)">
+          <span class="ico" aria-hidden="true">i</span>
+          <span>tabbyAPI records <strong>no client address</strong>, so these come from the
+          <strong>socket table</strong>. They are connections, not requests: a
+          keep-alive socket shows here while idle, and a client that connects,
+          asks and disconnects between samples never shows at all. Requests are
+          pinned on a client only where every sample taken while they ran showed
+          <strong>exactly one</strong> connected — otherwise they are counted as
+          ambiguous and attributed to nobody.</span>
+        </div>
+        <div class="tbl-wrap" id="t-eclients"></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Recent requests</h2><span class="note" id="n-ereq"></span></header>
+        <div class="tbl-wrap" id="t-ereq"></div>
       </div>
     </div>
   </section>
@@ -2412,6 +2517,238 @@ function renderNinferTables(d) {
 $("nsource").addEventListener("change", (e) => { state.nsource = e.target.value; refreshNinfer(); });
 
 /* =====================================================================
+   Exllama tab (tabbyAPI / exllamav3)
+
+   No periodic throughput gauge (unlike NInfer's 5s line), so the charts
+   are built entirely from per-request rows.
+   ===================================================================== */
+let eRefreshing = false;
+
+async function refreshExllama() {
+  if (eRefreshing) return;
+  eRefreshing = true;
+  $("tab-exllama").querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.esource ? `&source=${encodeURIComponent(state.esource)}` : "");
+    state.edata = await jget("/api/exllama/dashboard" + q);
+    renderExllama();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    $("tab-exllama").querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    eRefreshing = false;
+  }
+}
+
+function renderExllama() {
+  const d = state.edata;
+  const sel = $("esource");
+  const names = (d.instances || []).map((i) => i.source);
+  if (sel.dataset.names !== names.join("|")) {
+    sel.innerHTML = "";
+    for (const nm of names) {
+      const o = document.createElement("option");
+      o.value = nm; text(o, nm); sel.appendChild(o);
+    }
+    sel.dataset.names = names.join("|");
+  }
+  if (d.source) { state.esource = d.source; sel.value = d.source; }
+  if (!d.summary) { text($("e-hero"), "\u2014"); return; }
+
+  const s = d.summary, ts = d.timeseries;
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
+  renderExllamaKpis(d, s);
+
+  text($("e-hero"), fmtCompact(s.decode_tps_mean, 1));
+  const hs = state.charts.eherospark;
+  const hspec = { type: "line", spark: true, t: ts.t,
+                  fmt: (v) => fmtCompact(v, 1) + " tok/s",
+                  series: [{ name: "decode", values: ts.decode_tps, color: sc(0) }] };
+  if (hs) hs.update(hspec); else state.charts.eherospark = new Chart($("e-hero-spark"), hspec);
+
+  draw("ettft", "p-ettft", "l-ettft", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "TTFT mean", values: ts.ttft_mean_ms, color: sc(0) }],
+  });
+  text($("n-ettft"), s.ttft_ms.p50 !== null
+    ? `p50 ${fmtMs(s.ttft_ms.p50)} \u00b7 p90 ${fmtMs(s.ttft_ms.p90)} \u00b7 exact`
+    : "no requests in this window");
+
+  draw("erate", "p-erate", "l-erate", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 3) + "/s",
+    fmtAxis: (v) => fmtCompact(v, 2), fmtTick,
+    series: [{ name: "requests", values: ts.req_per_s, color: sc(1) },
+             { name: "errors", values: ts.err_per_s, color: css("--critical") }],
+  });
+  text($("n-erate"), `${fmtCompact(s.requests, 0)} requests \u00b7 ${fmtCompact(s.errors, 0)} failed`);
+
+  draw("etok", "p-etok", "l-etok", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "generated", values: ts.out_tps, color: sc(0) },
+             { name: "prompt evaluated", values: ts.in_tps, color: sc(3) }],
+  });
+  text($("n-etok"), `${fmtCompact(s.output_tokens, 0)} generated \u00b7 `
+    + `${fmtCompact(s.cached_tokens, 0)} reused by prefix cache`);
+
+  const g = d.gpu || { t: [], gpus: [] };
+  const inst = (d.instances || []).find((i) => i.source === d.source) || {};
+  const gv = gpuView(g.gpus, inst.gpu_indices, "no model resident");
+  draw("egpu", "p-egpu", "l-egpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((x) => ({ name: gv.label(x), values: x.util_pct,
+                                 color: gv.colour(x) })),
+  });
+  text($("n-egpu"), gv.note(inst.gpu_source));
+
+  draw("evram", "p-evram", "l-evram", {
+    type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    yMax: gv.cards.length ? Math.max(...gv.cards.map((x) => (x.mem_total || 0) / 1024))
+                          : undefined,
+    series: g.gpus.map((x) => ({ name: gv.label(x),
+      values: x.mem_used.map((v) => v === null ? null : v / 1024),
+      color: gv.colour(x) })),
+  });
+  text($("n-evram"), inst.cache_size
+    ? `KV pool ${fmtCompact(inst.cache_size, 0)} tokens` : "");
+
+  draw("etemp", "p-etemp", "l-etemp",
+       tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const hot = hottest(gv.cards);
+    text($("n-etemp"), hot ? `hottest now ${fmtTemp(hot.temp)} on GPU ${hot.index}`
+                           : (g.gpus.length ? "no readings yet" : "no samples yet")); }
+
+  draw("epower", "p-epower", "l-epower",
+       powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const w = totalPower(gv.cards);
+    text($("n-epower"), w === null ? "no samples yet" : `${fmtWatts(w)} drawn`); }
+
+  renderExllamaTables(d);
+}
+
+function renderExllamaKpis(d, s) {
+  const k = $("e-kpis"); k.innerHTML = "";
+  k.append(
+    tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
+    tile("TTFT p50", fmtMs(s.ttft_ms.p50), "", `p90 ${fmtMs(s.ttft_ms.p90)} \u00b7 exact`),
+    tile("Decode speed", fmtCompact(s.decode_tps_mean, 1), "tok/s", "while generating"),
+    tile("Prefill speed", fmtCompact(s.prefill_tps_mean, 0), "tok/s", "while evaluating"),
+    tile("Prompt cache", fmtPct(s.cache_hit_rate), "",
+         `${fmtCompact(s.cached_tokens, 0)} tokens reused`),
+    tile("Draft accept", s.draft_accept_mean === null ? "\u2014" : fmtPct(s.draft_accept_mean),
+         "", "speculative decoding"),
+    tile("Errors", fmtPct(s.error_rate), "", `${s.errors} of ${s.requests}`,
+         s.error_rate > 0.01, s.errors ? css("--critical") : css("--good")),
+    tile("Latency p90", fmtMs(s.latency_ms.p90), "", `p50 ${fmtMs(s.latency_ms.p50)}`)
+  );
+}
+
+function renderExllamaTables(d) {
+  table("t-efinish",
+    [{ label: "Finish" }, { label: "Count", num: true }],
+    d.finish, (tr, r) => {
+      tr.appendChild(tdNode(pill(r.finish,
+        r.finish === "error" ? "err" : r.finish === "output_limit" ? "warn" : "ok")));
+      tr.appendChild(td(fmtCompact(r.count, 0), true));
+    }, "No requests in this window.");
+  text($("n-efinish"), "tabbyAPI logs no HTTP status; this is the closest thing");
+
+  table("t-emodels",
+    [{ label: "Model" }, { label: "Requests", num: true }, { label: "TTFT mean", num: true },
+     { label: "Decode", num: true }, { label: "Generated", num: true }, { label: "Last used" }],
+    d.models, (tr, m) => {
+      tr.appendChild(td(m.model, false, true));
+      tr.appendChild(td(fmtCompact(m.requests, 0), true));
+      tr.appendChild(td(fmtMs(m.ttft_mean), true));
+      tr.appendChild(td(m.decode_tps === null ? "\u2014" : fmtCompact(m.decode_tps, 1), true));
+      tr.appendChild(td(fmtCompact(m.output_tokens, 0), true));
+      tr.appendChild(td(m.last_used ? fmtClock(m.last_used) : "\u2014"));
+    }, "No models seen yet.");
+  text($("n-emodels"), `${(d.models || []).length} seen`);
+
+  table("t-eslow",
+    [{ label: "When" }, { label: "Prompt", num: true }, { label: "Generated", num: true },
+     { label: "TTFT", num: true }, { label: "Wall", num: true }],
+    d.slowest, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+    }, "No requests in this window.");
+  text($("n-eslow"), d.raw_complete ? "" : `raw rows from ${fmtClock(d.raw_from, true)}`);
+
+  table("t-einst",
+    [{ label: "Instance" }, { label: "Model" }, { label: "State" },
+     { label: "KV pool", num: true }, { label: "Load", num: true }, { label: "Last seen" }],
+    d.instances, (tr, i) => {
+      tr.appendChild(td(i.source, false, true));
+      tr.appendChild(td(i.model || "\u2014"));
+      tr.appendChild(tdNode(i.reachable ? pill("reachable", "ok") : pill("unreachable", "err")));
+      tr.appendChild(td(i.cache_size ? fmtCompact(i.cache_size, 0) : "\u2014", true));
+      tr.appendChild(td(i.load_ms ? fmtMs(i.load_ms) : "\u2014", true));
+      tr.appendChild(td(i.last_seen ? fmtClock(i.last_seen) : "\u2014"));
+      if (!i.reachable && i.error) tr.title = i.error;
+    }, "No instances yet.");
+  text($("n-einst"), `${(d.instances || []).length} configured`);
+
+  table("t-ereq",
+    [{ label: "When" }, { label: "Finish" }, { label: "Prompt", num: true },
+     { label: "Reused", num: true }, { label: "Generated", num: true },
+     { label: "TTFT", num: true }, { label: "Wall", num: true },
+     { label: "Decode", num: true }, { label: "Accept", num: true }],
+    d.requests, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(pill(r.finish || "?",
+        r.finish === "error" ? "err" : r.finish === "output_limit" ? "warn" : "ok")));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      tr.appendChild(td(r.cached_tokens ? fmtCompact(r.cached_tokens, 0) : "\u2014", true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+      tr.appendChild(td(r.decode_tps === null ? "\u2014" : fmtCompact(r.decode_tps, 1), true));
+      tr.appendChild(td(r.draft_accept === null ? "\u2014" : fmtPct(r.draft_accept), true));
+      if (r.error) tr.title = r.error;
+    }, "No requests in this window.");
+
+  const cl = d.clients || { clients: [] };
+  table("t-eclients",
+    [{ label: "Client" }, { label: "Connected", num: true }, { label: "Peak conns", num: true },
+     { label: "Requests", num: true }, { label: "Prompt tok", num: true },
+     { label: "Generated", num: true }, { label: "TTFT p50", num: true },
+     { label: "Errors", num: true }, { label: "Last seen" }],
+    cl.clients,
+    (tr, c) => {
+      tr.appendChild(td(c.client, false, true));
+      tr.appendChild(td(c.presence === null ? "\u2014" : fmtPct(c.presence), true));
+      tr.appendChild(td(fmtCompact(c.peak_conns, 0), true));
+      tr.appendChild(td(fmtCompact(c.requests, 0), true));
+      tr.appendChild(td(fmtCompact(c.input_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(c.ttft_p50), true));
+      tr.appendChild(td(fmtCompact(c.errors, 0), true));
+      tr.appendChild(td(c.last_seen ? fmtClock(c.last_seen) : "\u2014"));
+    },
+    cl.samples ? "Nobody connected in this window."
+               : "No connection samples yet.");
+  text($("n-eclients"), cl.samples
+    ? `${cl.clients.length} seen \u00b7 ${fmtCompact(cl.attributed, 0)} requests attributed`
+      + (cl.ambiguous ? `, ${fmtCompact(cl.ambiguous, 0)} not attributable` : "")
+    : "no connection samples yet");
+
+  const unpaired = (d.requests || []).filter((r) => !r.paired).length;
+  text($("n-ereq"), `${(d.requests || []).length} shown`
+    + (unpaired ? ` \u00b7 ${unpaired} whose submission was not read` : ""));
+}
+
+$("esource").addEventListener("change", (e) => { state.esource = e.target.value; refreshExllama(); });
+
+/* =====================================================================
    Tabs
    ===================================================================== */
 state.tab = "ollama";
@@ -2421,13 +2758,15 @@ state.isource = "";
 state.idata = null;
 state.nsource = "";
 state.ndata = null;
+state.esource = "";
+state.edata = null;
 state.settings = null;
 
 function switchTab(name) {
   state.tab = name;
   for (const btn of $("tabs").querySelectorAll("button"))
     btn.setAttribute("aria-selected", String(btn.dataset.tab === name));
-  for (const t of ["ollama", "vllm", "ninfer", "images", "settings"])
+  for (const t of ["ollama", "vllm", "ninfer", "exllama", "images", "settings"])
     $("tab-" + t).hidden = t !== name;
   // The filter row scopes the metric tabs only, and each shows a different
   // dimension selector.
@@ -2435,6 +2774,7 @@ function switchTab(name) {
   $("model-wrap").hidden = name !== "ollama";
   $("vsource-wrap").hidden = name !== "vllm";
   $("nsource-wrap").hidden = name !== "ninfer";
+  $("esource-wrap").hidden = name !== "exllama";
   $("isource-wrap").hidden = name !== "images";
   history.replaceState(null, "", "?" + new URLSearchParams({
     tab: name, window: state.window,
@@ -2446,6 +2786,7 @@ function refreshActive() {
   if (state.tab === "ollama") return refresh();
   if (state.tab === "vllm") return refreshVllm();
   if (state.tab === "ninfer") return refreshNinfer();
+  if (state.tab === "exllama") return refreshExllama();
   if (state.tab === "images") return refreshImages();
   return refreshSettings();
 }
