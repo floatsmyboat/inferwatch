@@ -26,6 +26,7 @@ import logging
 from . import parse_proxy
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
 from .images import ImagesPoller, SwarmLogCollector
+from .ninfer import NinferCorrelator, NinferPoller
 from .models import ModelIndex
 from .readers import build_reader
 from .vllm import VllmCollector
@@ -47,6 +48,8 @@ class SourceRuntime:
         self.swarm_log: SwarmLogCollector | None = None
         # A vLLM source can have a second reader on the proxy in front of it.
         self.proxy_reader = None
+        self.ninfer: NinferPoller | None = None
+        self.ninfer_corr: NinferCorrelator | None = None
 
     @property
     def name(self) -> str:
@@ -64,6 +67,13 @@ class SourceRuntime:
         if self.proxy_reader is not None:
             d["proxy_reader"] = self.proxy_reader.describe()
             d["proxy_lines_read"] = self.proxy_reader.lines
+        if self.ninfer_corr is not None:
+            d["inflight"] = self.ninfer_corr.inflight
+            d["stats"] = dict(self.ninfer_corr.stats)
+            d["model"] = self.ninfer_corr.model
+        if self.ninfer is not None:
+            d["reachable"] = self.ninfer.reachable
+            d["gpu_indices"] = self.ninfer.gpu_indices
         if self.corr is not None:
             d["inflight"] = self.corr.inflight
             d["stats"] = dict(self.corr.stats)
@@ -320,6 +330,47 @@ class Supervisor:
                     rt.proxy_reader.run(on_line, on_flush), name=f"proxy:{name}"))
             log.info("source %r started (vllm %s%s)", spec["name"], rt.vllm.url,
                      f", proxy journal {proxy_unit}" if proxy_unit else "")
+        elif spec["kind"] == "ninfer":
+            name, store = spec["name"], self.store
+            rt.ninfer_corr = NinferCorrelator(
+                name,
+                on_request=self.store.insert_ninfer_request,
+                on_sample=self.store.insert_ninfer_sample,
+                on_event=self.store.insert_event,
+                on_live=self.hub.publish)
+            corr = rt.ninfer_corr
+
+            def resume_ts(store=store, name=name):
+                """Its own newest row: resuming from another engine's table
+                would skip whatever NInfer did in between."""
+                row = store.query("SELECT MAX(ts) t FROM ninfer_requests"
+                                  " WHERE source = ?", (name,))
+                return row[0]["t"] if row and row[0]["t"] else None
+
+            rt.reader = build_reader(
+                self.store, name,
+                {"reader": "journald", "unit": cfg.get("unit") or "ninfer"},
+                backfill=self.config.get("collection.backfill"),
+                resume_ts=resume_ts)
+
+            def on_line(ts, msg, corr=corr):
+                corr.feed(ts, msg)
+
+            def on_flush(now, corr=corr, store=store):
+                corr.tick(now)
+                store.commit()
+
+            rt.ninfer = NinferPoller(
+                self.store, name, cfg, corr,
+                interval_getter=lambda: self.config.get("collection.poll_interval_s"),
+                on_live=self.hub.publish)
+            rt.tasks = [
+                asyncio.create_task(rt.reader.run(on_line, on_flush),
+                                    name=f"reader:{name}"),
+                asyncio.create_task(rt.ninfer.run(), name=f"ninfer:{name}"),
+            ]
+            log.info("source %r started (ninfer %s, %s)", name, rt.ninfer.url,
+                     rt.reader.describe())
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
         return rt

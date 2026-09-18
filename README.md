@@ -32,17 +32,18 @@ break inference.
 
 This is the central design fact, so it is worth stating plainly.
 
-| | Ollama | vLLM |
-|---|---|---|
-| Source | its log | `/metrics` |
-| Per-request rows | **yes** | **no** — none exist to collect |
-| TTFT / latency | exact, per request | histograms only |
-| Tokens | per request | cumulative counters |
-| Errors | HTTP status per request | `request_success_total{finished_reason}` |
-| Client address | yes | not from vLLM — only from a proxy in front of it |
-| Percentiles | exact within retention | bucket upper bounds; **means are exact** |
-| KV / prompt cache | occupancy + eviction counts, sampled from the log | occupancy gauge, scraped |
-| Unique extras | prompt cache reuse, draft accept, cold-load time, KV VRAM/RAM split | preemptions, batch occupancy, waiting-by-reason |
+| | Ollama | vLLM | NInfer |
+|---|---|---|---|
+| Source | its log | `/metrics` | its log (no `/metrics` — 404) |
+| Per-request rows | **yes** | **no** — none exist to collect | **yes** |
+| TTFT / latency | exact, per request | histograms only | exact, per request |
+| Tokens | per request | cumulative counters | per request |
+| Errors | HTTP status per request | `request_success_total{finished_reason}` | finish reason + `error` lines |
+| Client address | yes | not from vLLM — only from a proxy in front of it | no |
+| Percentiles | exact within retention | bucket upper bounds; **means are exact** | exact within retention |
+| KV / prompt cache | occupancy + eviction counts, sampled from the log | occupancy gauge, scraped | reuse per request, pool size at load |
+| Queue depth / batch | — | preemptions, batch occupancy, waiting-by-reason | running/waiting/batch, sampled every 5s |
+| Unique extras | draft accept, cold-load time, KV VRAM/RAM split | preemptions, waiting-by-reason | both halves at once; tool-call counts |
 
 Both tabs show GPU utilisation, VRAM, temperature and power draw, since those
 are measured by `nvidia-smi` rather than by either engine. Temperature and power
@@ -50,6 +51,46 @@ get separate charts rather than sharing an axis, and each is aggregated the way
 its unit demands: utilisation averages across cards, VRAM and watts sum,
 temperature reports the hottest card. Temperature is the one series not plotted
 from zero — a 33–68 °C range starting at 0 wastes most of the plot.
+
+### NInfer: both halves, from one log
+
+NInfer is the reason the table above needed a third column rather than a second
+opinion. It publishes no `/metrics` at all (verified — 404, while `/health` and
+`/v1/models` answer), so like ollama it is read from its log. But that log
+carries **both** of the things the other two each have only one of:
+
+```
+[req 2] done finish=tool_calls tool_calls=1 prompt=41854 gen=2177 cache=0
+        reuse=full_reset ttft=19893ms prefill=2113.1tok/s decode=70.8tok/s
+        wall=50.67s speculative=mtp 2.69tok/round (56.3%)
+
+throughput interval=5.000s prefill=0.0tok/s decode=65.2tok/s running=1
+        prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+```
+
+So its percentiles are **exact** within the raw window — computed from stored
+per-request values, not read off a bucket bound — *and* it reports queue depth
+and batch occupancy, which ollama has no equivalent of. It is the only engine
+here whose pane needs no caveat about a missing half.
+
+**The request id is real, and that changes what may be joined.** Every line
+carries `[req N]`, so submission, completion and error are matched by lookup
+rather than by guessing an order — the opposite of the vLLM proxy alongside it,
+where no id exists and the panel says so. The counter restarts at 1 with the
+server, so a `listening on …` line opens a new epoch and retires whatever was
+still pending, rather than letting a fresh `[req 1]` be completed by an
+abandoned one from the previous process. Abandoned requests are counted, never
+stored: nothing is known about how they ended.
+
+Two things it does not log: a client address, and an HTTP status. `(client)` on
+the submission line marks where `max_tokens` came from, not who called. Finish
+reasons stand in for status, and are more informative than one — `output_limit`
+and `tool_calls` are both 200s that mean very different things.
+
+One parsing note worth keeping: the `tok/s` unit is printed only when there *is*
+a rate. A request too short to have one logs a bare `decode=n/a`, and requiring
+the suffix silently dropped 7 of 16 completions in a day's log — every
+single-token one, which is exactly the set worth looking at.
 
 ### Who is calling vLLM
 
@@ -439,6 +480,14 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `container` | `ollama` | `reader=docker` |  |
 | `url` | `http://127.0.0.1:11434` | — | Used to poll /api/ps for resident models. |
 | `models_dir` | — | — | Optional. Resolves blob digests to model names on load events. Defaults to $OLLAMA_MODELS or ~/.ollama/models. |
+
+**NInfer** (`--kind ninfer`)
+
+| Field | Default | Required when | Notes |
+|---|---|---|---|
+| `unit` | `ninfer-qwen38` | — | NInfer publishes no /metrics endpoint, so everything measured comes from this unit's journal -- which carries both per-request timings AND a 5-second throughput line, so unlike the other two engines nothing has to be reconstructed or given up. Also used to attribute GPUs by cgroup. |
+| `url` | `http://127.0.0.1:8011` | — | Polled for /health and /v1/models. The log goes quiet when the engine is merely idle, which is indistinguishable from it being gone unless something asks. |
+| `api_key` | — | — | Sent as a bearer token if the server requires one. Prefer an indirection like ${NINFER_API_KEY} over pasting the value: what is stored here goes into the database in plain text, and a reference keeps the secret in the environment instead. |
 
 **SwarmUI / ComfyUI** (`--kind swarmui`)
 

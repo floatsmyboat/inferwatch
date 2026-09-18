@@ -23,7 +23,7 @@ import urllib.request
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import image_metrics, metrics, vllm_metrics
+from . import image_metrics, metrics, ninfer_metrics, vllm_metrics
 from .config import (SOURCE_KINDS, ConfigError, merge_secrets, redact_sources,
                      resolve_secret, validate_source)
 
@@ -338,6 +338,60 @@ def create_app(state: AppState) -> FastAPI:
             return source
         known = image_metrics.sources(state.store)
         return known[0]["source"] if known else None
+
+    # ------------------------------------------------------------- ninfer
+
+    @app.get("/api/ninfer/instances")
+    async def ninfer_instances():
+        return {"instances": ninfer_metrics.instances(state.store)}
+
+    @app.get("/api/ninfer/dashboard")
+    async def ninfer_dashboard(source: str | None = None, window: str = Query("1h"),
+                               step: int | None = None):
+        start, end = _window(window)
+        st = state.store
+        loop = asyncio.get_running_loop()
+        inst = ninfer_metrics.instances(st)
+        if source is None:
+            source = inst[0]["source"] if inst else None
+        if source is None:
+            return {"window": window, "start": start, "end": end, "instances": [],
+                    "source": None, "summary": None, "timeseries": None,
+                    "hint": "No NInfer source configured. Add one in Settings."}
+
+        def build():
+            return {
+                "window": window, "start": start, "end": end, "now": time.time(),
+                "source": source, "instances": inst,
+                "summary": ninfer_metrics.summary(st, source, start, end),
+                "timeseries": ninfer_metrics.timeseries(st, source, start, end, step),
+                "finish": ninfer_metrics.finish_reasons(st, source, start, end),
+                "models": ninfer_metrics.by_model(st, source, start, end),
+                "requests": ninfer_metrics.recent_requests(st, source, start, end, 100),
+                "slowest": ninfer_metrics.slowest(st, source, start, end, "ttft_ms", 10),
+                "gpu": metrics.gpu_series(st, start, end, step),
+                "raw_complete": metrics.coverage(st, start)["complete"],
+                "raw_from": metrics.coverage(st, start)["covers_from"],
+            }
+
+        return await loop.run_in_executor(None, build)
+
+    @app.get("/api/ninfer/summary")
+    async def ninfer_summary(source: str, window: str = "1h"):
+        start, end = _window(window)
+        return ninfer_metrics.summary(state.store, source, start, end)
+
+    @app.get("/api/ninfer/timeseries")
+    async def ninfer_timeseries(source: str, window: str = "1h",
+                                step: int | None = None):
+        start, end = _window(window)
+        return ninfer_metrics.timeseries(state.store, source, start, end, step)
+
+    @app.get("/api/ninfer/requests")
+    async def ninfer_requests(source: str, window: str = "1h", limit: int = 100):
+        start, end = _window(window)
+        return {"requests": ninfer_metrics.recent_requests(
+            state.store, source, start, end, limit)}
 
     @app.get("/api/images/sources")
     async def image_sources():

@@ -170,12 +170,20 @@ class TestMarkup(unittest.TestCase):
         self.assertIn("GPU utilisation", vllm)
         self.assertIn("VRAM in use", vllm)
 
-    def test_both_tabs_show_gpu_temperature_and_power(self):
-        for card in ("c-gtemp", "c-vtemp", "c-gpower", "c-vpower"):
+    def test_every_engine_tab_shows_gpu_temperature_and_power(self):
+        """Each engine pane carries its own pair, scoped to the cards that
+        engine holds. The count is derived from the cards present rather than
+        hardcoded, so adding an engine does not mean editing a literal here --
+        which is what this test did when NInfer arrived."""
+        for card in ("c-gtemp", "c-vtemp", "c-ntemp",
+                     "c-gpower", "c-vpower", "c-npower"):
             self.assertIn(f'id="{card}"', self.html)
-        # one card heading per tab; the KPI tiles reuse the same label
-        self.assertEqual(self.html.count("<h2>GPU temperature</h2>"), 2)
-        self.assertEqual(self.html.count("<h2>GPU power draw</h2>"), 2)
+        temp = len(re.findall(r'class="card" id="c-\w*temp"', self.html))
+        power = len(re.findall(r'class="card" id="c-\w*power"', self.html))
+        self.assertGreaterEqual(temp, 3)
+        # One card heading each; the KPI tiles reuse the same label.
+        self.assertEqual(self.html.count("<h2>GPU temperature</h2>"), temp)
+        self.assertEqual(self.html.count("<h2>GPU power draw</h2>"), power)
 
     def test_temperature_and_power_are_not_on_one_axis(self):
         """Different units on one plot invents a correlation; they get their

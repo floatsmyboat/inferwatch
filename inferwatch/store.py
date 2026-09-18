@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -46,6 +46,10 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
         "registry": [("vllm_instances", None)],
         "history": [("vllm_samples", "ts"), ("vllm_hist", "ts"),
                     ("vllm_client_requests", "ts")],
+    },
+    "ninfer": {
+        "registry": [("ninfer_instances", None)],
+        "history": [("ninfer_requests", "ts"), ("ninfer_samples", "ts")],
     },
     "swarmui": {
         "registry": [],
@@ -340,6 +344,80 @@ CREATE TABLE IF NOT EXISTS vllm_hist (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_vllm_h_metric ON vllm_hist(source, metric, ts);
 
+-- NInfer: per-request rows AND evenly sampled gauges, both from its log.  It
+-- publishes no /metrics (404), but its log carries what ollama's does and what
+-- vLLM's gauges do, so unlike either it needs no caveat about which half is
+-- missing.  Requests are joined to their submission by the id NInfer prints,
+-- so `paired` records whether both halves were seen rather than being implied.
+CREATE TABLE IF NOT EXISTS ninfer_requests (
+    id                  INTEGER PRIMARY KEY,
+    ts                  REAL NOT NULL,      -- completion time
+    started_ts          REAL,
+    source              TEXT NOT NULL,
+    -- Server run: the [req N] counter restarts at 1 with the process, so an id
+    -- is unique only within an epoch.
+    epoch               INTEGER,
+    req_id              INTEGER,
+    model               TEXT,
+    endpoint            TEXT,
+    stream              INTEGER,
+    messages            INTEGER,
+    max_tokens          INTEGER,
+    tools               INTEGER,
+    thinking            INTEGER,
+    -- stop_token | output_limit | tool_calls | error.  NInfer logs no HTTP
+    -- status, so this is what stands in for one.
+    finish              TEXT,
+    tool_calls          INTEGER,
+    error               TEXT,
+    prompt_tokens       INTEGER,            -- actually evaluated
+    cached_tokens       INTEGER,            -- saved by prefix reuse
+    prompt_tokens_total INTEGER,            -- what the client sent
+    output_tokens       INTEGER,
+    reuse               TEXT,
+    ttft_ms             REAL,
+    latency_ms          REAL,
+    decode_ms           REAL,
+    prefill_tps         REAL,
+    decode_tps          REAL,
+    speculator          TEXT,
+    draft_mean_len      REAL,
+    draft_accept        REAL,
+    paired              INTEGER,
+    dedupe_key          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_nreq_ts ON ninfer_requests(source, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nreq_dedupe ON ninfer_requests(dedupe_key);
+
+-- The 5s throughput line: queue depth and batch occupancy, which no
+-- per-request row can show.
+CREATE TABLE IF NOT EXISTS ninfer_samples (
+    ts               REAL NOT NULL,
+    source           TEXT NOT NULL,
+    interval_s       REAL,
+    prefill_tps      REAL,
+    decode_tps       REAL,
+    running          INTEGER,
+    prefilling       INTEGER,
+    decode_ready     INTEGER,
+    waiting          INTEGER,
+    avg_decode_batch REAL,
+    PRIMARY KEY (ts, source)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS ninfer_instances (
+    source      TEXT PRIMARY KEY,
+    last_seen   REAL,
+    model       TEXT,
+    reachable   INTEGER,
+    error       TEXT,
+    kv_tokens   INTEGER,
+    load_ms     REAL,
+    gpu_indices TEXT,
+    gpu_source  TEXT,
+    gpu_ts      REAL
+);
+
 -- Client-facing requests, read from the proxy in front of vLLM rather than from
 -- vLLM itself.  vLLM's /metrics is pre-aggregated and carries no request
 -- identity, and its own access log sees only the proxy, so this is the only
@@ -461,6 +539,19 @@ def client_request_key(r: dict) -> str:
     return "|".join(_f(r.get(k)) for k in
                     ("ts", "source", "client", "endpoint", "model",
                      "messages", "prompt_tokens"))
+
+
+def ninfer_request_key(r: dict) -> str:
+    """Identity of a NInfer completion, for replay-safe inserts.
+
+    The engine's own id plus its epoch would almost do, but a journal replay
+    can re-deliver lines from a run this collector already read, and epoch is
+    counted per reader rather than stamped by the server.  So identity is the
+    completion's own content, which a replay reproduces exactly.
+    """
+    return "|".join(_f(r.get(k)) for k in
+                    ("ts", "source", "req_id", "finish", "prompt_tokens",
+                     "output_tokens", "ttft_ms", "latency_ms"))
 
 
 def event_key(e: dict) -> str:
@@ -986,6 +1077,45 @@ class Store:
                 f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                 tuple(row.get(c) for c in cols))
 
+    NINFER_REQUEST_COLS = (
+        "ts", "started_ts", "source", "epoch", "req_id", "model", "endpoint",
+        "stream", "messages", "max_tokens", "tools", "thinking", "finish",
+        "tool_calls", "error", "prompt_tokens", "cached_tokens",
+        "prompt_tokens_total", "output_tokens", "reuse", "ttft_ms",
+        "latency_ms", "decode_ms", "prefill_tps", "decode_tps", "speculator",
+        "draft_mean_len", "draft_accept", "paired", "dedupe_key")
+
+    def insert_ninfer_request(self, row: dict) -> None:
+        row = dict(row)
+        row["dedupe_key"] = ninfer_request_key(row)
+        cols = self.NINFER_REQUEST_COLS
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO ninfer_requests"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+
+    def insert_ninfer_sample(self, row: dict) -> None:
+        cols = ("ts", "source", "interval_s", "prefill_tps", "decode_tps",
+                "running", "prefilling", "decode_ready", "waiting",
+                "avg_decode_batch")
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO ninfer_samples"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+
+    def upsert_ninfer_instance(self, source: str, **fields) -> None:
+        cols = ("last_seen", "model", "reachable", "error", "kv_tokens",
+                "load_ms", "gpu_indices", "gpu_source", "gpu_ts")
+        sets = ",".join(f"{c}=excluded.{c}" for c in cols)
+        with self.lock:
+            self.db.execute(
+                f"INSERT INTO ninfer_instances (source,{','.join(cols)})"
+                f" VALUES ({','.join('?' * (len(cols) + 1))})"
+                f" ON CONFLICT(source) DO UPDATE SET {sets}",
+                (source, *(fields.get(c) for c in cols)))
+
     def commit(self) -> None:
         with self.lock:
             self.db.commit()
@@ -1109,6 +1239,10 @@ class Store:
             # Per-request rows, so they follow the raw window, not the sample one.
             n_vcr = self.db.execute("DELETE FROM vllm_client_requests WHERE ts < ?",
                                     (raw_cut,)).rowcount
+            n_nr = self.db.execute("DELETE FROM ninfer_requests WHERE ts < ?",
+                                   (raw_cut,)).rowcount
+            n_ns = self.db.execute("DELETE FROM ninfer_samples WHERE ts < ?",
+                                   (samp_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
             n_r1m = n_r1h = 0
@@ -1124,7 +1258,8 @@ class Store:
                 "vllm_samples": n_vs, "vllm_hist": n_vh,
                 "image_generations": n_ig, "image_samples": n_is,
                 "image_events": n_ie, "rollup_1m": n_r1m, "rollup_1h": n_r1h,
-                "vllm_client_requests": n_vcr}
+                "vllm_client_requests": n_vcr,
+                "ninfer_requests": n_nr, "ninfer_samples": n_ns}
 
     # -- reads ---------------------------------------------------------------
 

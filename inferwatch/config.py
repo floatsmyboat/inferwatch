@@ -205,6 +205,32 @@ SOURCE_KINDS = {
                      "Defaults to $OLLAMA_MODELS or ~/.ollama/models."},
         ],
     },
+    "ninfer": {
+        "label": "NInfer",
+        "fields": [
+            {"key": "unit", "label": "systemd unit", "type": "str",
+             "default": "ninfer-qwen38",
+             "help": "NInfer publishes no /metrics endpoint, so everything "
+                     "measured comes from this unit's journal -- which carries "
+                     "both per-request timings AND a 5-second throughput line, "
+                     "so unlike the other two engines nothing has to be "
+                     "reconstructed or given up. Also used to attribute GPUs "
+                     "by cgroup."},
+            {"key": "url", "label": "Base URL", "type": "str",
+             "default": "http://127.0.0.1:8011",
+             "help": "Polled for /health and /v1/models. The log goes quiet "
+                     "when the engine is merely idle, which is "
+                     "indistinguishable from it being gone unless something "
+                     "asks."},
+            {"key": "api_key", "label": "API key (optional)", "type": "str",
+             "default": "", "secret": True,
+             "help": "Sent as a bearer token if the server requires one. Prefer "
+                     "an indirection like ${NINFER_API_KEY} over pasting the "
+                     "value: what is stored here goes into the database in "
+                     "plain text, and a reference keeps the secret in the "
+                     "environment instead."},
+        ],
+    },
     "swarmui": {
         "label": "SwarmUI / ComfyUI",
         "fields": [
