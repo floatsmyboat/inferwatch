@@ -11,8 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -148,30 +146,6 @@ class ExllamaCorrelator:
         return None
 
 
-def sample_connections(port: int) -> dict[str, int] | None:
-    """Peers holding an established connection to `port`, counted per address."""
-    exe = shutil.which("ss")
-    if exe is None:
-        return None
-    try:
-        out = subprocess.run(
-            [exe, "-Htn", "state", "established", f"( sport = :{port} )"],
-            capture_output=True, text=True, timeout=5).stdout
-    except (subprocess.SubprocessError, OSError):
-        return None
-    counts: dict[str, int] = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        peer = parts[3]
-        host = (peer[1:peer.index("]")] if peer.startswith("[")
-                else peer.rsplit(":", 1)[0])
-        if host:
-            counts[host] = counts.get(host, 0) + 1
-    return counts
-
-
 def fetch_json(url: str, api_key: str = "", timeout: float = 5.0):
     req = urllib.request.Request(url)
     if api_key:
@@ -200,11 +174,11 @@ class ExllamaPoller:
         self.gpu_source = "unavailable"
         self.gpu_ts: float | None = None
         self._gpu_checked = 0.0
-        self.connections: dict | None = None
         self.last: dict = {}
 
     def probe(self) -> dict:
-        out: dict = {"reachable": False, "error": None, "model": None}
+        out: dict = {"reachable": False, "error": None, "model": None,
+                     "cache": None}
         try:
             fetch_json(f"{self.url}/health", self.api_key)
             out["reachable"] = True
@@ -215,6 +189,14 @@ class ExllamaPoller:
             got = fetch_json(f"{self.url}/v1/model", self.api_key)
             if isinstance(got, dict):
                 out["model"] = got.get("id") or got.get("model")
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        # Live KV-cache occupancy, read from exllamav3's page table.  Optional:
+        # an older tabbyAPI without the endpoint just leaves this None.
+        try:
+            got = fetch_json(f"{self.url}/v1/cache/stats", self.api_key)
+            if isinstance(got, dict) and got.get("ok"):
+                out["cache"] = got
         except (urllib.error.URLError, OSError, ValueError):
             pass
         return out
@@ -256,20 +238,18 @@ class ExllamaPoller:
                     gpu_indices=(json.dumps(self.gpu_indices)
                                  if self.gpu_indices is not None else None),
                     gpu_source=self.gpu_source, gpu_ts=self.gpu_ts)
-                port = gpuproc.port_of(self.url)
-                if port is not None and gpuproc.is_local(self.url):
-                    conns = await loop.run_in_executor(
-                        None, sample_connections, port)
-                    if conns:
-                        self.store.insert_exllama_client_samples(
-                            ts, self.source, conns)
-                    self.connections = conns
+                cache = got.get("cache")
+                if cache:
+                    self.store.insert_exllama_cache_sample(
+                        ts, self.source, cache.get("used_tokens"),
+                        cache.get("max_tokens"), cache.get("active_jobs"),
+                        cache.get("pending_jobs"), cache.get("hit_rate"))
                 self.store.commit()
                 self.last = {"ts": ts, "reachable": self.reachable,
-                             "connections": self.connections,
                              "model": model, "error": self.error,
                              "gpu_indices": self.gpu_indices,
-                             "gpu_source": self.gpu_source}
+                             "gpu_source": self.gpu_source,
+                             "cache": cache}
                 self.on_live({"type": "exllama_status", **self.last})
             except asyncio.CancelledError:
                 raise

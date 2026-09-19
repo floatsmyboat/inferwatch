@@ -285,6 +285,17 @@ SOURCE_KINDS = {
             {"key": "api_key", "label": "API key (optional)", "type": "str",
              "default": "", "secret": True,
              "help": "Sent as a bearer token if the server requires one."},
+            {"key": "proxy_unit", "label": "Client proxy unit (optional)", "type": "str",
+             "default": "",
+             "help": "The systemd unit of a proxy sitting IN FRONT of tabbyAPI, "
+                     "if there is one. tabbyAPI sees the proxy (loopback), not "
+                     "whoever called it, so its own log carries no client "
+                     "address. The proxy's journal does: it logs the caller on "
+                     "every request. Set this to get the per-client table; "
+                     "leave it empty and that panel says it has no source. Only "
+                     "requests and prompt sizes are read from it -- status and "
+                     "latency are on separate lines with no request id, so they "
+                     "cannot be tied to a client without guessing."},
         ],
     },
     "vllm": {

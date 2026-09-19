@@ -60,7 +60,7 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
     "exllama": {
         "registry": [("exllama_instances", None)],
         "history": [("exllama_requests", "ts"),
-                    ("exllama_client_samples", "ts")],
+                    ("exllama_cache_samples", "ts")],
     },
 }
 
@@ -484,15 +484,6 @@ CREATE TABLE IF NOT EXISTS exllama_requests (
 CREATE INDEX IF NOT EXISTS idx_exreq_ts ON exllama_requests(source, ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_exreq_dedupe ON exllama_requests(dedupe_key);
 
-CREATE TABLE IF NOT EXISTS exllama_client_samples (
-    ts     REAL NOT NULL,
-    source TEXT NOT NULL,
-    client TEXT NOT NULL,
-    conns  INTEGER NOT NULL,
-    PRIMARY KEY (ts, source, client)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_ecs_src_ts ON exllama_client_samples(source, ts);
-
 CREATE TABLE IF NOT EXISTS exllama_instances (
     source       TEXT PRIMARY KEY,
     last_seen    REAL,
@@ -506,6 +497,22 @@ CREATE TABLE IF NOT EXISTS exllama_instances (
     gpu_source   TEXT,
     gpu_ts       REAL
 );
+
+-- Periodic KV-cache occupancy, polled from tabbyAPI's /v1/cache/stats (which
+-- reads exllamav3's page table).  used_tokens/max_tokens is the true fraction
+-- of the KV pool in use by active jobs -- the analog of vLLM's
+-- kv_cache_usage_perc, which tabbyAPI does not otherwise publish.
+CREATE TABLE IF NOT EXISTS exllama_cache_samples (
+    ts           REAL NOT NULL,
+    source       TEXT NOT NULL,
+    used_tokens  INTEGER,
+    max_tokens   INTEGER,
+    active_jobs  INTEGER,
+    pending_jobs INTEGER,
+    hit_rate     REAL,
+    PRIMARY KEY (ts, source)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_ecache_src_ts ON exllama_cache_samples(source, ts);
 
 -- Client-facing requests, read from the proxy in front of vLLM rather than from
 -- vLLM itself.  vLLM's /metrics is pre-aggregated and carries no request
@@ -1243,15 +1250,17 @@ class Store:
                 f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                 tuple(row.get(c) for c in cols))
 
-    def insert_exllama_client_samples(self, ts: float, source: str,
-                                      counts: dict) -> None:
-        if not counts:
-            return
+    def insert_exllama_cache_sample(self, ts: float, source: str,
+                                    used_tokens, max_tokens,
+                                    active_jobs, pending_jobs,
+                                    hit_rate) -> None:
         with self.lock:
-            self.db.executemany(
-                "INSERT OR REPLACE INTO exllama_client_samples"
-                " (ts,source,client,conns) VALUES (?,?,?,?)",
-                [(ts, source, c, n) for c, n in counts.items()])
+            self.db.execute(
+                "INSERT OR REPLACE INTO exllama_cache_samples"
+                " (ts,source,used_tokens,max_tokens,active_jobs,pending_jobs,"
+                "  hit_rate) VALUES (?,?,?,?,?,?,?)",
+                (ts, source, used_tokens, max_tokens, active_jobs,
+                 pending_jobs, hit_rate))
 
     def upsert_exllama_instance(self, source: str, **fields) -> None:
         cols = ("last_seen", "model", "reachable", "error", "max_seq_len",
@@ -1395,8 +1404,8 @@ class Store:
                                    (samp_cut,)).rowcount
             n_er = self.db.execute("DELETE FROM exllama_requests WHERE ts < ?",
                                    (raw_cut,)).rowcount
-            n_ecs = self.db.execute("DELETE FROM exllama_client_samples WHERE ts < ?",
-                                    (samp_cut,)).rowcount
+            n_eck = self.db.execute("DELETE FROM exllama_cache_samples WHERE ts < ?",
+                                     (samp_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
             n_r1m = n_r1h = 0
@@ -1415,7 +1424,8 @@ class Store:
                 "vllm_client_requests": n_vcr,
                 "ninfer_requests": n_nr, "ninfer_samples": n_ns,
                 "ninfer_client_samples": n_ncs,
-                "exllama_requests": n_er, "exllama_client_samples": n_ecs}
+                "exllama_requests": n_er,
+                "exllama_cache_samples": n_eck}
 
     # -- reads ---------------------------------------------------------------
 

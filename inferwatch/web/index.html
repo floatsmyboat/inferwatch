@@ -131,6 +131,7 @@ nav.tabs button .badge {
 .err { color: var(--critical); font-size: 12px; margin-top: 3px; }
 .ok-msg { color: var(--success-text); font-size: 12px; }
 .addform { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.addform-head { font-size: 12px; font-weight: 600; color: var(--ink-2); margin-bottom: 10px; }
 .addform .fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
 .addform label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
 .addform input, .addform select {
@@ -650,6 +651,18 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
         <div class="legend" id="l-evram"></div><div class="plot" id="p-evram"></div>
         <div class="tbl-wrap" id="t-evram" hidden></div>
       </div>
+      <div class="card" id="c-ekv">
+        <header><h2>KV cache usage</h2><span class="note" id="n-ekv"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-ekv"></div><div class="plot" id="p-ekv"></div>
+        <div class="tbl-wrap" id="t-ekv" hidden></div>
+      </div>
+      <div class="card" id="c-esess">
+        <header><h2>Concurrent &amp; waiting sessions</h2><span class="note" id="n-esess"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-esess"></div><div class="plot" id="p-esess"></div>
+        <div class="tbl-wrap" id="t-esess" hidden></div>
+      </div>
       <div class="card" id="c-etemp">
         <header><h2>GPU temperature</h2><span class="note" id="n-etemp"></span>
           <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
@@ -681,13 +694,12 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
         <div class="banner show" id="eclient-note"
              style="border-left-color:var(--series-3)">
           <span class="ico" aria-hidden="true">i</span>
-          <span>tabbyAPI records <strong>no client address</strong>, so these come from the
-          <strong>socket table</strong>. They are connections, not requests: a
-          keep-alive socket shows here while idle, and a client that connects,
-          asks and disconnects between samples never shows at all. Requests are
-          pinned on a client only where every sample taken while they ran showed
-          <strong>exactly one</strong> connected — otherwise they are counted as
-          ambiguous and attributed to nobody.</span>
+<span>tabbyAPI sees the <strong>proxy</strong> (loopback), not the caller, so its
+           own log carries no client address. These come from the <strong>proxy's
+           journal</strong>, which logs the caller on every request. Only what the
+           proxy states on the request line is shown here; status and latency are
+           logged on separate lines with no request id, so they cannot be tied to
+           a client without guessing.</span>
         </div>
         <div class="tbl-wrap" id="t-eclients"></div>
       </div>
@@ -922,6 +934,7 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="card">
         <header><h2>Monitored engines</h2><span class="note" id="n-sources"></span></header>
         <div class="tbl-wrap" id="t-sources"></div>
+        <div id="source-edit" class="addform"></div>
         <div id="source-add" class="addform"></div>
       </div>
     </div>
@@ -2617,6 +2630,30 @@ function renderExllama() {
   text($("n-evram"), inst.cache_size
     ? `KV pool ${fmtCompact(inst.cache_size, 0)} tokens` : "");
 
+  const cts = d.cache_ts || { t: [], used_frac: [], active_jobs: [], pending_jobs: [] };
+  const cv = d.cache || {};
+  draw("ekv", "p-ekv", "l-ekv", {
+    type: "line", t: cts.t, yMax: 1, fmt: (v) => fmtPct(v),
+    fmtAxis: (v) => fmtPct(v, 0), fmtTick,
+    series: [{ name: "KV cache used", values: cts.used_frac, color: sc(2) }],
+  });
+  text($("n-ekv"), cv.n
+    ? `pool ${fmtCompact(inst.kv_max_tokens || inst.cache_size, 0)} tokens \u00b7 `
+      + `peak ${fmtPct(cv.max)} \u00b7 ${cv.active_jobs || 0} active`
+    : "no samples yet \u2014 needs a tabbyAPI with /v1/cache/stats");
+
+  draw("esess", "p-esess", "l-esess", {
+    type: "line", t: cts.t, fmt: (v) => fmtCompact(v, 0),
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [
+      { name: "concurrent", values: cts.active_jobs, color: sc(0) },
+      { name: "waiting", values: cts.pending_jobs, color: sc(1) },
+    ],
+  });
+  text($("n-esess"), cv.n
+    ? `now ${cv.active_jobs || 0} concurrent \u00b7 ${cv.pending_jobs || 0} waiting`
+    : "no samples yet");
+
   draw("etemp", "p-etemp", "l-etemp",
        tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   { const hot = hottest(gv.cards);
@@ -2640,6 +2677,16 @@ function renderExllamaKpis(d, s) {
     tile("Prefill speed", fmtCompact(s.prefill_tps_mean, 0), "tok/s", "while evaluating"),
     tile("Prompt cache", fmtPct(s.cache_hit_rate), "",
          `${fmtCompact(s.cached_tokens, 0)} tokens reused`),
+    tile("KV cache", (d.cache && d.cache.last != null) ? fmtPct(d.cache.last) : "\u2014",
+         "", (d.cache && d.cache.n)
+            ? `peak ${fmtPct(d.cache.max)} \u00b7 ${d.cache.active_jobs || 0} active`
+            : "no samples yet",
+         (d.cache && (d.cache.last || 0) > 0.95)),
+    tile("Sessions", (d.cache && d.cache.n) ? `${d.cache.active_jobs || 0}` : "\u2014",
+         "", (d.cache && d.cache.n)
+            ? `${d.cache.pending_jobs || 0} waiting`
+            : "no samples yet",
+         (d.cache && (d.cache.pending_jobs || 0) > 0)),
     tile("Draft accept", s.draft_accept_mean === null ? "\u2014" : fmtPct(s.draft_accept_mean),
          "", "speculative decoding"),
     tile("Errors", fmtPct(s.error_rate), "", `${s.errors} of ${s.requests}`,
@@ -2685,12 +2732,17 @@ function renderExllamaTables(d) {
 
   table("t-einst",
     [{ label: "Instance" }, { label: "Model" }, { label: "State" },
-     { label: "KV pool", num: true }, { label: "Load", num: true }, { label: "Last seen" }],
+     { label: "KV pool", num: true }, { label: "KV used", num: true },
+     { label: "Concurrent", num: true }, { label: "Waiting", num: true },
+     { label: "Load", num: true }, { label: "Last seen" }],
     d.instances, (tr, i) => {
       tr.appendChild(td(i.source, false, true));
       tr.appendChild(td(i.model || "\u2014"));
       tr.appendChild(tdNode(i.reachable ? pill("reachable", "ok") : pill("unreachable", "err")));
       tr.appendChild(td(i.cache_size ? fmtCompact(i.cache_size, 0) : "\u2014", true));
+      tr.appendChild(td(i.kv_frac != null ? fmtPct(i.kv_frac) : "\u2014", true));
+      tr.appendChild(td(i.kv_active_jobs != null ? `${i.kv_active_jobs}` : "\u2014", true));
+      tr.appendChild(td(i.kv_pending_jobs != null ? `${i.kv_pending_jobs}` : "\u2014", true));
       tr.appendChild(td(i.load_ms ? fmtMs(i.load_ms) : "\u2014", true));
       tr.appendChild(td(i.last_seen ? fmtClock(i.last_seen) : "\u2014"));
       if (!i.reachable && i.error) tr.title = i.error;
@@ -2716,30 +2768,37 @@ function renderExllamaTables(d) {
       if (r.error) tr.title = r.error;
     }, "No requests in this window.");
 
-  const cl = d.clients || { clients: [] };
+  const cl = d.clients || [];
   table("t-eclients",
-    [{ label: "Client" }, { label: "Connected", num: true }, { label: "Peak conns", num: true },
-     { label: "Requests", num: true }, { label: "Prompt tok", num: true },
-     { label: "Generated", num: true }, { label: "TTFT p50", num: true },
-     { label: "Errors", num: true }, { label: "Last seen" }],
-    cl.clients,
+    [{ label: "Client" }, { label: "Requests", num: true }, { label: "Model" },
+     { label: "Prompt tokens", num: true }, { label: "Mean prompt", num: true },
+     { label: "Largest", num: true }, { label: "Context peak", num: true },
+     { label: "Streamed", num: true }, { label: "Last seen" }],
+    cl,
     (tr, c) => {
       tr.appendChild(td(c.client, false, true));
-      tr.appendChild(td(c.presence === null ? "\u2014" : fmtPct(c.presence), true));
-      tr.appendChild(td(fmtCompact(c.peak_conns, 0), true));
       tr.appendChild(td(fmtCompact(c.requests, 0), true));
-      tr.appendChild(td(fmtCompact(c.input_tokens, 0), true));
-      tr.appendChild(td(fmtCompact(c.output_tokens, 0), true));
-      tr.appendChild(td(fmtMs(c.ttft_p50), true));
-      tr.appendChild(td(fmtCompact(c.errors, 0), true));
+      tr.appendChild(td(c.top_model || "\u2014"));
+      tr.appendChild(td(fmtCompact(c.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(c.prompt_mean, 0), true));
+      tr.appendChild(td(fmtCompact(c.prompt_max, 0), true));
+      tr.appendChild(tdNode(c.context_peak_pct === null ? document.createTextNode("\u2014")
+        : pill(fmtPct(c.context_peak_pct),
+               c.context_peak_pct > 0.9 ? "err"
+                 : c.context_peak_pct > 0.7 ? "warn" : "ok")));
+      tr.appendChild(td(c.streamed === c.requests ? "all"
+        : `${fmtCompact(c.streamed, 0)}/${fmtCompact(c.requests, 0)}`, true));
       tr.appendChild(td(c.last_seen ? fmtClock(c.last_seen) : "\u2014"));
+      if (c.unsized) tr.title = `${c.unsized} request(s) the proxy could not size`;
     },
-    cl.samples ? "Nobody connected in this window."
-               : "No connection samples yet.");
-  text($("n-eclients"), cl.samples
-    ? `${cl.clients.length} seen \u00b7 ${fmtCompact(cl.attributed, 0)} requests attributed`
-      + (cl.ambiguous ? `, ${fmtCompact(cl.ambiguous, 0)} not attributable` : "")
-    : "no connection samples yet");
+    d.clients_configured
+      ? "No client requests in this window."
+      : "No proxy configured — set the exllama source's proxy unit in Settings to "
+        + "see who is calling this instance.");
+  const eunsized = cl.reduce((a, c) => a + (c.unsized || 0), 0);
+  text($("n-eclients"), !d.clients_configured ? "needs a proxy unit"
+    : `${cl.length} client${cl.length === 1 ? "" : "s"} · via the proxy journal`
+      + (eunsized ? ` · ${eunsized} request(s) not sized` : ""));
 
   const unpaired = (d.requests || []).filter((r) => !r.paired).length;
   text($("n-ereq"), `${(d.requests || []).length} shown`
@@ -3515,6 +3574,10 @@ function renderSources() {
         .map(([k, v]) => `${k}=${v}`).join("  ")));
       const acts = document.createElement("div");
       acts.style.display = "flex"; acts.style.gap = "6px";
+      const edit = document.createElement("button");
+      edit.className = "btn"; edit.style.fontSize = "11px"; edit.style.padding = "1px 8px";
+      text(edit, "edit");
+      edit.onclick = () => { renderEditForm(s); $("source-edit").scrollIntoView({ behavior: "smooth", block: "nearest" }); };
       const toggle = document.createElement("button");
       toggle.className = "btn"; toggle.style.fontSize = "11px"; toggle.style.padding = "1px 8px";
       text(toggle, s.enabled ? "disable" : "enable");
@@ -3535,7 +3598,7 @@ function renderSources() {
                     { method: "DELETE" });
         refreshSettings();
       };
-      acts.append(toggle, del);
+      acts.append(edit, toggle, del);
       tr.appendChild(tdNode(acts));
     }, "No engines configured — add one below.");
   const ollama = d.sources.filter((s) => s.kind === "ollama" && s.enabled).length;
@@ -3629,6 +3692,107 @@ function renderAddForm() {
     msg.className = "ok-msg"; text(msg, "added");
     refreshSettings();
   };
+}
+
+/* Edit an existing source in place. The API edits by id and keeps the kind,
+   so the type is shown read-only. Field values are seeded from the stored
+   (redacted) config: a secret still reads as its mask, and the server's
+   merge_secrets turns that mask back into "keep what is stored", so an edit
+   that never touches the key cannot wipe it. */
+function renderEditForm(source) {
+  const d = state.settings;
+  const host = $("source-edit"); host.innerHTML = "";
+  const kind = source.kind;
+  const spec = d.source_kinds[kind];
+  const cfg = source.config || {};
+
+  const head = document.createElement("div");
+  head.className = "addform-head";
+  text(head, `Editing ${source.name}`);
+  host.appendChild(head);
+
+  // Seed the dataset with the stored values so the `when` gating and the
+  // enum re-render both start from what is actually configured.  Only fill a
+  // key that is not already set: the dataset survives a re-render (it lives on
+  // `host`, not its children), so re-seeding from `cfg` here would throw away
+  // whatever the user has typed since the form opened.
+  for (const f of spec.fields) {
+    if (!(f.key in host.dataset)) host.dataset[f.key] = cfg[f.key] != null ? cfg[f.key] : (f.default || "");
+  }
+
+  const fields = document.createElement("div"); fields.className = "fields";
+  const kindEl = document.createElement("input");
+  kindEl.type = "text"; kindEl.value = spec.label; kindEl.disabled = true;
+  fields.appendChild(labelled("Type", kindEl));
+
+  const nameEl = document.createElement("input");
+  nameEl.type = "text"; nameEl.value = source.name;
+  fields.appendChild(labelled("Name", nameEl));
+
+  const readerEl = spec.fields.find((f) => f.key === "reader");
+  for (const f of spec.fields) {
+    if (f.when) {
+      const dep = Object.keys(f.when)[0];
+      const want = f.when[dep];
+      const depEl = host.querySelector(`[data-fkey="${dep}"]`);
+      const val = (depEl && depEl.value) || host.dataset[dep] || (readerEl && readerEl.default);
+      if (val !== want) continue;
+    }
+    let el;
+    if (f.type === "enum") {
+      el = document.createElement("select");
+      for (const c of f.choices) { const o = document.createElement("option"); o.value = c; text(o, c); el.appendChild(o); }
+      el.value = host.dataset[f.key] || f.default;
+      el.onchange = () => { host.dataset[f.key] = el.value; renderEditForm(source); };
+      if (host.dataset[f.key]) el.value = host.dataset[f.key];
+    } else {
+      el = document.createElement("input"); el.type = "text";
+      el.value = host.dataset[f.key] || "";
+      el.placeholder = f.help ? "" : f.label;
+      // Track keystrokes in the dataset so an enum change re-rendering the
+      // form does not reset the other fields to their stored values.
+      el.oninput = () => { host.dataset[f.key] = el.value; };
+    }
+    el.dataset.fkey = f.key;
+    fields.appendChild(labelled(f.label, el, f.help));
+  }
+  host.appendChild(fields);
+
+  const actions = document.createElement("div");
+  actions.className = "actions"; actions.style.marginTop = "10px";
+  const save = document.createElement("button"); save.className = "btn primary"; text(save, "Save changes");
+  const cancel = document.createElement("button"); cancel.className = "btn"; text(cancel, "Cancel");
+  const msg = document.createElement("span"); msg.style.fontSize = "12px";
+  actions.append(save, cancel, msg);
+  host.appendChild(actions);
+
+  const collect = () => {
+    const c = {};
+    for (const el of host.querySelectorAll("[data-fkey]")) c[el.dataset.fkey] = el.value;
+    // A secret field the form does not render (none do today) keeps its stored
+    // mask rather than being dropped, so an edit can never wipe a hidden key.
+    for (const f of spec.fields) {
+      if (f.secret && !(f.key in c)) c[f.key] = cfg[f.key] || "";
+    }
+    return { name: nameEl.value.trim(), config: c };
+  };
+  save.onclick = async () => {
+    const payload = collect();
+    if (!payload.name) { msg.className = "err"; text(msg, "a name is required"); return; }
+    const r = await fetch("/api/sources/" + source.id, { method: "PUT",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      msg.className = "err";
+      text(msg, typeof body.detail === "string" ? body.detail : "could not save that engine");
+      return;
+    }
+    // The table re-renders with the new values, which is the confirmation;
+    // drop the form so it does not linger with a stale "saved" note.
+    host.innerHTML = "";
+    refreshSettings();
+  };
+  cancel.onclick = () => { host.innerHTML = ""; };
 }
 
 function labelled(labelText, el, help) {

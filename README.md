@@ -524,6 +524,7 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `log_dir` | — | — | Directory containing tabbyAPI's per-startup log files. The reader follows the newest .log file and switches automatically when the server restarts and writes a new one. |
 | `url` | `http://127.0.0.1:8003` | — | Polled for /health and /v1/model. The log goes quiet when the engine is merely idle, which is indistinguishable from it being gone unless something asks. |
 | `api_key` | — | — | Sent as a bearer token if the server requires one. |
+| `proxy_unit` | — | — | The systemd unit of a proxy sitting IN FRONT of tabbyAPI, if there is one. tabbyAPI sees the proxy (loopback), not whoever called it, so its own log carries no client address. The proxy's journal does: it logs the caller on every request. Set this to get the per-client table; leave it empty and that panel says it has no source. Only requests and prompt sizes are read from it -- status and latency are on separate lines with no request id, so they cannot be tied to a client without guessing. |
 
 **vLLM** (`--kind vllm`)
 

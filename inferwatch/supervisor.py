@@ -418,8 +418,37 @@ class Supervisor:
                                     name=f"reader:{name}"),
                 asyncio.create_task(rt.exllama.run(), name=f"exllama:{name}"),
             ]
-            log.info("source %r started (exllama %s, %s)", name, rt.exllama.url,
-                     rt.reader.describe())
+            proxy_unit = (cfg.get("proxy_unit") or "").strip()
+            if proxy_unit:
+                # tabbyAPI sees the proxy (loopback), not the caller, so its own
+                # log carries no client address. The proxy's journal does: it
+                # logs the caller on every request. Read it exactly the way the
+                # vLLM source reads its proxy -- one row per REQ line into the
+                # shared, source-keyed table.
+                def proxy_resume_ts(store=store, name=name):
+                    row = store.query("SELECT MAX(ts) t FROM vllm_client_requests"
+                                      " WHERE source = ?", (name,))
+                    return row[0]["t"] if row and row[0]["t"] else None
+
+                rt.proxy_reader = build_reader(
+                    self.store, name, {"reader": "journald", "unit": proxy_unit},
+                    backfill=self.config.get("collection.backfill"),
+                    resume_ts=proxy_resume_ts)
+
+                def proxy_on_line(ts, msg, store=store, name=name):
+                    got = parse_proxy.parse_req(msg)
+                    if got:
+                        store.insert_client_request({"ts": ts, "source": name, **got})
+
+                def proxy_on_flush(now, store=store):
+                    store.commit()
+
+                rt.tasks.append(asyncio.create_task(
+                    rt.proxy_reader.run(proxy_on_line, proxy_on_flush),
+                    name=f"proxy:{name}"))
+            log.info("source %r started (exllama %s, %s%s)", name, rt.exllama.url,
+                     rt.reader.describe(),
+                     f", proxy journal {proxy_unit}" if proxy_unit else "")
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
         return rt

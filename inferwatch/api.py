@@ -427,12 +427,16 @@ def create_app(state: AppState) -> FastAPI:
                 "source": source, "instances": inst,
                 "summary": exllama_metrics.summary(st, source, start, end),
                 "timeseries": exllama_metrics.timeseries(st, source, start, end, step),
+                "cache": exllama_metrics.cache_usage(st, source, start, end),
+                "cache_ts": exllama_metrics.cache_timeseries(
+                    st, source, start, end, step),
                 "finish": exllama_metrics.finish_reasons(st, source, start, end),
                 "models": exllama_metrics.by_model(st, source, start, end),
                 "requests": exllama_metrics.recent_requests(st, source, start, end, 100),
                 "slowest": exllama_metrics.slowest(st, source, start, end, "ttft_ms", 10),
                 "gpu": metrics.gpu_series(st, start, end, step),
                 "clients": exllama_metrics.clients(st, source, start, end),
+                "clients_configured": exllama_metrics.clients_available(st, source),
                 "raw_complete": metrics.coverage(st, start)["complete"],
                 "raw_from": metrics.coverage(st, start)["covers_from"],
             }
@@ -453,7 +457,8 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/api/exllama/clients")
     async def exllama_clients(source: str, window: str = "1h"):
         start, end = _window(window)
-        return exllama_metrics.clients(state.store, source, start, end)
+        return {"clients": exllama_metrics.clients(state.store, source, start, end),
+                "configured": exllama_metrics.clients_available(state.store, source)}
 
     @app.get("/api/exllama/requests")
     async def exllama_requests(source: str, window: str = "1h", limit: int = 100):
