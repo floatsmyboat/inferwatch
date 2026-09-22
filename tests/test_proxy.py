@@ -47,6 +47,19 @@ class TestParseReq(unittest.TestCase):
         got = parse_req(REQ[:REQ.index(" stream=")])
         self.assertIsNone(got["stream"])
 
+    def test_the_backend_field_is_parsed_and_optional(self):
+        """Newer proxy builds tag each REQ with the backend it routed to;
+        the field sits between REQ and the path and broke the parser when
+        it appeared, freezing the client list."""
+        got = parse_req("REQ backend=local v1/chat/completions from=10.0.0.122 "
+                        "model=qwen3.8 msgs=34 prompt=12,105 limit=163840 stream=True")
+        self.assertEqual(got["client"], "10.0.0.122")
+        self.assertEqual(got["endpoint"], "v1/chat/completions")
+        self.assertEqual(got["backend"], "local")
+        self.assertEqual(got["prompt_tokens"], 12105)
+        # The old format (no backend=) still parses, with backend unknown.
+        self.assertIsNone(parse_req(REQ)["backend"])
+
 
 class TestClientMetrics(unittest.TestCase):
     def setUp(self):

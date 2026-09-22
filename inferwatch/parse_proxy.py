@@ -10,8 +10,9 @@ host that is 100% of 3,879 lines in six hours.
 
 The proxy, however, knows exactly who called it, and says so on every request:
 
-    REQ v1/chat/completions from=10.0.0.96 model=qwen3.8 msgs=29 prompt=19,172
-        limit=131072 max_tokens=16384 max_completion_tokens=None stream=True
+    REQ backend=local v1/chat/completions from=10.0.0.96 model=qwen3.8 msgs=29
+        prompt=19,172 limit=131072 max_tokens=16384 max_completion_tokens=None
+        stream=True
 
 `prompt` is exact rather than estimated -- the proxy tokenises upstream before
 forwarding -- which makes it the one token figure on the vLLM side that is not a
@@ -39,7 +40,9 @@ import re
 # The proxy prefixes its own timestamp, and journald prefixes the unit, so the
 # marker is matched wherever it falls rather than anchored to the line start.
 _REQ = re.compile(
-    r"\bREQ\s+(?P<path>\S+)\s+"
+    r"\bREQ\s+"
+    r"(?:backend=(?P<backend>\S+)\s+)?"
+    r"(?P<path>\S+)\s+"
     r"from=(?P<client>\S+)\s+"
     r"model=(?P<model>\S+)\s+"
     r"msgs=(?P<msgs>\d+)\s+"
@@ -79,6 +82,7 @@ def parse_req(msg: str) -> dict | None:
     stream = m.group("stream")
     return {
         "endpoint": m.group("path"),
+        "backend": _opt(m.group("backend")),
         "client": m.group("client"),
         "model": _opt(m.group("model")),
         "messages": _int(m.group("msgs")),
