@@ -324,7 +324,7 @@ class Supervisor:
                     return row[0]["t"] if row and row[0]["t"] else None
 
                 rt.proxy_reader = build_reader(
-                    self.store, name, {"reader": "journald", "unit": proxy_unit},
+                    self.store, f"{name}:proxy", {"reader": "journald", "unit": proxy_unit},
                     backfill=self.config.get("collection.backfill"),
                     resume_ts=resume_ts)
 
@@ -431,7 +431,7 @@ class Supervisor:
                     return row[0]["t"] if row and row[0]["t"] else None
 
                 rt.proxy_reader = build_reader(
-                    self.store, name, {"reader": "journald", "unit": proxy_unit},
+                    self.store, f"{name}:proxy", {"reader": "journald", "unit": proxy_unit},
                     backfill=self.config.get("collection.backfill"),
                     resume_ts=proxy_resume_ts)
 

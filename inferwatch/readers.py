@@ -656,6 +656,7 @@ class DirReader(Reader):
                         if fh:
                             self._drain(fh, on_line)
                             fh.close()
+                            fh = None
                         current = newest
                         offset = 0
                         inode = None
@@ -738,7 +739,7 @@ class DirReader(Reader):
     def _drain(self, fh, on_line) -> None:
         try:
             rest = fh.read()
-        except OSError:
+        except (OSError, ValueError):
             return
         for line in rest.split("\n"):
             self._emit(line, on_line)
