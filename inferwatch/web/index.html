@@ -163,6 +163,7 @@ select, .btn {
   border-radius: 8px; padding: 6px 10px; cursor: pointer;
 }
 label.inline { color: var(--ink-2); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+[hidden] { display: none !important; }
 
 /* --------------------------------------------------------- banner */
 .banner {
@@ -428,6 +429,13 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="tbl-wrap" id="t-gpower" hidden></div>
     </div>
 
+    <div class="card" id="c-gpcie">
+      <header><h2>PCIe bandwidth</h2><span class="note" id="n-gpcie"></span>
+        <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+      <div class="legend" id="l-gpcie"></div><div class="plot" id="p-gpcie"></div>
+      <div class="tbl-wrap" id="t-gpcie" hidden></div>
+    </div>
+
     <div class="card" id="c-err">
       <header><h2>Errors</h2><span class="note" id="n-err"></span>
         <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
@@ -561,6 +569,12 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
         <div class="legend" id="l-npower"></div><div class="plot" id="p-npower"></div>
         <div class="tbl-wrap" id="t-npower" hidden></div>
       </div>
+      <div class="card" id="c-npcie">
+        <header><h2>PCIe bandwidth</h2><span class="note" id="n-npcie"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-npcie"></div><div class="plot" id="p-npcie"></div>
+        <div class="tbl-wrap" id="t-npcie" hidden></div>
+      </div>
     </div>
 
     <div class="grid" style="margin-top:14px">
@@ -674,6 +688,12 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
           <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
         <div class="legend" id="l-epower"></div><div class="plot" id="p-epower"></div>
         <div class="tbl-wrap" id="t-epower" hidden></div>
+      </div>
+      <div class="card" id="c-epcie">
+        <header><h2>PCIe bandwidth</h2><span class="note" id="n-epcie"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-epcie"></div><div class="plot" id="p-epcie"></div>
+        <div class="tbl-wrap" id="t-epcie" hidden></div>
       </div>
     </div>
 
@@ -888,6 +908,12 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
           <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
         <div class="legend" id="l-vpower"></div><div class="plot" id="p-vpower"></div>
         <div class="tbl-wrap" id="t-vpower" hidden></div>
+      </div>
+      <div class="card" id="c-vpcie">
+        <header><h2>PCIe bandwidth</h2><span class="note" id="n-vpcie"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-vpcie"></div><div class="plot" id="p-vpcie"></div>
+        <div class="tbl-wrap" id="t-vpcie" hidden></div>
       </div>
       <div class="card" id="c-vrate">
         <header><h2>Request rate</h2><span class="note">completions per second</span>
@@ -1200,8 +1226,10 @@ class Chart {
         } else {
           let d = `M ${sx(r[0])} ${sy(s.values[r[0]])}`;
           for (const i of r.slice(1)) d += ` L ${sx(i)} ${sy(s.values[i])}`;
-          el("path", { d, fill: "none", stroke: color, "stroke-width": 2,
-                       "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+          const attrs = { d, fill: "none", stroke: color, "stroke-width": 2,
+                          "stroke-linejoin": "round", "stroke-linecap": "round" };
+          if (s.dash) attrs["stroke-dasharray"] = s.dash;
+          el("path", attrs, g);
         }
       }
       /* end marker + selective direct label */
@@ -1586,6 +1614,31 @@ function tempChartSpec(gpus, t, labelFn, colorFn, fmtTick) {
   };
 }
 
+/* PCIe bandwidth: one line per card per direction.  NVML reports a live rate
+   in KB/s, so it is plotted directly (as MB/s); "out" is dashed to tell the
+   two directions apart without a second colour per card. */
+function pcieChartSpec(gpus, t, labelFn, colorFn, fmtTick) {
+  const series = [];
+  for (const gpu of gpus || []) {
+    const rx = (gpu.pcie_rx_kbs || []).map((v) => v === null ? null : v / 1024);
+    const tx = (gpu.pcie_tx_kbs || []).map((v) => v === null ? null : v / 1024);
+    series.push({ name: labelFn(gpu) + " in", values: rx, color: colorFn(gpu) });
+    series.push({ name: labelFn(gpu) + " out", values: tx, color: colorFn(gpu), dash: "4 3" });
+  }
+  return { type: "line", t, fmt: (v) => fmtCompact(v, 1) + " MB/s",
+           fmtAxis: (v) => fmtCompact(v, 0), fmtTick, series };
+}
+
+function latestPcie(gpus) {
+  let rx = 0, tx = 0, seen = false;
+  for (const gpu of gpus || []) {
+    const ra = gpu.pcie_rx_kbs || [], ta = gpu.pcie_tx_kbs || [];
+    for (let i = ra.length - 1; i >= 0; i--) if (ra[i] !== null) { rx += ra[i]; seen = true; break; }
+    for (let i = ta.length - 1; i >= 0; i--) if (ta[i] !== null) { tx += ta[i]; seen = true; break; }
+  }
+  return seen ? { rx: rx / 1024, tx: tx / 1024 } : null;
+}
+
 /* "4m", "2h" -- for saying how stale an attribution is without a full clock. */
 function fmtAgo(seconds) {
   if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "\u2014";
@@ -1838,6 +1891,14 @@ function renderCharts() {
     const w = totalPower(gv.cards);
     text($("n-gpower"), w === null ? "no samples yet"
       : `${fmtWatts(w)} across ${gv.known ? "the cards it held" : "all devices"}`);
+  }
+
+  draw("gpcie", "p-gpcie", "l-gpcie",
+       pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  {
+    const p = latestPcie(gv.cards);
+    text($("n-gpcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s`
+                         : "no samples yet");
   }
 
   draw("vram", "p-vram", "l-vram", {
@@ -2407,6 +2468,12 @@ function renderNinfer() {
   { const w = totalPower(gv.cards);
     text($("n-npower"), w === null ? "no samples yet" : `${fmtWatts(w)} drawn`); }
 
+  draw("npcie", "p-npcie", "l-npcie",
+       pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const p = latestPcie(gv.cards);
+    text($("n-npcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s`
+                         : "no samples yet"); }
+
   renderNinferTables(d);
 }
 
@@ -2664,6 +2731,12 @@ function renderExllama() {
        powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   { const w = totalPower(gv.cards);
     text($("n-epower"), w === null ? "no samples yet" : `${fmtWatts(w)} drawn`); }
+
+  draw("epcie", "p-epcie", "l-epcie",
+       pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const p = latestPcie(gv.cards);
+    text($("n-epcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s`
+                         : "no samples yet"); }
 
   renderExllamaTables(d);
 }
@@ -3249,6 +3322,12 @@ function renderVllm() {
        powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
   text($("n-vpower"), wattsV === null ? "no readings yet"
     : `${fmtWatts(wattsV)} across ${gv.known ? "this instance's cards" : "all devices"}`);
+
+  draw("vpcie", "p-vpcie", "l-vpcie",
+       pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const p = latestPcie(gv.cards);
+    text($("n-vpcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s`
+                         : "no readings yet"); }
 
   draw("vgpu", "p-vgpu", "l-vgpu", {
     type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",

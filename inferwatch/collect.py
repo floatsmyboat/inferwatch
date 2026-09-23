@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import ctypes
 import json
 import logging
 import re
@@ -553,7 +554,53 @@ class Correlator:
 # --------------------------------------------------------------------------
 
 _NVIDIA_QUERY = ("index,name,utilization.gpu,memory.used,memory.total,"
-                 "temperature.gpu,power.draw")
+                  "temperature.gpu,power.draw")
+
+# NVML is loaded lazily and at most once: nvidia-smi already proves the driver
+# is present, and PCIe throughput is the one number it does not report.
+_NVML_LIB = None
+_NVML_TRIED = False
+
+
+def _nvml_pcie() -> dict:
+    """Per-GPU PCIe throughput in KB/s, as {index: (rx, tx)}.
+
+    nvmlDeviceGetPcieThroughput returns a live rate (KB/s), not a cumulative
+    counter, so the value is used directly -- no differencing.  An unavailable
+    or failing NVML yields {} so GPU sampling degrades rather than breaks.
+    """
+    global _NVML_LIB, _NVML_TRIED
+    if not _NVML_TRIED:
+        _NVML_TRIED = True
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            if lib.nvmlInit_v2() == 0:
+                lib.nvmlDeviceGetCount_v2.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+                lib.nvmlDeviceGetHandleByIndex_v2.argtypes = [
+                    ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+                lib.nvmlDeviceGetPcieThroughput.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+                lib.nvmlDeviceGetPcieThroughput.restype = ctypes.c_int
+                _NVML_LIB = lib
+        except OSError:
+            _NVML_LIB = None
+    lib = _NVML_LIB
+    if lib is None:
+        return {}
+    n = ctypes.c_uint()
+    if lib.nvmlDeviceGetCount_v2(ctypes.byref(n)) != 0:
+        return {}
+    out = {}
+    for i in range(n.value):
+        h = ctypes.c_void_p()
+        if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h)) != 0:
+            continue
+        rx = ctypes.c_uint()
+        tx = ctypes.c_uint()
+        ok_rx = lib.nvmlDeviceGetPcieThroughput(h, 1, ctypes.byref(rx)) == 0
+        ok_tx = lib.nvmlDeviceGetPcieThroughput(h, 0, ctypes.byref(tx)) == 0
+        out[i] = (rx.value if ok_rx else None, tx.value if ok_tx else None)
+    return out
 
 
 def sample_gpus() -> list[dict]:
@@ -566,16 +613,20 @@ def sample_gpus() -> list[dict]:
             capture_output=True, text=True, timeout=5).stdout
     except (subprocess.SubprocessError, OSError):
         return []
+    pcie = _nvml_pcie()
     gpus = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 7:
             continue
+        index = _num(parts[0], int)
+        rx, tx = pcie.get(index, (None, None))
         gpus.append({
-            "index": _num(parts[0], int), "name": parts[1],
+            "index": index, "name": parts[1],
             "util_pct": _num(parts[2], float), "mem_used": _num(parts[3], int),
             "mem_total": _num(parts[4], int), "temp_c": _num(parts[5], float),
             "power_w": _num(parts[6], float),
+            "pcie_rx_kbs": rx, "pcie_tx_kbs": tx,
         })
     return gpus
 

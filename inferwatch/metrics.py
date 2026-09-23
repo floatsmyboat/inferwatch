@@ -549,7 +549,8 @@ def gpu_series(store, start: float, end: float, step: int | None = None) -> dict
     span = max(1.0, end - start)
     step = step or pick_step(span)
     rows = store.query(
-        "SELECT ts,gpu_index,name,util_pct,mem_used,mem_total,temp_c,power_w"
+        "SELECT ts,gpu_index,name,util_pct,mem_used,mem_total,temp_c,power_w,"
+        " pcie_rx_kbs,pcie_tx_kbs"
         " FROM gpu_samples WHERE ts >= ? AND ts < ? ORDER BY ts", (start, end))
     base = int(start // step) * step
     nb = int(span // step) + 1
@@ -558,13 +559,15 @@ def gpu_series(store, start: float, end: float, step: int | None = None) -> dict
         g = gpus.setdefault(r["gpu_index"], {
             "index": r["gpu_index"], "name": r["name"], "mem_total": r["mem_total"],
             "util_pct": [None] * nb, "mem_used": [None] * nb, "temp_c": [None] * nb,
-            "power_w": [None] * nb, "_n": [0] * nb})
+            "power_w": [None] * nb, "pcie_rx_kbs": [None] * nb,
+            "pcie_tx_kbs": [None] * nb, "_n": [0] * nb})
         i = int((r["ts"] - base) // step)
         if not 0 <= i < nb:
             continue
         # running mean within the bucket
         n = g["_n"][i]
-        for key in ("util_pct", "mem_used", "temp_c", "power_w"):
+        for key in ("util_pct", "mem_used", "temp_c", "power_w",
+                    "pcie_rx_kbs", "pcie_tx_kbs"):
             v = r[key]
             if v is None:
                 continue

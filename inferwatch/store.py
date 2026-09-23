@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS gpu_samples (
     mem_total INTEGER,
     temp_c    REAL,
     power_w   REAL,
+    pcie_rx_kbs REAL,   -- KB/s, NVML live rate (host->GPU)
+    pcie_tx_kbs REAL,   -- KB/s, NVML live rate (GPU->host)
     PRIMARY KEY (ts, gpu_index)
 ) WITHOUT ROWID;
 
@@ -749,6 +751,15 @@ class Store:
         if cols and "gpu_indices" not in cols:
             self.db.execute("ALTER TABLE vllm_instances ADD COLUMN gpu_indices TEXT")
 
+        # schema 10: per-card PCIe throughput (KB/s) from NVML, the one GPU
+        # number nvidia-smi does not expose.  Rows written before it keep NULL.
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(gpu_samples)")}
+        if cols:
+            for col in ("pcie_rx_kbs", "pcie_tx_kbs"):
+                if col not in cols:
+                    self.db.execute(
+                        f"ALTER TABLE gpu_samples ADD COLUMN {col} REAL")
+
         # schema 8: slot capacity alongside the in-flight gauge, so
         # utilisation is computable rather than just occupancy.
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(ps_samples)")}
@@ -1144,10 +1155,12 @@ class Store:
         with self.lock:
             self.db.executemany(
                 "INSERT OR REPLACE INTO gpu_samples"
-                " (ts,gpu_index,name,util_pct,mem_used,mem_total,temp_c,power_w)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                " (ts,gpu_index,name,util_pct,mem_used,mem_total,temp_c,power_w,"
+                "  pcie_rx_kbs,pcie_tx_kbs)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 [(ts, g["index"], g.get("name"), g.get("util_pct"), g.get("mem_used"),
-                  g.get("mem_total"), g.get("temp_c"), g.get("power_w")) for g in gpus])
+                  g.get("mem_total"), g.get("temp_c"), g.get("power_w"),
+                  g.get("pcie_rx_kbs"), g.get("pcie_tx_kbs")) for g in gpus])
 
     def insert_ps_sample(self, ts: float, loaded_count: int, models: list,
                          inflight: int, slots: int | None = None,
