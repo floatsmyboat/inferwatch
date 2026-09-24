@@ -3594,7 +3594,7 @@ function renderSettings() {
         text(b, "reset to default");
         b.onclick = async () => {
           await fetch("/api/config/reset", { method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
             body: JSON.stringify({ key: st.key }) });
           refreshSettings();
         };
@@ -3619,7 +3619,8 @@ $("set-save").addEventListener("click", async () => {
   }
   for (const e of $("set-groups").querySelectorAll(".err")) { e.hidden = true; text(e, ""); }
   const r = await fetch("/api/config", { method: "PUT",
-    headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) });
+    headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
+    body: JSON.stringify(values) });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) {
     const errs = (body.detail && body.detail.errors) || {};
@@ -3662,7 +3663,7 @@ function renderSources() {
       text(toggle, s.enabled ? "disable" : "enable");
       toggle.onclick = async () => {
         await fetch("/api/sources/" + s.id, { method: "PUT",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
           body: JSON.stringify({ enabled: !s.enabled }) });
         refreshSettings();
       };
@@ -3674,7 +3675,7 @@ function renderSources() {
         if (!choice) return;
         /* Only purge when the dialog actually named what would be destroyed. */
         await fetch("/api/sources/" + s.id + "?purge=" + choice.purge,
-                    { method: "DELETE" });
+                    { method: "DELETE", headers: { "X-Inferwatch-Request": "1" } });
         refreshSettings();
       };
       acts.append(edit, toggle, del);
@@ -3752,7 +3753,8 @@ function renderAddForm() {
   probe.onclick = async () => {
     text(msg, "testing…"); msg.className = "";
     const r = await fetch("/api/sources/probe", { method: "POST",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
+      headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
+      body: JSON.stringify(collect()) });
     const body = await r.json().catch(() => ({ ok: false, detail: "bad response" }));
     msg.className = body.ok ? "ok-msg" : "err";
     text(msg, body.detail || (body.ok ? "reachable" : "failed"));
@@ -3761,7 +3763,8 @@ function renderAddForm() {
     const payload = collect();
     if (!payload.name) { msg.className = "err"; text(msg, "a name is required"); return; }
     const r = await fetch("/api/sources", { method: "POST",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
+      body: JSON.stringify(payload) });
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       msg.className = "err";
@@ -3859,7 +3862,8 @@ function renderEditForm(source) {
     const payload = collect();
     if (!payload.name) { msg.className = "err"; text(msg, "a name is required"); return; }
     const r = await fetch("/api/sources/" + source.id, { method: "PUT",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      headers: { "Content-Type": "application/json", "X-Inferwatch-Request": "1" },
+      body: JSON.stringify(payload) });
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       msg.className = "err";

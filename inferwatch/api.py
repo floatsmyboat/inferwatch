@@ -113,9 +113,33 @@ def _window(window: str) -> tuple[float, float]:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+CSRF_HEADER = "x-inferwatch-request"
+
+
 def create_app(state: AppState) -> FastAPI:
     app = FastAPI(title="inferwatch", docs_url="/api/docs", redoc_url=None)
     app.state.inferwatch = state
+
+    @app.middleware("http")
+    async def require_csrf_header(request: Request, call_next):
+        """Block drive-by CSRF against the mutating endpoints.
+
+        There is no authentication here by design -- this is a LAN tool, and
+        anything reachable on the port can already call these routes
+        directly. What this closes is a *different* attacker: a page loaded
+        from the open internet by someone whose browser also has this LAN
+        service reachable, which fires a blind cross-origin form submission
+        or a `fetch(..., {mode: "no-cors"})` at it. Neither of those can set
+        a custom header, so requiring one on every state-changing request is
+        enough to stop that class of attack without adding real auth.
+        """
+        if (request.method in MUTATING_METHODS
+                and request.url.path.startswith("/api/")
+                and CSRF_HEADER not in request.headers):
+            return JSONResponse(status_code=403,
+                                content={"detail": "missing required header"})
+        return await call_next(request)
 
     # ---------------------------------------------------------------- static
 
