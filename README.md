@@ -526,6 +526,14 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `api_key` | — | — | Sent as a bearer token if the server requires one. |
 | `proxy_unit` | — | — | The systemd unit of a proxy sitting IN FRONT of tabbyAPI, if there is one. tabbyAPI sees the proxy (loopback), not whoever called it, so its own log carries no client address. The proxy's journal does: it logs the caller on every request. Set this to get the per-client table; leave it empty and that panel says it has no source. Only requests and prompt sizes are read from it -- status and latency are on separate lines with no request id, so they cannot be tied to a client without guessing. |
 
+**Strata** (`--kind strata`)
+
+| Field | Default | Required when | Notes |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:8001` | — | Polled for /health, /v1/status and /metrics; no log is read. Strata's /metrics is JSON holding its configuration, the running request and a ring of finished ones, each with the expert-cache hit rate and the share of experts read over PCIe. If a switcher rotates other engines onto this port, polls that find a different server record nothing and say which one answered. |
+| `unit` | — | — | The unit running Strata, for GPU attribution by cgroup. Without it the cards are found by the process listening on the URL's port, which also works for a local server. |
+| `api_key` | — | — | Sent as a bearer token if Strata was started with --api-key. Prefer a reference like ${STRATA_API_KEY} over the value: what is stored here goes into the database in plain text. |
+
 **vLLM** (`--kind vllm`)
 
 | Field | Default | Required when | Notes |

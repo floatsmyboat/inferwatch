@@ -62,6 +62,10 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
         "history": [("exllama_requests", "ts"),
                     ("exllama_cache_samples", "ts")],
     },
+    "strata": {
+        "registry": [("strata_instances", None)],
+        "history": [("strata_requests", "ts"), ("strata_samples", "ts")],
+    },
 }
 
 # Log-spaced upper bounds in ms.  Fine where local inference actually lives
@@ -516,6 +520,99 @@ CREATE TABLE IF NOT EXISTS exllama_cache_samples (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_ecache_src_ts ON exllama_cache_samples(source, ts);
 
+-- ----------------------------------------------------------------------
+-- Strata: everything is POLLED, nothing is read from a log.  Its /metrics
+-- answers JSON (Prometheus text only on request, under vLLM's names) holding
+-- the engine's configuration, the running request, and a ring of the last
+-- requests it finished -- each with numbers no other engine here has: the
+-- share of routed experts the GPU's expert cache held (hit_rate) and the share
+-- fetched over PCIe instead (pcie_share).  A request row is therefore the
+-- server's own record, deduplicated by its start time; there is no submission
+-- half to miss, so unlike the log-read engines there is no `paired` column.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strata_requests (
+    id                  INTEGER PRIMARY KEY,
+    ts                  REAL NOT NULL,      -- completion time (started + duration)
+    started_ts          REAL,
+    source              TEXT NOT NULL,
+    model               TEXT,
+    -- stop | length | tool_calls | cancelled | error, as Strata states it.
+    finish              TEXT,
+    prompt_tokens       INTEGER,            -- read by the engine (seen)
+    cached_tokens       INTEGER,            -- reused from the previous turn
+    prompt_tokens_total INTEGER,            -- what the client sent
+    output_tokens       INTEGER,
+    ttft_ms             REAL,               -- the engine's prompt time
+    latency_ms          REAL,
+    prefill_ms          REAL,
+    decode_ms           REAL,
+    prefill_tps         REAL,
+    decode_tps          REAL,
+    expert_hit_rate     REAL,               -- routed experts found in VRAM
+    pcie_share          REAL,               -- routed experts read over PCIe
+    ram_blobs           INTEGER,
+    file_blobs          INTEGER,            -- experts read from disk (low-RAM mode)
+    file_mb             REAL,
+    drafts_offered      INTEGER,
+    drafts_accepted     INTEGER,
+    draft_accept        REAL,
+    reasoning_recoveries INTEGER,
+    dedupe_key          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sreq_ts ON strata_requests(source, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sreq_dedupe ON strata_requests(dedupe_key);
+
+-- One poll of /metrics: what the engine is doing between requests, which no
+-- request row can show.  kv_tokens is the running requests' context (prompt
+-- plus generated) -- the quantity Strata itself exports as
+-- vllm:kv_cache_usage_perc -- and kv_resident is how much of a context the
+-- engine keeps in VRAM; past it the KV cache streams from RAM.
+CREATE TABLE IF NOT EXISTS strata_samples (
+    ts               REAL NOT NULL,
+    source           TEXT NOT NULL,
+    state            TEXT,                  -- idle | reading | generating | ...
+    running          INTEGER,
+    queued           INTEGER,
+    kv_tokens        INTEGER,
+    kv_max           INTEGER,
+    kv_resident      INTEGER,
+    prompt_read      INTEGER,
+    prompt_total     INTEGER,
+    decode_tps       REAL,                  -- live, over the last seconds
+    prefill_tps      REAL,                  -- the running request's mean
+    host_pcie_rx_mb  REAL,                  -- Strata's own NVML reading, MB/s
+    host_pcie_tx_mb  REAL,
+    cpu_pct          REAL,
+    ram_used_bytes   INTEGER,
+    ram_total_bytes  INTEGER,
+    conv_cache_bytes INTEGER,
+    conv_cache_parked INTEGER,
+    PRIMARY KEY (ts, source)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS strata_instances (
+    source           TEXT PRIMARY KEY,
+    last_seen        REAL,
+    model            TEXT,
+    version          TEXT,
+    reachable        INTEGER,
+    error            TEXT,
+    started          REAL,
+    max_context      INTEGER,
+    kv_type          TEXT,
+    kv_resident      INTEGER,
+    slots            INTEGER,               -- "parallel": requests served at once
+    expert_slots     INTEGER,
+    expert_cache_mib INTEGER,
+    arena_mib        INTEGER,
+    vram_free_mib    INTEGER,
+    spec             INTEGER,
+    vision           INTEGER,
+    gpu_indices      TEXT,
+    gpu_source       TEXT,
+    gpu_ts           REAL
+);
+
 -- Client-facing requests, read from the proxy in front of vLLM rather than from
 -- vLLM itself.  vLLM's /metrics is pre-aggregated and carries no request
 -- identity, and its own access log sees only the proxy, so this is the only
@@ -657,6 +754,18 @@ def exllama_request_key(r: dict) -> str:
     return "|".join(_f(r.get(k)) for k in
                     ("ts", "source", "req_id", "finish", "prompt_tokens",
                      "output_tokens", "ttft_ms", "latency_ms"))
+
+
+def strata_request_key(r: dict) -> str:
+    """Identity of a Strata request.
+
+    Every poll returns the same ring of recent requests, so most of each poll is
+    a request already stored.  Strata gives them no id; the start time it stamps
+    (to the microsecond) plus the prompt it was given identifies one, and a
+    re-poll reproduces both exactly.
+    """
+    return "|".join(_f(r.get(k)) for k in
+                    ("source", "started_ts", "prompt_tokens_total"))
 
 
 def event_key(e: dict) -> str:
@@ -1286,6 +1395,61 @@ class Store:
                 f" ON CONFLICT(source) DO UPDATE SET {sets}",
                 (source, *(fields.get(c) for c in cols)))
 
+    # -- strata ------------------------------------------------------------
+
+    STRATA_REQUEST_COLS = (
+        "ts", "started_ts", "source", "model", "finish", "prompt_tokens",
+        "cached_tokens", "prompt_tokens_total", "output_tokens", "ttft_ms",
+        "latency_ms", "prefill_ms", "decode_ms", "prefill_tps", "decode_tps",
+        "expert_hit_rate", "pcie_share", "ram_blobs", "file_blobs", "file_mb",
+        "drafts_offered", "drafts_accepted", "draft_accept",
+        "reasoning_recoveries", "dedupe_key")
+
+    def insert_strata_request(self, row: dict) -> bool:
+        """Store one finished request; False when it was already stored."""
+        row = dict(row)
+        row["dedupe_key"] = strata_request_key(row)
+        cols = self.STRATA_REQUEST_COLS
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO strata_requests"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+        return cur.rowcount > 0
+
+    STRATA_SAMPLE_COLS = (
+        "ts", "source", "state", "running", "queued", "kv_tokens", "kv_max",
+        "kv_resident", "prompt_read", "prompt_total", "decode_tps",
+        "prefill_tps", "host_pcie_rx_mb", "host_pcie_tx_mb", "cpu_pct",
+        "ram_used_bytes", "ram_total_bytes", "conv_cache_bytes",
+        "conv_cache_parked")
+
+    def insert_strata_sample(self, row: dict) -> None:
+        cols = self.STRATA_SAMPLE_COLS
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO strata_samples"
+                f" ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(c) for c in cols))
+
+    def upsert_strata_instance(self, source: str, **fields) -> None:
+        cols = ("last_seen", "model", "version", "reachable", "error", "started",
+                "max_context", "kv_type", "kv_resident", "slots", "expert_slots",
+                "expert_cache_mib", "arena_mib", "vram_free_mib", "spec",
+                "vision", "gpu_indices", "gpu_source", "gpu_ts")
+        # While another engine holds the port the configuration is unknown, not
+        # gone: keep the last one Strata stated.  Reachability and the error
+        # are what each poll found, so they are always replaced.
+        fresh = ("last_seen", "reachable", "error")
+        sets = ",".join(f"{c}=excluded.{c}" if c in fresh
+                        else f"{c}=COALESCE(excluded.{c},{c})" for c in cols)
+        with self.lock:
+            self.db.execute(
+                f"INSERT INTO strata_instances (source,{','.join(cols)})"
+                f" VALUES ({','.join('?' * (len(cols) + 1))})"
+                f" ON CONFLICT(source) DO UPDATE SET {sets}",
+                (source, *(fields.get(c) for c in cols)))
+
     def commit(self) -> None:
         with self.lock:
             self.db.commit()
@@ -1419,6 +1583,10 @@ class Store:
                                    (raw_cut,)).rowcount
             n_eck = self.db.execute("DELETE FROM exllama_cache_samples WHERE ts < ?",
                                      (samp_cut,)).rowcount
+            n_sr = self.db.execute("DELETE FROM strata_requests WHERE ts < ?",
+                                   (raw_cut,)).rowcount
+            n_ss = self.db.execute("DELETE FROM strata_samples WHERE ts < ?",
+                                   (samp_cut,)).rowcount
             # 0 means keep forever, so no cutoff is computed at all -- distinct
             # from a cutoff of now, which would delete everything.
             n_r1m = n_r1h = 0
@@ -1438,7 +1606,8 @@ class Store:
                 "ninfer_requests": n_nr, "ninfer_samples": n_ns,
                 "ninfer_client_samples": n_ncs,
                 "exllama_requests": n_er,
-                "exllama_cache_samples": n_eck}
+                "exllama_cache_samples": n_eck,
+                "strata_requests": n_sr, "strata_samples": n_ss}
 
     # -- reads ---------------------------------------------------------------
 

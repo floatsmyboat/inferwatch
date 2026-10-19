@@ -295,6 +295,7 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     <button role="tab" data-tab="vllm" aria-selected="false">vLLM</button>
     <button role="tab" data-tab="ninfer" aria-selected="false">NInfer</button>
     <button role="tab" data-tab="exllama" aria-selected="false">Exllama</button>
+    <button role="tab" data-tab="strata" aria-selected="false">Strata</button>
     <button role="tab" data-tab="images" aria-selected="false">Images</button>
     <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
   </nav>
@@ -319,6 +320,9 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     </label>
     <label class="inline" id="esource-wrap" hidden>Instance
       <select id="esource"></select>
+    </label>
+    <label class="inline" id="stsource-wrap" hidden>Instance
+      <select id="stsource"></select>
     </label>
     <label class="inline" id="vsource-wrap" hidden>Instance
       <select id="vsource"></select>
@@ -729,6 +733,127 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="card" style="grid-column:1/-1">
         <header><h2>Recent requests</h2><span class="note" id="n-ereq"></span></header>
         <div class="tbl-wrap" id="t-ereq"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-strata" hidden>
+    <div class="banner show" id="strata-note" style="border-left-color:var(--series-2)">
+      <span class="ico" aria-hidden="true">i</span>
+      <span>Strata is <strong>polled</strong>, not read from a log: its <code>/metrics</code> holds
+      each finished request as the server recorded it, so percentiles are exact. Its experts live
+      in system RAM with the hottest cached in VRAM, so the numbers that matter most here are the
+      <strong>expert-cache hit rate</strong> and the share of experts read <strong>over PCIe</strong>.
+      TTFT is the engine's prompt time; context in use is the running request's prompt plus output,
+      Strata's own definition of KV usage.</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="flabel">Decode throughput</div>
+        <div class="figure"><span id="st-hero">—</span><span class="unit">tok/s</span></div>
+      </div>
+      <div class="spark plot" id="st-hero-spark"></div>
+    </div>
+
+    <div class="kpis" id="st-kpis"></div>
+
+    <div class="grid">
+      <div class="card" id="c-sttft">
+        <header><h2>Time to first token</h2><span class="note" id="n-sttft">mean per bucket</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-sttft"></div><div class="plot" id="p-sttft"></div>
+        <div class="tbl-wrap" id="t-sttft" hidden></div>
+      </div>
+      <div class="card" id="c-stexp">
+        <header><h2>Expert cache</h2><span class="note" id="n-stexp">hit rate and PCIe share, per request</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stexp"></div><div class="plot" id="p-stexp"></div>
+        <div class="tbl-wrap" id="t-stexp" hidden></div>
+      </div>
+      <div class="card" id="c-stkv">
+        <header><h2>Context in use</h2><span class="note" id="n-stkv"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stkv"></div><div class="plot" id="p-stkv"></div>
+        <div class="tbl-wrap" id="t-stkv" hidden></div>
+      </div>
+      <div class="card" id="c-stq">
+        <header><h2>Running &amp; queued</h2><span class="note" id="n-stq"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stq"></div><div class="plot" id="p-stq"></div>
+        <div class="tbl-wrap" id="t-stq" hidden></div>
+      </div>
+      <div class="card" id="c-stlive">
+        <header><h2>Live speed</h2><span class="note" id="n-stlive">sampled from the running request</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stlive"></div><div class="plot" id="p-stlive"></div>
+        <div class="tbl-wrap" id="t-stlive" hidden></div>
+      </div>
+      <div class="card" id="c-strate">
+        <header><h2>Request rate</h2><span class="note" id="n-strate">completions per second</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-strate"></div><div class="plot" id="p-strate"></div>
+        <div class="tbl-wrap" id="t-strate" hidden></div>
+      </div>
+      <div class="card" id="c-sttok">
+        <header><h2>Token throughput</h2><span class="note" id="n-sttok">prompt read vs generated</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-sttok"></div><div class="plot" id="p-sttok"></div>
+        <div class="tbl-wrap" id="t-sttok" hidden></div>
+      </div>
+      <div class="card" id="c-stram">
+        <header><h2>System RAM</h2><span class="note" id="n-stram">experts are pinned here</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stram"></div><div class="plot" id="p-stram"></div>
+        <div class="tbl-wrap" id="t-stram" hidden></div>
+      </div>
+      <div class="card" id="c-stgpu">
+        <header><h2>GPU utilisation</h2><span class="note" id="n-stgpu"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stgpu"></div><div class="plot" id="p-stgpu"></div>
+        <div class="tbl-wrap" id="t-stgpu" hidden></div>
+      </div>
+      <div class="card" id="c-stvram">
+        <header><h2>VRAM in use</h2><span class="note" id="n-stvram"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stvram"></div><div class="plot" id="p-stvram"></div>
+        <div class="tbl-wrap" id="t-stvram" hidden></div>
+      </div>
+      <div class="card" id="c-sttemp">
+        <header><h2>GPU temperature</h2><span class="note" id="n-sttemp"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-sttemp"></div><div class="plot" id="p-sttemp"></div>
+        <div class="tbl-wrap" id="t-sttemp" hidden></div>
+      </div>
+      <div class="card" id="c-stpower">
+        <header><h2>GPU power draw</h2><span class="note" id="n-stpower"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stpower"></div><div class="plot" id="p-stpower"></div>
+        <div class="tbl-wrap" id="t-stpower" hidden></div>
+      </div>
+      <div class="card" id="c-stpcie">
+        <header><h2>PCIe bandwidth</h2><span class="note" id="n-stpcie"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-stpcie"></div><div class="plot" id="p-stpcie"></div>
+        <div class="tbl-wrap" id="t-stpcie" hidden></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Finish reasons</h2><span class="note" id="n-stfinish"></span></header>
+        <div class="tbl-wrap" id="t-stfinish"></div></div>
+      <div class="card"><header><h2>Models</h2><span class="note" id="n-stmodels"></span></header>
+        <div class="tbl-wrap" id="t-stmodels"></div></div>
+      <div class="card"><header><h2>Slowest by TTFT</h2><span class="note" id="n-stslow"></span></header>
+        <div class="tbl-wrap" id="t-stslow"></div></div>
+      <div class="card"><header><h2>Instances</h2><span class="note" id="n-stinst"></span></header>
+        <div class="tbl-wrap" id="t-stinst"></div></div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Recent requests</h2><span class="note" id="n-streq"></span></header>
+        <div class="tbl-wrap" id="t-streq"></div>
       </div>
     </div>
   </section>
@@ -2881,6 +3006,303 @@ function renderExllamaTables(d) {
 $("esource").addEventListener("change", (e) => { state.esource = e.target.value; refreshExllama(); });
 
 /* =====================================================================
+   Strata tab
+
+   Polled, not log-read: request rows are the server's own records, and
+   the gauges (queue, context in use, live speed, RAM) are /metrics samples.
+   ===================================================================== */
+let stRefreshing = false;
+
+async function refreshStrata() {
+  if (stRefreshing) return;
+  stRefreshing = true;
+  $("tab-strata").querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.stsource ? `&source=${encodeURIComponent(state.stsource)}` : "");
+    state.stdata = await jget("/api/strata/dashboard" + q);
+    renderStrata();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    $("tab-strata").querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    stRefreshing = false;
+  }
+}
+
+function renderStrata() {
+  const d = state.stdata;
+  const sel = $("stsource");
+  const names = (d.instances || []).map((i) => i.source);
+  if (sel.dataset.names !== names.join("|")) {
+    sel.innerHTML = "";
+    for (const nm of names) {
+      const o = document.createElement("option");
+      o.value = nm; text(o, nm); sel.appendChild(o);
+    }
+    sel.dataset.names = names.join("|");
+  }
+  if (d.source) { state.stsource = d.source; sel.value = d.source; }
+  if (!d.summary) { text($("st-hero"), "—"); return; }
+
+  const s = d.summary, ts = d.timeseries;
+  const sm = d.samples || { t: [] };
+  const lv = d.live || {};
+  const inst = (d.instances || []).find((i) => i.source === d.source) || {};
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
+  renderStrataKpis(d, s, lv, inst);
+
+  text($("st-hero"), fmtCompact(s.decode_tps_mean, 1));
+  const hs = state.charts.stherospark;
+  const hspec = { type: "line", spark: true, t: ts.t,
+                  fmt: (v) => fmtCompact(v, 1) + " tok/s",
+                  series: [{ name: "decode", values: ts.decode_tps, color: sc(0) }] };
+  if (hs) hs.update(hspec); else state.charts.stherospark = new Chart($("st-hero-spark"), hspec);
+
+  draw("sttft", "p-sttft", "l-sttft", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "TTFT mean", values: ts.ttft_mean_ms, color: sc(0) }],
+  });
+  text($("n-sttft"), s.ttft_ms.p50 !== null
+    ? `p50 ${fmtMs(s.ttft_ms.p50)} · p90 ${fmtMs(s.ttft_ms.p90)} · exact`
+    : "no requests in this window");
+
+  draw("stexp", "p-stexp", "l-stexp", {
+    type: "line", t: ts.t, yMax: 1, fmt: (v) => fmtPct(v),
+    fmtAxis: (v) => fmtPct(v, 0), fmtTick,
+    series: [{ name: "expert cache hit", values: ts.expert_hit_rate, color: sc(2) },
+             { name: "read over PCIe", values: ts.pcie_share, color: sc(1) }],
+  });
+  text($("n-stexp"), s.expert_hit_rate !== null
+    ? `hit ${fmtPct(s.expert_hit_rate)} · worst ${fmtPct(s.expert_hit_min)} · `
+      + `PCIe ${fmtPct(s.pcie_share)} · weighted by tokens`
+    : "no requests in this window");
+
+  draw("stkv", "p-stkv", "l-stkv", {
+    type: "line", t: sm.t, yMax: 1, fmt: (v) => fmtPct(v),
+    fmtAxis: (v) => fmtPct(v, 0), fmtTick,
+    series: [{ name: "context in use (peak)", values: sm.kv_frac, color: sc(2) },
+             { name: "past the VRAM window", values: (sm.kv_streamed || []).map(
+                 (v) => v === null || !inst.max_context ? null : v / inst.max_context),
+               color: sc(3) }],
+  });
+  text($("n-stkv"), lv.n
+    ? `now ${fmtCompact(lv.kv_tokens || 0, 0)} of ${fmtCompact(lv.kv_max, 0)} · `
+      + `peak ${fmtCompact(lv.kv_peak || 0, 0)} · VRAM holds ${fmtCompact(inst.kv_resident, 0)}`
+      + `${inst.kv_type ? " · " + inst.kv_type : ""}`
+    : "no samples yet");
+
+  draw("stq", "p-stq", "l-stq", {
+    type: "line", t: sm.t, fmt: (v) => fmtCompact(v, 1),
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "running", values: sm.running, color: sc(0) },
+             { name: "queued", values: sm.queued, color: sc(1) }],
+  });
+  text($("n-stq"), lv.n
+    ? `now ${lv.running || 0} running · ${lv.queued || 0} queued · `
+      + `peak queue ${lv.queued_peak || 0} · ${inst.slots || 1} slot${(inst.slots || 1) === 1 ? "" : "s"}`
+    : "no samples yet");
+
+  draw("stlive", "p-stlive", "l-stlive", {
+    type: "line", t: sm.t, fmt: (v) => fmtCompact(v, 1) + " tok/s",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "decode", values: sm.decode_tps, color: sc(0) },
+             { name: "prompt read", values: sm.prefill_tps, color: sc(3) }],
+  });
+
+  draw("strate", "p-strate", "l-strate", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 3) + "/s",
+    fmtAxis: (v) => fmtCompact(v, 2), fmtTick,
+    series: [{ name: "requests", values: ts.req_per_s, color: sc(1) },
+             { name: "errors", values: ts.err_per_s, color: css("--critical") }],
+  });
+  text($("n-strate"), `${fmtCompact(s.requests, 0)} requests · ${fmtCompact(s.errors, 0)} failed`
+    + (s.cancelled ? ` · ${fmtCompact(s.cancelled, 0)} cancelled` : ""));
+
+  draw("sttok", "p-sttok", "l-sttok", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "generated", values: ts.out_tps, color: sc(0) },
+             { name: "prompt read", values: ts.in_tps, color: sc(3) }],
+  });
+  text($("n-sttok"), `${fmtCompact(s.output_tokens, 0)} generated · `
+    + `${fmtCompact(s.cached_tokens, 0)} reused from the previous turn`);
+
+  const ramTotal = lv.ram_total_bytes ? lv.ram_total_bytes / 2 ** 30 : undefined;
+  draw("stram", "p-stram", "l-stram", {
+    type: "line", t: sm.t, yMax: ramTotal, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "RAM in use", values: sm.ram_used_gib, color: sc(2) }],
+  });
+  text($("n-stram"), inst.arena_mib
+    ? `experts pinned ${fmtCompact(inst.arena_mib / 1024, 1)} GiB`
+      + (ramTotal ? ` · of ${fmtCompact(ramTotal, 0)} GiB` : "")
+    : "experts are pinned here");
+
+  const g = d.gpu || { t: [], gpus: [] };
+  const gv = gpuView(g.gpus, inst.gpu_indices, "no model resident");
+  draw("stgpu", "p-stgpu", "l-stgpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((x) => ({ name: gv.label(x), values: x.util_pct,
+                                 color: gv.colour(x) })),
+  });
+  text($("n-stgpu"), gv.note(inst.gpu_source));
+
+  draw("stvram", "p-stvram", "l-stvram", {
+    type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    yMax: gv.cards.length ? Math.max(...gv.cards.map((x) => (x.mem_total || 0) / 1024))
+                          : undefined,
+    series: g.gpus.map((x) => ({ name: gv.label(x),
+      values: x.mem_used.map((v) => v === null ? null : v / 1024),
+      color: gv.colour(x) })),
+  });
+  text($("n-stvram"), inst.expert_cache_mib
+    ? `expert cache ${fmtCompact(inst.expert_cache_mib / 1024, 1)} GiB · `
+      + `${fmtCompact(inst.expert_slots, 0)} slots · ${fmtCompact(inst.vram_free_mib, 0)} MiB free`
+    : "");
+
+  draw("sttemp", "p-sttemp", "l-sttemp",
+       tempChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const hot = hottest(gv.cards);
+    text($("n-sttemp"), hot ? `hottest now ${fmtTemp(hot.temp)} on GPU ${hot.index}`
+                            : (g.gpus.length ? "no readings yet" : "no samples yet")); }
+
+  draw("stpower", "p-stpower", "l-stpower",
+       powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const w = totalPower(gv.cards);
+    text($("n-stpower"), w === null ? "no samples yet" : `${fmtWatts(w)} drawn`); }
+
+  draw("stpcie", "p-stpcie", "l-stpcie",
+       pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const p = latestPcie(gv.cards);
+    text($("n-stpcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s`
+      + " · expert-cache misses cross here" : "no samples yet"); }
+
+  renderStrataTables(d);
+}
+
+function renderStrataKpis(d, s, lv, inst) {
+  const k = $("st-kpis"); k.innerHTML = "";
+  k.append(
+    tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
+    tile("TTFT p50", fmtMs(s.ttft_ms.p50), "", `p90 ${fmtMs(s.ttft_ms.p90)} · exact`),
+    tile("Decode speed", fmtCompact(s.decode_tps_mean, 1), "tok/s", "while generating"),
+    tile("Prompt read", fmtCompact(s.prefill_tps_mean, 0), "tok/s", "while reading"),
+    tile("Expert cache", s.expert_hit_rate === null ? "—" : fmtPct(s.expert_hit_rate), "",
+         s.expert_hit_rate === null ? "no requests" : `worst ${fmtPct(s.expert_hit_min)}`,
+         s.expert_hit_rate !== null && s.expert_hit_rate < 0.85),
+    tile("Over PCIe", s.pcie_share === null ? "—" : fmtPct(s.pcie_share), "",
+         "of routed experts"),
+    tile("Context now", lv.kv_frac == null ? "—" : fmtPct(lv.kv_frac), "",
+         lv.n ? `${fmtCompact(lv.kv_tokens || 0, 0)} tokens · peak ${fmtPct(lv.kv_peak_frac)}`
+              : "no samples yet",
+         (lv.kv_frac || 0) > 0.9),
+    tile("Queue", lv.n ? `${lv.queued || 0}` : "—", "",
+         lv.n ? `${lv.running || 0} running · ${inst.slots || 1} slot${(inst.slots || 1) === 1 ? "" : "s"}`
+              : "no samples yet",
+         (lv.queued || 0) > 0),
+    tile("Draft accept", s.draft_accept_mean === null ? "—" : fmtPct(s.draft_accept_mean),
+         "", "MTP, all drafts"),
+    tile("Prompt reuse", fmtPct(s.cache_hit_rate), "",
+         `${fmtCompact(s.cached_tokens, 0)} tokens`),
+    tile("Errors", fmtPct(s.error_rate), "", `${s.errors} of ${s.requests}`
+         + (s.disk_reads ? ` · ${s.disk_reads} read experts from disk` : ""),
+         s.error_rate > 0.01, s.errors ? css("--critical") : css("--good")),
+    tile("Latency p90", fmtMs(s.latency_ms.p90), "", `p50 ${fmtMs(s.latency_ms.p50)}`)
+  );
+}
+
+function renderStrataTables(d) {
+  const finishKind = (f) => f === "error" ? "err"
+    : (f === "length" || f === "cancelled") ? "warn" : "ok";
+  table("t-stfinish",
+    [{ label: "Finish" }, { label: "Count", num: true }],
+    d.finish, (tr, r) => {
+      tr.appendChild(tdNode(pill(r.finish, finishKind(r.finish))));
+      tr.appendChild(td(fmtCompact(r.count, 0), true));
+    }, "No requests in this window.");
+  text($("n-stfinish"), "as Strata records it");
+
+  table("t-stmodels",
+    [{ label: "Model" }, { label: "Requests", num: true }, { label: "TTFT mean", num: true },
+     { label: "Decode", num: true }, { label: "Generated", num: true }, { label: "Last used" }],
+    d.models, (tr, m) => {
+      tr.appendChild(td(m.model, false, true));
+      tr.appendChild(td(fmtCompact(m.requests, 0), true));
+      tr.appendChild(td(fmtMs(m.ttft_mean), true));
+      tr.appendChild(td(m.decode_tps === null ? "—" : fmtCompact(m.decode_tps, 1), true));
+      tr.appendChild(td(fmtCompact(m.output_tokens, 0), true));
+      tr.appendChild(td(m.last_used ? fmtClock(m.last_used) : "—"));
+    }, "No models seen yet.");
+  text($("n-stmodels"), `${(d.models || []).length} seen`);
+
+  table("t-stslow",
+    [{ label: "When" }, { label: "Prompt", num: true }, { label: "Generated", num: true },
+     { label: "TTFT", num: true }, { label: "Wall", num: true }, { label: "Expert hit", num: true }],
+    d.slowest, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+      tr.appendChild(td(r.expert_hit_rate === null ? "—" : fmtPct(r.expert_hit_rate), true));
+    }, "No requests in this window.");
+  text($("n-stslow"), d.raw_complete ? "" : `raw rows from ${fmtClock(d.raw_from, true)}`);
+
+  table("t-stinst",
+    [{ label: "Instance" }, { label: "Model" }, { label: "State" }, { label: "Version" },
+     { label: "Context", num: true }, { label: "In VRAM", num: true },
+     { label: "Slots", num: true }, { label: "Expert cache", num: true },
+     { label: "Uptime", num: true }, { label: "Last seen" }],
+    d.instances, (tr, i) => {
+      tr.appendChild(td(i.source, false, true));
+      tr.appendChild(td(i.model || "—"));
+      tr.appendChild(tdNode(i.reachable ? pill("serving", "ok")
+        : pill(i.error && i.error.startsWith("port answered") ? "other engine" : "unreachable",
+               i.error && i.error.startsWith("port answered") ? "warn" : "err")));
+      tr.appendChild(td(i.version || "—"));
+      tr.appendChild(td(i.max_context ? fmtCompact(i.max_context, 0) : "—", true));
+      tr.appendChild(td(i.kv_resident ? fmtCompact(i.kv_resident, 0) : "—", true));
+      tr.appendChild(td(i.slots ? `${i.slots}` : "—", true));
+      tr.appendChild(td(i.expert_cache_mib ? `${fmtCompact(i.expert_cache_mib / 1024, 1)} GiB` : "—", true));
+      tr.appendChild(td(i.uptime_s ? fmtMs(i.uptime_s * 1000) : "—", true));
+      tr.appendChild(td(i.last_seen ? fmtClock(i.last_seen) : "—"));
+      if (!i.reachable && i.error) tr.title = i.error;
+    }, "No instances yet.");
+  text($("n-stinst"), `${(d.instances || []).length} configured`);
+
+  table("t-streq",
+    [{ label: "When" }, { label: "Finish" }, { label: "Prompt", num: true },
+     { label: "Reused", num: true }, { label: "Generated", num: true },
+     { label: "TTFT", num: true }, { label: "Wall", num: true },
+     { label: "Decode", num: true }, { label: "Read", num: true },
+     { label: "Expert hit", num: true }, { label: "PCIe", num: true },
+     { label: "Accept", num: true }],
+    d.requests, (tr, r) => {
+      tr.appendChild(td(fmtClock(r.ts)));
+      tr.appendChild(tdNode(pill(r.finish || "?", finishKind(r.finish))));
+      tr.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      tr.appendChild(td(r.cached_tokens ? fmtCompact(r.cached_tokens, 0) : "—", true));
+      tr.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      tr.appendChild(td(fmtMs(r.ttft_ms), true));
+      tr.appendChild(td(fmtMs(r.latency_ms), true));
+      tr.appendChild(td(r.decode_tps === null ? "—" : fmtCompact(r.decode_tps, 1), true));
+      tr.appendChild(td(r.prefill_tps === null ? "—" : fmtCompact(r.prefill_tps, 0), true));
+      tr.appendChild(td(r.expert_hit_rate === null ? "—" : fmtPct(r.expert_hit_rate), true));
+      tr.appendChild(td(r.pcie_share === null ? "—" : fmtPct(r.pcie_share), true));
+      tr.appendChild(td(r.draft_accept === null ? "—" : fmtPct(r.draft_accept), true));
+      if (r.file_blobs) tr.title = `${r.file_blobs} expert reads from disk`;
+    }, "No requests in this window.");
+  text($("n-streq"), `${(d.requests || []).length} shown`);
+}
+
+$("stsource").addEventListener("change", (e) => { state.stsource = e.target.value; refreshStrata(); });
+
+/* =====================================================================
    Tabs
    ===================================================================== */
 state.tab = "ollama";
@@ -2892,13 +3314,15 @@ state.nsource = "";
 state.ndata = null;
 state.esource = "";
 state.edata = null;
+state.stsource = "";
+state.stdata = null;
 state.settings = null;
 
 function switchTab(name) {
   state.tab = name;
   for (const btn of $("tabs").querySelectorAll("button"))
     btn.setAttribute("aria-selected", String(btn.dataset.tab === name));
-  for (const t of ["ollama", "vllm", "ninfer", "exllama", "images", "settings"])
+  for (const t of ["ollama", "vllm", "ninfer", "exllama", "strata", "images", "settings"])
     $("tab-" + t).hidden = t !== name;
   // The filter row scopes the metric tabs only, and each shows a different
   // dimension selector.
@@ -2907,6 +3331,7 @@ function switchTab(name) {
   $("vsource-wrap").hidden = name !== "vllm";
   $("nsource-wrap").hidden = name !== "ninfer";
   $("esource-wrap").hidden = name !== "exllama";
+  $("stsource-wrap").hidden = name !== "strata";
   $("isource-wrap").hidden = name !== "images";
   history.replaceState(null, "", "?" + new URLSearchParams({
     tab: name, window: state.window,
@@ -2919,6 +3344,7 @@ function refreshActive() {
   if (state.tab === "vllm") return refreshVllm();
   if (state.tab === "ninfer") return refreshNinfer();
   if (state.tab === "exllama") return refreshExllama();
+  if (state.tab === "strata") return refreshStrata();
   if (state.tab === "images") return refreshImages();
   return refreshSettings();
 }

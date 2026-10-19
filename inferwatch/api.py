@@ -23,7 +23,8 @@ import urllib.request
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import exllama_metrics, image_metrics, metrics, ninfer_metrics, vllm_metrics
+from . import (exllama_metrics, image_metrics, metrics, ninfer_metrics,
+               strata_metrics, vllm_metrics)
 from .config import (SOURCE_KINDS, ConfigError, merge_secrets, redact_sources,
                      resolve_secret, validate_source)
 
@@ -490,6 +491,64 @@ def create_app(state: AppState) -> FastAPI:
         return {"requests": exllama_metrics.recent_requests(
             state.store, source, start, end, limit)}
 
+    # -------------------------------------------------------------- strata
+
+    @app.get("/api/strata/instances")
+    async def strata_instances():
+        return {"instances": strata_metrics.instances(state.store)}
+
+    @app.get("/api/strata/dashboard")
+    async def strata_dashboard(source: str | None = None, window: str = Query("1h"),
+                               step: int | None = None):
+        start, end = _window(window)
+        st = state.store
+        loop = asyncio.get_running_loop()
+        inst = strata_metrics.instances(st)
+        if source is None:
+            source = inst[0]["source"] if inst else None
+        if source is None:
+            return {"window": window, "start": start, "end": end, "instances": [],
+                    "source": None, "summary": None, "timeseries": None,
+                    "hint": "No Strata source configured. Add one in Settings."}
+
+        def build():
+            return {
+                "window": window, "start": start, "end": end, "now": time.time(),
+                "source": source, "instances": inst,
+                "summary": strata_metrics.summary(st, source, start, end),
+                "timeseries": strata_metrics.timeseries(st, source, start, end, step),
+                "samples": strata_metrics.sample_timeseries(st, source, start, end, step),
+                "live": strata_metrics.live(st, source, start, end),
+                "finish": strata_metrics.finish_reasons(st, source, start, end),
+                "models": strata_metrics.by_model(st, source, start, end),
+                "requests": strata_metrics.recent_requests(st, source, start, end, 100),
+                "slowest": strata_metrics.slowest(st, source, start, end, "ttft_ms", 10),
+                "gpu": metrics.gpu_series(st, start, end, step),
+                "raw_complete": metrics.coverage(st, start)["complete"],
+                "raw_from": metrics.coverage(st, start)["covers_from"],
+            }
+
+        return await loop.run_in_executor(None, build)
+
+    @app.get("/api/strata/summary")
+    async def strata_summary(source: str, window: str = "1h"):
+        start, end = _window(window)
+        return strata_metrics.summary(state.store, source, start, end)
+
+    @app.get("/api/strata/timeseries")
+    async def strata_timeseries(source: str, window: str = "1h",
+                                step: int | None = None):
+        start, end = _window(window)
+        return {"requests": strata_metrics.timeseries(state.store, source, start, end, step),
+                "samples": strata_metrics.sample_timeseries(
+                    state.store, source, start, end, step)}
+
+    @app.get("/api/strata/requests")
+    async def strata_requests(source: str, window: str = "1h", limit: int = 100):
+        start, end = _window(window)
+        return {"requests": strata_metrics.recent_requests(
+            state.store, source, start, end, limit)}
+
     @app.get("/api/images/sources")
     async def image_sources():
         return {"sources": image_metrics.sources(state.store),
@@ -869,6 +928,26 @@ def _probe(kind: str, cfg: dict) -> dict:
         if log_dir and not os.path.isdir(log_dir):
             return {"ok": False, "detail": f"log_dir does not exist: {log_dir}"}
         return {"ok": True, "detail": "; ".join(notes)}
+    if kind == "strata":
+        from .strata import fetch_json
+        url = (cfg.get("url") or "").rstrip("/")
+        api_key = cfg.get("api_key") or ""
+        try:
+            health = fetch_json(f"{url}/health", api_key)
+        except Exception as e:
+            return {"ok": False, "detail": f"could not reach {url}/health: {e}"}
+        service = (health or {}).get("service")
+        if service != "strata":
+            return {"ok": False,
+                    "detail": f"{url} answers, but as {service!r} rather than Strata "
+                              "(a switcher may have another engine on this port)"}
+        try:
+            m = fetch_json(f"{url}/metrics", api_key)
+        except Exception as e:
+            return {"ok": False, "detail": f"Strata at {url}, but /metrics failed: {e}"}
+        eng = (m or {}).get("engine") or {}
+        return {"ok": True, "detail": f"Strata {eng.get('version') or '?'} at {url}, "
+                                      f"model {eng.get('model') or health.get('model')}"}
     return {"ok": False, "detail": f"unknown source kind {kind!r}"}
 
 

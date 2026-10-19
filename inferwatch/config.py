@@ -298,6 +298,31 @@ SOURCE_KINDS = {
                      "cannot be tied to a client without guessing."},
         ],
     },
+    "strata": {
+        "label": "Strata",
+        "fields": [
+            {"key": "url", "label": "Base URL", "type": "str",
+             "default": "http://127.0.0.1:8001",
+             "help": "Polled for /health, /v1/status and /metrics; no log is "
+                     "read. Strata's /metrics is JSON holding its configuration, "
+                     "the running request and a ring of finished ones, each with "
+                     "the expert-cache hit rate and the share of experts read "
+                     "over PCIe. If a switcher rotates other engines onto this "
+                     "port, polls that find a different server record nothing "
+                     "and say which one answered."},
+            {"key": "unit", "label": "systemd unit (optional)", "type": "str",
+             "default": "",
+             "help": "The unit running Strata, for GPU attribution by cgroup. "
+                     "Without it the cards are found by the process listening on "
+                     "the URL's port, which also works for a local server."},
+            {"key": "api_key", "label": "API key (optional)", "type": "str",
+             "default": "", "secret": True,
+             "help": "Sent as a bearer token if Strata was started with "
+                     "--api-key. Prefer a reference like ${STRATA_API_KEY} over "
+                     "the value: what is stored here goes into the database in "
+                     "plain text."},
+        ],
+    },
     "vllm": {
         "label": "vLLM",
         "fields": [
@@ -462,6 +487,8 @@ def validate_source(kind: str, name: str, cfg: dict) -> dict:
             raise ValueError("an exllama source needs a log directory")
         if not out.get("url"):
             raise ValueError("an exllama source needs a base URL")
+    if kind == "strata" and not out.get("url"):
+        raise ValueError("a Strata source needs a base URL")
     if kind == "vllm" and not out.get("url"):
         raise ValueError("a vLLM source needs a base URL")
     if kind == "swarmui":

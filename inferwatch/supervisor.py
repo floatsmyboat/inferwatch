@@ -26,6 +26,7 @@ import logging
 from . import parse_proxy
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
 from .exllama import ExllamaCorrelator, ExllamaPoller
+from .strata import StrataPoller
 from .images import ImagesPoller, SwarmLogCollector
 from .ninfer import NinferCorrelator, NinferPoller
 from .models import ModelIndex
@@ -53,6 +54,7 @@ class SourceRuntime:
         self.ninfer_corr: NinferCorrelator | None = None
         self.exllama: ExllamaPoller | None = None
         self.exllama_corr: ExllamaCorrelator | None = None
+        self.strata: StrataPoller | None = None
 
     @property
     def name(self) -> str:
@@ -84,6 +86,13 @@ class SourceRuntime:
         if self.exllama is not None:
             d["reachable"] = self.exllama.reachable
             d["gpu_indices"] = self.exllama.gpu_indices
+        if self.strata is not None:
+            d["reachable"] = self.strata.reachable
+            d["is_strata"] = self.strata.is_strata
+            d["error"] = self.strata.error
+            d["model"] = self.strata.model
+            d["stats"] = dict(self.strata.stats)
+            d["gpu_indices"] = self.strata.gpu_indices
         if self.corr is not None:
             d["inflight"] = self.corr.inflight
             d["stats"] = dict(self.corr.stats)
@@ -449,6 +458,16 @@ class Supervisor:
             log.info("source %r started (exllama %s, %s%s)", name, rt.exllama.url,
                      rt.reader.describe(),
                      f", proxy journal {proxy_unit}" if proxy_unit else "")
+        elif spec["kind"] == "strata":
+            # Nothing to read from a log: /metrics carries the finished requests
+            # as well as the gauges, so one poller is the whole collector.
+            name = spec["name"]
+            rt.strata = StrataPoller(
+                self.store, name, cfg,
+                interval_getter=lambda: self.config.get("collection.poll_interval_s"),
+                on_live=self.hub.publish, on_event=self.store.insert_event)
+            rt.tasks = [asyncio.create_task(rt.strata.run(), name=f"strata:{name}")]
+            log.info("source %r started (strata %s)", name, rt.strata.url)
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
         return rt
@@ -475,6 +494,8 @@ class Supervisor:
                                if rt.kind == "swarmui"],
             "exllama_sources": [rt.name for rt in self.runtimes.values()
                                 if rt.kind == "exllama"],
+            "strata_sources": [rt.name for rt in self.runtimes.values()
+                               if rt.kind == "strata"],
         }
 
     def image_runtimes(self) -> list[SourceRuntime]:
