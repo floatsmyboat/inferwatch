@@ -296,6 +296,7 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     <button role="tab" data-tab="ninfer" aria-selected="false">NInfer</button>
     <button role="tab" data-tab="exllama" aria-selected="false">Exllama</button>
     <button role="tab" data-tab="strata" aria-selected="false">Strata</button>
+    <button role="tab" data-tab="maya" aria-selected="false">Maya</button>
     <button role="tab" data-tab="images" aria-selected="false">Images</button>
     <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
   </nav>
@@ -323,6 +324,9 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
     </label>
     <label class="inline" id="stsource-wrap" hidden>Instance
       <select id="stsource"></select>
+    </label>
+    <label class="inline" id="masource-wrap" hidden>Instance
+      <select id="masource"></select>
     </label>
     <label class="inline" id="vsource-wrap" hidden>Instance
       <select id="vsource"></select>
@@ -854,6 +858,123 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px; display: f
       <div class="card" style="grid-column:1/-1">
         <header><h2>Recent requests</h2><span class="note" id="n-streq"></span></header>
         <div class="tbl-wrap" id="t-streq"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-maya" hidden>
+    <div class="banner show" id="maya-note" style="border-left-color:var(--series-2)">
+      <span class="ico" aria-hidden="true">i</span>
+      <span>Maya is <strong>polled</strong>: its <code>/metrics</code> has each finished request as the
+      server recorded it, and a live decode rate <strong>summed over the requests it answers at once</strong>
+      (<code>--parallel</code>), so the hero and <em>Throughput by concurrency</em> are aggregate figures.
+      Experts live in VRAM, then pinned RAM, then the model's files: here those are on NFS, so
+      <strong>disk reads per token</strong> above zero mean network reads on the decode path.</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="flabel">Aggregate decode, live</div>
+        <div class="figure"><span id="ma-hero">—</span><span class="unit">tok/s</span></div>
+      </div>
+      <div class="spark plot" id="ma-hero-spark"></div>
+    </div>
+
+    <div class="kpis" id="ma-kpis"></div>
+
+    <div class="grid" style="margin-bottom:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Throughput by concurrency</h2><span class="note" id="n-maconc"></span></header>
+        <div class="tbl-wrap" id="t-maconc"></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card" id="c-malive">
+        <header><h2>Aggregate decode</h2><span class="note" id="n-malive">summed over running requests, per poll</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-malive"></div><div class="plot" id="p-malive"></div>
+        <div class="tbl-wrap" id="t-malive" hidden></div>
+      </div>
+      <div class="card" id="c-maq">
+        <header><h2>Running &amp; queued</h2><span class="note" id="n-maq"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-maq"></div><div class="plot" id="p-maq"></div>
+        <div class="tbl-wrap" id="t-maq" hidden></div>
+      </div>
+      <div class="card" id="c-matier">
+        <header><h2>Expert tiers</h2><span class="note" id="n-matier">share of routed experts VRAM held</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-matier"></div><div class="plot" id="p-matier"></div>
+        <div class="tbl-wrap" id="t-matier" hidden></div>
+      </div>
+      <div class="card" id="c-mafetch">
+        <header><h2>Expert reads per token</h2><span class="note" id="n-mafetch">RAM, disk (NFS) and promotions to VRAM</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mafetch"></div><div class="plot" id="p-mafetch"></div>
+        <div class="tbl-wrap" id="t-mafetch" hidden></div>
+      </div>
+      <div class="card" id="c-mattft">
+        <header><h2>Time to first token</h2><span class="note" id="n-mattft">mean per bucket</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mattft"></div><div class="plot" id="p-mattft"></div>
+        <div class="tbl-wrap" id="t-mattft" hidden></div>
+      </div>
+      <div class="card" id="c-mareq">
+        <header><h2>Per-request decode</h2><span class="note" id="n-mareq">each finished request's own rate</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mareq"></div><div class="plot" id="p-mareq"></div>
+        <div class="tbl-wrap" id="t-mareq" hidden></div>
+      </div>
+      <div class="card" id="c-makv">
+        <header><h2>Context in use</h2><span class="note" id="n-makv"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-makv"></div><div class="plot" id="p-makv"></div>
+        <div class="tbl-wrap" id="t-makv" hidden></div>
+      </div>
+      <div class="card" id="c-maram">
+        <header><h2>System RAM</h2><span class="note" id="n-maram">the RAM tier is pinned here</span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-maram"></div><div class="plot" id="p-maram"></div>
+        <div class="tbl-wrap" id="t-maram" hidden></div>
+      </div>
+      <div class="card" id="c-magpu">
+        <header><h2>GPU utilisation</h2><span class="note" id="n-magpu"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-magpu"></div><div class="plot" id="p-magpu"></div>
+        <div class="tbl-wrap" id="t-magpu" hidden></div>
+      </div>
+      <div class="card" id="c-mavram">
+        <header><h2>VRAM in use</h2><span class="note" id="n-mavram"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mavram"></div><div class="plot" id="p-mavram"></div>
+        <div class="tbl-wrap" id="t-mavram" hidden></div>
+      </div>
+      <div class="card" id="c-mapcie">
+        <header><h2>PCIe bandwidth</h2><span class="note" id="n-mapcie"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mapcie"></div><div class="plot" id="p-mapcie"></div>
+        <div class="tbl-wrap" id="t-mapcie" hidden></div>
+      </div>
+      <div class="card" id="c-mapower">
+        <header><h2>GPU power draw</h2><span class="note" id="n-mapower"></span>
+          <div class="tools"><button data-view="chart" aria-pressed="true">Chart</button><button data-view="table">Table</button></div></header>
+        <div class="legend" id="l-mapower"></div><div class="plot" id="p-mapower"></div>
+        <div class="tbl-wrap" id="t-mapower" hidden></div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><header><h2>Finish reasons</h2><span class="note" id="n-mafinish"></span></header>
+        <div class="tbl-wrap" id="t-mafinish"></div></div>
+      <div class="card"><header><h2>Instances</h2><span class="note" id="n-mainst"></span></header>
+        <div class="tbl-wrap" id="t-mainst"></div></div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card" style="grid-column:1/-1">
+        <header><h2>Recent requests</h2><span class="note" id="n-mareqs"></span></header>
+        <div class="tbl-wrap" id="t-mareqs"></div>
       </div>
     </div>
   </section>
@@ -3303,6 +3424,236 @@ function renderStrataTables(d) {
 $("stsource").addEventListener("change", (e) => { state.stsource = e.target.value; refreshStrata(); });
 
 /* =====================================================================
+   Maya tab
+
+   Maya's rows are in the Strata tables; what is its own is the live
+   decode rate summed over concurrent requests, and the expert tiers.
+   ===================================================================== */
+let maRefreshing = false;
+
+async function refreshMaya() {
+  if (maRefreshing) return;
+  maRefreshing = true;
+  $("tab-maya").querySelectorAll(".plot").forEach((p) => p.classList.add("loading"));
+  try {
+    const q = `?window=${encodeURIComponent(state.window)}` +
+              (state.masource ? `&source=${encodeURIComponent(state.masource)}` : "");
+    state.madata = await jget("/api/maya/dashboard" + q);
+    renderMaya();
+    setConn(true);
+  } catch (e) {
+    console.error(e);
+    setConn(false, String(e.message || e));
+  } finally {
+    $("tab-maya").querySelectorAll(".plot").forEach((p) => p.classList.remove("loading"));
+    maRefreshing = false;
+  }
+}
+
+function renderMaya() {
+  const d = state.madata;
+  const sel = $("masource");
+  const names = (d.instances || []).map((i) => i.source);
+  if (sel.dataset.names !== names.join("|")) {
+    sel.innerHTML = "";
+    for (const nm of names) {
+      const o = document.createElement("option");
+      o.value = nm; text(o, nm); sel.appendChild(o);
+    }
+    sel.dataset.names = names.join("|");
+  }
+  if (d.source) { state.masource = d.source; sel.value = d.source; }
+  if (!d.summary) { text($("ma-hero"), "—"); text($("n-maconc"), d.hint || ""); return; }
+
+  const s = d.summary, ts = d.timeseries;
+  const sm = d.samples || { t: [] };
+  const tr = d.tiers || { t: [] };
+  const lv = d.live || {};
+  const inst = (d.instances || []).find((i) => i.source === d.source) || {};
+  const fmtTick = tickFormatterForSpan(d.end - d.start);
+  const slots = inst.slots || 1;
+
+  text($("ma-hero"), lv.state === "generating" ? fmtCompact(lv.decode_tps, 1) : "idle");
+  const hspec = { type: "line", spark: true, t: sm.t,
+                  fmt: (v) => fmtCompact(v, 1) + " tok/s",
+                  series: [{ name: "aggregate", values: sm.decode_tps, color: sc(0) }] };
+  if (state.charts.maherospark) state.charts.maherospark.update(hspec);
+  else state.charts.maherospark = new Chart($("ma-hero-spark"), hspec);
+
+  const conc = d.concurrency || [];
+  const best = conc.reduce((a, r) => (r.agg || 0) > (a ? a.agg || 0 : 0) ? r : a, null);
+  const k = $("ma-kpis"); k.innerHTML = "";
+  k.append(
+    tile("Requests", fmtCompact(s.requests, 0), "", `${fmtCompact(s.req_per_s, 3)} req/s`),
+    tile("Best aggregate", best ? fmtCompact(best.agg, 1) : "—", "tok/s",
+         best ? `at ${best.running} running · mean of ${best.n} polls` : "no generating samples"),
+    tile("Per-request decode", fmtCompact(s.decode_tps_mean, 1), "tok/s", "mean of finished requests"),
+    tile("TTFT p50", fmtMs(s.ttft_ms.p50), "", `p90 ${fmtMs(s.ttft_ms.p90)} · engine prompt time`),
+    tile("Prompt read", fmtCompact(s.prefill_tps_mean, 0), "tok/s", "reused prompt excluded"),
+    tile("Expert VRAM hit", s.expert_hit_rate === null ? "—" : fmtPct(s.expert_hit_rate), "",
+         s.expert_hit_rate === null ? "no requests" : `worst ${fmtPct(s.expert_hit_min)}`,
+         s.expert_hit_rate !== null && s.expert_hit_rate < 0.85),
+    tile("Queue", lv.n ? `${lv.queued || 0}` : "—", "",
+         lv.n ? `${lv.running || 0} running · ${slots} at once` : "no samples yet",
+         (lv.queued || 0) > 0),
+    tile("Errors", fmtPct(s.error_rate), "", `${s.errors} of ${s.requests}`,
+         s.error_rate > 0.01, s.errors ? css("--critical") : css("--good")),
+  );
+
+  table("t-maconc",
+    [{ label: "Running" }, { label: "Aggregate tok/s", num: true },
+     { label: "Per request", num: true }, { label: "Peak", num: true },
+     { label: "VRAM hit", num: true }, { label: "Disk/token", num: true },
+     { label: "Polls", num: true }],
+    conc, (row, r) => {
+      row.appendChild(td(`${r.running}${r.running > slots ? " (over slots?)" : ""}`));
+      row.appendChild(td(fmtCompact(r.agg, 1), true));
+      row.appendChild(td(fmtCompact(r.per_request, 1), true));
+      row.appendChild(td(fmtCompact(r.peak, 1), true));
+      row.appendChild(td(r.vram_hit == null ? "—" : fmtPct(r.vram_hit), true));
+      row.appendChild(td(r.disk_fetch == null ? "—" : fmtCompact(r.disk_fetch, 2), true));
+      row.appendChild(td(fmtCompact(r.n, 0), true));
+    }, "No generating samples in this window.");
+  text($("n-maconc"), `polls while generating, grouped by requests running · ${slots} slot${slots === 1 ? "" : "s"} configured`);
+
+  draw("malive", "p-malive", "l-malive", {
+    type: "line", t: sm.t, fmt: (v) => fmtCompact(v, 1) + " tok/s",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "aggregate decode", values: sm.decode_tps, color: sc(0) },
+             { name: "prompt read", values: sm.prefill_tps, color: sc(3) }],
+  });
+
+  draw("maq", "p-maq", "l-maq", {
+    type: "line", t: sm.t, fmt: (v) => fmtCompact(v, 1),
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "running", values: sm.running, color: sc(0) },
+             { name: "writing", values: tr.writing, color: sc(2) },
+             { name: "queued", values: sm.queued, color: sc(1) }],
+  });
+  text($("n-maq"), lv.n ? `now ${lv.running || 0} running · ${lv.queued || 0} queued · peak queue ${lv.queued_peak || 0}`
+                        : "no samples yet");
+
+  draw("matier", "p-matier", "l-matier", {
+    type: "line", t: tr.t, yMax: 1, fmt: (v) => fmtPct(v), fmtAxis: (v) => fmtPct(v, 0), fmtTick,
+    series: [{ name: "VRAM hit (live)", values: tr.vram_hit, color: sc(2) },
+             { name: "VRAM hit (per request)", values: ts.expert_hit_rate, color: sc(0) }],
+  });
+
+  draw("mafetch", "p-mafetch", "l-mafetch", {
+    type: "line", t: tr.t, fmt: (v) => fmtCompact(v, 2), fmtAxis: (v) => fmtCompact(v, 1), fmtTick,
+    series: [{ name: "from RAM", values: tr.ram_fetch, color: sc(1) },
+             { name: "from disk (NFS)", values: tr.disk_fetch, color: css("--critical") },
+             { name: "promoted to VRAM", values: tr.promo, color: sc(3) }],
+  });
+  { const dk = (tr.disk_fetch || []).filter((v) => v !== null);
+    text($("n-mafetch"), dk.length && Math.max(...dk) > 0
+      ? `disk reads seen: the RAM tier does not hold the rest of the model`
+      : "RAM, disk (NFS) and promotions to VRAM"); }
+
+  draw("mattft", "p-mattft", "l-mattft", {
+    type: "line", t: ts.t, fmt: fmtMs, fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "TTFT mean", values: ts.ttft_mean_ms, color: sc(0) }],
+  });
+  text($("n-mattft"), s.ttft_ms.p50 !== null
+    ? `p50 ${fmtMs(s.ttft_ms.p50)} · p90 ${fmtMs(s.ttft_ms.p90)} · exact` : "no requests in this window");
+
+  draw("mareq", "p-mareq", "l-mareq", {
+    type: "line", t: ts.t, fmt: (v) => fmtCompact(v, 1) + " tok/s",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "per-request decode", values: ts.decode_tps, color: sc(0) },
+             { name: "generated, all requests", values: ts.out_tps, color: sc(2) }],
+  });
+
+  draw("makv", "p-makv", "l-makv", {
+    type: "line", t: sm.t, yMax: 1, fmt: (v) => fmtPct(v), fmtAxis: (v) => fmtPct(v, 0), fmtTick,
+    series: [{ name: "context in use (peak)", values: sm.kv_frac, color: sc(2) }],
+  });
+  text($("n-makv"), lv.n ? `now ${fmtCompact(lv.kv_tokens || 0, 0)} of ${fmtCompact(lv.kv_max, 0)} · peak ${fmtCompact(lv.kv_peak || 0, 0)}`
+                         : "no samples yet");
+
+  const ramTotal = lv.ram_total_bytes ? lv.ram_total_bytes / 2 ** 30 : undefined;
+  draw("maram", "p-maram", "l-maram", {
+    type: "line", t: sm.t, yMax: ramTotal, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    series: [{ name: "RAM in use", values: sm.ram_used_gib, color: sc(2) }],
+  });
+
+  const g = d.gpu || { t: [], gpus: [] };
+  const gv = gpuView(g.gpus, inst.gpu_indices, "no model resident");
+  draw("magpu", "p-magpu", "l-magpu", {
+    type: "line", t: g.t, yMax: 100, fmt: (v) => fmtCompact(v, 0) + "%",
+    fmtAxis: (v) => fmtCompact(v, 0) + "%", fmtTick,
+    series: g.gpus.map((x) => ({ name: gv.label(x), values: x.util_pct, color: gv.colour(x) })),
+  });
+  text($("n-magpu"), gv.note(inst.gpu_source));
+
+  draw("mavram", "p-mavram", "l-mavram", {
+    type: "line", t: g.t, fmt: (v) => fmtCompact(v, 1) + " GiB",
+    fmtAxis: (v) => fmtCompact(v, 0), fmtTick,
+    yMax: gv.cards.length ? Math.max(...gv.cards.map((x) => (x.mem_total || 0) / 1024)) : undefined,
+    series: g.gpus.map((x) => ({ name: gv.label(x),
+      values: x.mem_used.map((v) => v === null ? null : v / 1024), color: gv.colour(x) })),
+  });
+
+  draw("mapcie", "p-mapcie", "l-mapcie", pcieChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const p = latestPcie(gv.cards);
+    text($("n-mapcie"), p ? `in ${fmtCompact(p.rx, 1)} · out ${fmtCompact(p.tx, 1)} MB/s · RAM-tier experts cross here`
+                          : "no samples yet"); }
+
+  draw("mapower", "p-mapower", "l-mapower", powerChartSpec(g.gpus, g.t, gv.label, gv.colour, fmtTick));
+  { const w = totalPower(gv.cards);
+    text($("n-mapower"), w === null ? "no samples yet" : `${fmtWatts(w)} drawn`); }
+
+  const finishKind = (f) => f === "error" ? "err" : (f === "length" || f === "disconnect") ? "warn" : "ok";
+  table("t-mafinish", [{ label: "Finish" }, { label: "Count", num: true }],
+    d.finish, (row, r) => {
+      row.appendChild(tdNode(pill(r.finish, finishKind(r.finish))));
+      row.appendChild(td(fmtCompact(r.count, 0), true));
+    }, "No requests in this window.");
+
+  table("t-mainst",
+    [{ label: "Instance" }, { label: "Model" }, { label: "State" }, { label: "Version" },
+     { label: "Context", num: true }, { label: "At once", num: true },
+     { label: "GPUs" }, { label: "Uptime", num: true }, { label: "Last seen" }],
+    d.instances, (row, i) => {
+      row.appendChild(td(i.source, false, true));
+      row.appendChild(td(i.model || "—"));
+      const other = i.error && i.error.startsWith("port answered");
+      row.appendChild(tdNode(i.reachable ? pill("serving", "ok")
+        : pill(other ? "other engine" : "unreachable", other ? "warn" : "err")));
+      row.appendChild(td(i.version || "—"));
+      row.appendChild(td(i.max_context ? fmtCompact(i.max_context, 0) : "—", true));
+      row.appendChild(td(i.slots ? `${i.slots}` : "—", true));
+      row.appendChild(td(i.gpu_indices ? i.gpu_indices.join(",") : "—"));
+      row.appendChild(td(i.uptime_s ? fmtMs(i.uptime_s * 1000) : "—", true));
+      row.appendChild(td(i.last_seen ? fmtClock(i.last_seen) : "—"));
+      if (!i.reachable && i.error) row.title = i.error;
+    }, "No instances yet.");
+  text($("n-mainst"), `${(d.instances || []).length} configured`);
+
+  table("t-mareqs",
+    [{ label: "When" }, { label: "Finish" }, { label: "Prompt", num: true },
+     { label: "Reused", num: true }, { label: "Generated", num: true },
+     { label: "TTFT", num: true }, { label: "Wall", num: true },
+     { label: "Decode", num: true }, { label: "Read", num: true }, { label: "VRAM hit", num: true }],
+    d.requests, (row, r) => {
+      row.appendChild(td(fmtClock(r.ts)));
+      row.appendChild(tdNode(pill(r.finish || "?", finishKind(r.finish))));
+      row.appendChild(td(fmtCompact(r.prompt_tokens, 0), true));
+      row.appendChild(td(r.cached_tokens ? fmtCompact(r.cached_tokens, 0) : "—", true));
+      row.appendChild(td(fmtCompact(r.output_tokens, 0), true));
+      row.appendChild(td(fmtMs(r.ttft_ms), true));
+      row.appendChild(td(fmtMs(r.latency_ms), true));
+      row.appendChild(td(r.decode_tps === null ? "—" : fmtCompact(r.decode_tps, 1), true));
+      row.appendChild(td(r.prefill_tps === null ? "—" : fmtCompact(r.prefill_tps, 0), true));
+      row.appendChild(td(r.expert_hit_rate === null ? "—" : fmtPct(r.expert_hit_rate), true));
+    }, "No requests in this window.");
+  text($("n-mareqs"), `${(d.requests || []).length} shown`);
+}
+
+$("masource").addEventListener("change", (e) => { state.masource = e.target.value; refreshMaya(); });
+
+/* =====================================================================
    Tabs
    ===================================================================== */
 state.tab = "ollama";
@@ -3316,13 +3667,15 @@ state.esource = "";
 state.edata = null;
 state.stsource = "";
 state.stdata = null;
+state.masource = "";
+state.madata = null;
 state.settings = null;
 
 function switchTab(name) {
   state.tab = name;
   for (const btn of $("tabs").querySelectorAll("button"))
     btn.setAttribute("aria-selected", String(btn.dataset.tab === name));
-  for (const t of ["ollama", "vllm", "ninfer", "exllama", "strata", "images", "settings"])
+  for (const t of ["ollama", "vllm", "ninfer", "exllama", "strata", "maya", "images", "settings"])
     $("tab-" + t).hidden = t !== name;
   // The filter row scopes the metric tabs only, and each shows a different
   // dimension selector.
@@ -3332,6 +3685,7 @@ function switchTab(name) {
   $("nsource-wrap").hidden = name !== "ninfer";
   $("esource-wrap").hidden = name !== "exllama";
   $("stsource-wrap").hidden = name !== "strata";
+  $("masource-wrap").hidden = name !== "maya";
   $("isource-wrap").hidden = name !== "images";
   history.replaceState(null, "", "?" + new URLSearchParams({
     tab: name, window: state.window,
@@ -3345,6 +3699,7 @@ function refreshActive() {
   if (state.tab === "ninfer") return refreshNinfer();
   if (state.tab === "exllama") return refreshExllama();
   if (state.tab === "strata") return refreshStrata();
+  if (state.tab === "maya") return refreshMaya();
   if (state.tab === "images") return refreshImages();
   return refreshSettings();
 }

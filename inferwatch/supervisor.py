@@ -26,6 +26,7 @@ import logging
 from . import parse_proxy
 from .collect import Correlator, GpuPoller, Maintainer, PsPoller
 from .exllama import ExllamaCorrelator, ExllamaPoller
+from .maya import MayaPoller
 from .strata import StrataPoller
 from .images import ImagesPoller, SwarmLogCollector
 from .ninfer import NinferCorrelator, NinferPoller
@@ -468,6 +469,16 @@ class Supervisor:
                 on_live=self.hub.publish, on_event=self.store.insert_event)
             rt.tasks = [asyncio.create_task(rt.strata.run(), name=f"strata:{name}")]
             log.info("source %r started (strata %s)", name, rt.strata.url)
+        elif spec["kind"] == "maya":
+            # Strata's poller with Maya's identity check and mappers; kept on
+            # rt.strata so status reporting needs no second branch.
+            name = spec["name"]
+            rt.strata = MayaPoller(
+                self.store, name, cfg,
+                interval_getter=lambda: self.config.get("collection.poll_interval_s"),
+                on_live=self.hub.publish, on_event=self.store.insert_event)
+            rt.tasks = [asyncio.create_task(rt.strata.run(), name=f"maya:{name}")]
+            log.info("source %r started (maya %s)", name, rt.strata.url)
         else:
             raise ValueError(f"unknown source kind {spec['kind']!r}")
         return rt
@@ -496,6 +507,8 @@ class Supervisor:
                                 if rt.kind == "exllama"],
             "strata_sources": [rt.name for rt in self.runtimes.values()
                                if rt.kind == "strata"],
+            "maya_sources": [rt.name for rt in self.runtimes.values()
+                             if rt.kind == "maya"],
         }
 
     def image_runtimes(self) -> list[SourceRuntime]:

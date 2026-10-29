@@ -262,9 +262,10 @@ def slowest(store, source: str, start: float, end: float,
         (source, start, end, limit))]
 
 
-def instances(store) -> list[dict]:
-    """Configured Strata instances, filtered to sources that still exist."""
-    configured = {s["name"] for s in store.list_sources() if s["kind"] == "strata"}
+def instances(store, kind: str = "strata") -> list[dict]:
+    """Configured instances of one kind (Strata, or Maya, which shares these
+    tables), filtered to sources that still exist."""
+    configured = {s["name"] for s in store.list_sources() if s["kind"] == kind}
     out = []
     for r in store.query("SELECT * FROM strata_instances ORDER BY source"):
         if r["source"] not in configured:

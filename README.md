@@ -534,6 +534,14 @@ Set these with `--set key=value` on `sources add`, or in the Settings tab.
 | `unit` | — | — | The unit running Strata, for GPU attribution by cgroup. Without it the cards are found by the process listening on the URL's port, which also works for a local server. |
 | `api_key` | — | — | Sent as a bearer token if Strata was started with --api-key. Prefer a reference like ${STRATA_API_KEY} over the value: what is stored here goes into the database in plain text. |
 
+**Maya** (`--kind maya`)
+
+| Field | Default | Required when | Notes |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:8001` | — | Polled for /health, /v1/status and /metrics; no log is read. Maya's server answers the same JSON /metrics as Strata (the engine it runs), plus its expert tiers and a live decode rate summed over the requests it answers at once. It is recognised by /v1/status saying service=maya; polls that find another engine on the port record nothing. |
+| `unit` | — | — | The unit running Maya, for GPU attribution by cgroup. Without it the cards are found by the process listening on the URL's port. |
+| `api_key` | — | — | Sent as a bearer token if Maya was set up with --api-key. Prefer a reference like ${MAYA_API_KEY} over the value: what is stored here goes into the database in plain text. |
+
 **vLLM** (`--kind vllm`)
 
 | Field | Default | Required when | Notes |

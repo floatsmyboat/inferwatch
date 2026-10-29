@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Where each engine kind's rows live, as (table, time column), so deleting a
 # source can say what it would destroy and then destroy exactly that.
@@ -63,6 +63,12 @@ SOURCE_DATA_TABLES: dict[str, dict[str, list[tuple[str, str | None]]]] = {
                     ("exllama_cache_samples", "ts")],
     },
     "strata": {
+        "registry": [("strata_instances", None)],
+        "history": [("strata_requests", "ts"), ("strata_samples", "ts")],
+    },
+    # Maya is Strata's engine behind a different server: the same /metrics
+    # shape, so the same tables, partitioned by source name like Strata's.
+    "maya": {
         "registry": [("strata_instances", None)],
         "history": [("strata_requests", "ts"), ("strata_samples", "ts")],
     },
@@ -587,6 +593,13 @@ CREATE TABLE IF NOT EXISTS strata_samples (
     ram_total_bytes  INTEGER,
     conv_cache_bytes INTEGER,
     conv_cache_parked INTEGER,
+    -- Maya only: the expert tiers' latest STAT line, per token decoded.
+    -- writing is the running requests already past their prompt.
+    writing          INTEGER,
+    vram_hit         REAL,
+    ram_fetch        REAL,
+    disk_fetch       REAL,
+    promo            REAL,
     PRIMARY KEY (ts, source)
 ) WITHOUT ROWID;
 
@@ -859,6 +872,17 @@ class Store:
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(vllm_instances)")}
         if cols and "gpu_indices" not in cols:
             self.db.execute("ALTER TABLE vllm_instances ADD COLUMN gpu_indices TEXT")
+
+        # schema 14: Maya's expert tiers on the Strata samples.  Strata rows,
+        # old and new, keep NULL: its /metrics has no tiers block.
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(strata_samples)")}
+        if cols:
+            for col, decl in (("writing", "INTEGER"), ("vram_hit", "REAL"),
+                              ("ram_fetch", "REAL"), ("disk_fetch", "REAL"),
+                              ("promo", "REAL")):
+                if col not in cols:
+                    self.db.execute(
+                        f"ALTER TABLE strata_samples ADD COLUMN {col} {decl}")
 
         # schema 10: per-card PCIe throughput (KB/s) from NVML, the one GPU
         # number nvidia-smi does not expose.  Rows written before it keep NULL.
@@ -1422,7 +1446,8 @@ class Store:
         "kv_resident", "prompt_read", "prompt_total", "decode_tps",
         "prefill_tps", "host_pcie_rx_mb", "host_pcie_tx_mb", "cpu_pct",
         "ram_used_bytes", "ram_total_bytes", "conv_cache_bytes",
-        "conv_cache_parked")
+        "conv_cache_parked", "writing", "vram_hit", "ram_fetch", "disk_fetch",
+        "promo")
 
     def insert_strata_sample(self, row: dict) -> None:
         cols = self.STRATA_SAMPLE_COLS

@@ -161,6 +161,12 @@ class StrataPoller:
     """Polls /health, /v1/status and /metrics; stores requests, samples, state."""
 
     GPU_RECHECK_S = 60.0
+    # The engine's name in events and the /metrics mappers; a subclass
+    # polling a relative of Strata's server overrides them.
+    ENGINE = "strata"
+    request_row = staticmethod(request_row)
+    sample_row = staticmethod(sample_row)
+    instance_fields = staticmethod(instance_fields)
 
     def __init__(self, store, source: str, cfg: dict, interval_getter=None,
                  on_live=None, on_event=None):
@@ -251,16 +257,16 @@ class StrataPoller:
         m = got.get("metrics")
         fields: dict = {}
         if m:
-            fields = instance_fields(m, got.get("status"), got.get("health"))
+            fields = self.instance_fields(m, got.get("status"), got.get("health"))
             self.model = fields.get("model") or self.model
             if fields.get("started") and self.started and fields["started"] != self.started:
                 self.on_event({"ts": ts, "kind": "start", "source": self.source,
                                "model": self.model,
-                               "msg": f"strata {fields.get('version') or ''} restarted".strip()})
+                               "msg": f"{self.ENGINE} {fields.get('version') or ''} restarted".strip()})
             self.started = fields.get("started") or self.started
             new = 0
             for h in m.get("requests") or []:
-                row = request_row(self.source, self.model, h)
+                row = self.request_row(self.source, self.model, h)
                 if row is None:
                     continue
                 if self.store.insert_strata_request(row):
@@ -269,7 +275,7 @@ class StrataPoller:
                 if self.newest_started is None or row["started_ts"] > self.newest_started:
                     self.newest_started = row["started_ts"]
             self.stats["requests"] += new
-            self.store.insert_strata_sample(sample_row(self.source, ts, m))
+            self.store.insert_strata_sample(self.sample_row(self.source, ts, m))
             self.stats["samples"] += 1
         self.store.upsert_strata_instance(
             self.source, last_seen=ts,

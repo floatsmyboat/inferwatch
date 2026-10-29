@@ -323,6 +323,31 @@ SOURCE_KINDS = {
                      "plain text."},
         ],
     },
+    "maya": {
+        "label": "Maya",
+        "fields": [
+            {"key": "url", "label": "Base URL", "type": "str",
+             "default": "http://127.0.0.1:8001",
+             "help": "Polled for /health, /v1/status and /metrics; no log is "
+                     "read. Maya's server answers the same JSON /metrics as "
+                     "Strata (the engine it runs), plus its expert tiers and a "
+                     "live decode rate summed over the requests it answers at "
+                     "once. It is recognised by /v1/status saying "
+                     "service=maya; polls that find another engine on the port "
+                     "record nothing."},
+            {"key": "unit", "label": "systemd unit (optional)", "type": "str",
+             "default": "",
+             "help": "The unit running Maya, for GPU attribution by cgroup. "
+                     "Without it the cards are found by the process listening on "
+                     "the URL's port."},
+            {"key": "api_key", "label": "API key (optional)", "type": "str",
+             "default": "", "secret": True,
+             "help": "Sent as a bearer token if Maya was set up with "
+                     "--api-key. Prefer a reference like ${MAYA_API_KEY} over "
+                     "the value: what is stored here goes into the database in "
+                     "plain text."},
+        ],
+    },
     "vllm": {
         "label": "vLLM",
         "fields": [
@@ -489,6 +514,8 @@ def validate_source(kind: str, name: str, cfg: dict) -> dict:
             raise ValueError("an exllama source needs a base URL")
     if kind == "strata" and not out.get("url"):
         raise ValueError("a Strata source needs a base URL")
+    if kind == "maya" and not out.get("url"):
+        raise ValueError("a Maya source needs a base URL")
     if kind == "vllm" and not out.get("url"):
         raise ValueError("a vLLM source needs a base URL")
     if kind == "swarmui":

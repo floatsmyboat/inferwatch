@@ -23,8 +23,8 @@ import urllib.request
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import (exllama_metrics, image_metrics, metrics, ninfer_metrics,
-               strata_metrics, vllm_metrics)
+from . import (exllama_metrics, image_metrics, maya_metrics, metrics,
+               ninfer_metrics, strata_metrics, vllm_metrics)
 from .config import (SOURCE_KINDS, ConfigError, merge_secrets, redact_sources,
                      resolve_secret, validate_source)
 
@@ -549,6 +549,43 @@ def create_app(state: AppState) -> FastAPI:
         return {"requests": strata_metrics.recent_requests(
             state.store, source, start, end, limit)}
 
+    # ---------------------------------------------------------------- maya
+
+    @app.get("/api/maya/dashboard")
+    async def maya_dashboard(source: str | None = None, window: str = Query("1h"),
+                             step: int | None = None):
+        # Maya's rows are in the Strata tables, so this is the Strata
+        # dashboard over Maya's sources, plus its tiers and concurrency split.
+        start, end = _window(window)
+        st = state.store
+        loop = asyncio.get_running_loop()
+        inst = strata_metrics.instances(st, "maya")
+        if source is None:
+            source = inst[0]["source"] if inst else None
+        if source is None:
+            return {"window": window, "start": start, "end": end, "instances": [],
+                    "source": None, "summary": None, "timeseries": None,
+                    "hint": "No Maya source configured. Add one in Settings."}
+
+        def build():
+            return {
+                "window": window, "start": start, "end": end, "now": time.time(),
+                "source": source, "instances": inst,
+                "summary": strata_metrics.summary(st, source, start, end),
+                "timeseries": strata_metrics.timeseries(st, source, start, end, step),
+                "samples": strata_metrics.sample_timeseries(st, source, start, end, step),
+                "tiers": maya_metrics.tier_timeseries(st, source, start, end, step),
+                "concurrency": maya_metrics.by_concurrency(st, source, start, end),
+                "live": strata_metrics.live(st, source, start, end),
+                "finish": strata_metrics.finish_reasons(st, source, start, end),
+                "requests": strata_metrics.recent_requests(st, source, start, end, 100),
+                "gpu": metrics.gpu_series(st, start, end, step),
+                "raw_complete": metrics.coverage(st, start)["complete"],
+                "raw_from": metrics.coverage(st, start)["covers_from"],
+            }
+
+        return await loop.run_in_executor(None, build)
+
     @app.get("/api/images/sources")
     async def image_sources():
         return {"sources": image_metrics.sources(state.store),
@@ -928,6 +965,21 @@ def _probe(kind: str, cfg: dict) -> dict:
         if log_dir and not os.path.isdir(log_dir):
             return {"ok": False, "detail": f"log_dir does not exist: {log_dir}"}
         return {"ok": True, "detail": "; ".join(notes)}
+    if kind == "maya":
+        from .strata import fetch_json
+        url = (cfg.get("url") or "").rstrip("/")
+        api_key = cfg.get("api_key") or ""
+        try:
+            status = fetch_json(f"{url}/v1/status", api_key)
+        except Exception as e:
+            return {"ok": False, "detail": f"could not reach {url}/v1/status: {e} "
+                                           "(Maya may not be running; the source still polls)"}
+        service = (status or {}).get("service")
+        if service != "maya":
+            return {"ok": False,
+                    "detail": f"{url} answers, but as {service!r} rather than Maya "
+                              "(a switcher may have another engine on this port)"}
+        return {"ok": True, "detail": f"Maya at {url}, model {status.get('model')}"}
     if kind == "strata":
         from .strata import fetch_json
         url = (cfg.get("url") or "").rstrip("/")
